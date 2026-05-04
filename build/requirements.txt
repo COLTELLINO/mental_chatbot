@@ -1,0 +1,17 @@
+unsloth
+sentencepiece
+protobuf
+datasets==4.3.0
+huggingface_hub>=0.34.0
+hf_transfer
+bitsandbytes
+accelerate
+peft
+triton
+trl==0.25.1
+transformers==4.57.3
+torchao==0.15.0
+optimum==1.24.0
+pytorch-tokenizers
+wandb
+weave
