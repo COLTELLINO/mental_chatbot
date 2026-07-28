@@ -11,14 +11,18 @@ RUN apt-get update -y && \
     apt-get autoremove -y && apt-get clean -y && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3.11 -m ensurepip --upgrade
-RUN python3.11 -m pip install --upgrade pip
-RUN python3.11 -m pip install wrapt --upgrade --ignore-installed
+# System python3.11 has ensurepip disabled by Debian/Ubuntu policy, so we
+# bootstrap pip via a venv instead (same pattern as the guide's RTX 5090 Dockerfile).
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-RUN python3.11 -m pip install torch==2.6.0 torchvision torchaudio \
+RUN pip install --upgrade pip
+RUN pip install wrapt --upgrade --ignore-installed
+
+RUN pip install torch==2.6.0 torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu124
 
 COPY build/requirements.txt .
-RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 ENV DEBIAN_FRONTEND=dialog
