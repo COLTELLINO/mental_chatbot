@@ -1,0 +1,7 @@
+# Installed with `pip install --no-deps` (see Dockerfile). Both packages have
+# huge, loosely-pinned dependency trees that make pip's resolver backtrack for
+# minutes (or fail entirely) when resolved together with the pinned core stack
+# in requirements.txt. Installing them standalone avoids re-triggering a global
+# resolve; the core stack already satisfies their real runtime needs for now.
+unsloth
+weave

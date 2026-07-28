@@ -3,7 +3,6 @@ torch==2.6.0+cu124
 torchvision==0.21.0+cu124
 torchaudio==2.6.0+cu124
 
-unsloth
 sentencepiece
 protobuf
 datasets==4.3.0
@@ -19,4 +18,3 @@ torchao==0.15.0
 optimum==1.24.0
 pytorch-tokenizers
 wandb==0.19.7
-weave
