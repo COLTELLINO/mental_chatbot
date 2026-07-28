@@ -11,6 +11,7 @@ RUN apt-get update -y && \
     apt-get autoremove -y && apt-get clean -y && \
     rm -rf /var/lib/apt/lists/*
 
+RUN python3.11 -m ensurepip --upgrade
 RUN python3.11 -m pip install --upgrade pip
 RUN python3.11 -m pip install wrapt --upgrade --ignore-installed
 
