@@ -22,12 +22,16 @@ RUN pip install wrapt --upgrade --ignore-installed
 RUN pip install torch==2.6.0 torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu124
 
-COPY build/requirements.txt build/requirements-nodeps.txt ./
+COPY build/requirements.txt build/requirements-nodeps.txt build/requirements-benchmark.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # unsloth/weave have huge unpinned dependency trees; installing them together
 # with the pinned core stack makes pip backtrack for minutes or fail outright.
 # --no-deps keeps them from re-triggering a global resolve.
 RUN pip install --no-cache-dir --no-deps -r requirements-nodeps.txt
+
+# lm-polygraph + benchmark deps, installed WITH deps in their own stage so any
+# version conflict with the pinned core stack fails loudly here, not silently.
+RUN pip install --no-cache-dir -r requirements-benchmark.txt
 
 ENV DEBIAN_FRONTEND=dialog

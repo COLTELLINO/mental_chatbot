@@ -1,0 +1,9 @@
+# Installed WITH deps (unlike requirements-nodeps.txt) in its own Dockerfile
+# stage, after the pinned core stack. If lm-polygraph needs a newer
+# transformers/torch than pinned in requirements.txt, pip will fail loudly
+# here instead of silently swapping versions elsewhere in the image.
+lm-polygraph
+pandas
+matplotlib
+seaborn
+tqdm

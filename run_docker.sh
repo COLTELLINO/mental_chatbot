@@ -8,8 +8,9 @@ docker run \
     -v "$LLM_CACHE_DIR":/llms \
     -e HF_HOME="/llms" \
     -e WANDB_API_KEY="$WANDB_API_KEY" \
+    -e HF_TOKEN="$HF_TOKEN" \
     --rm \
     --memory="30g" \
     --gpus '"device='"$CUDA_VISIBLE_DEVICES"'"' \
     mental-chatbot-image \
-    "/workspace/train.sh" "${1}" "${2}"
+    "/workspace/train.sh" "$@"
