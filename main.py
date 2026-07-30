@@ -369,6 +369,17 @@ def main():
             man()
             log_gpu_mem(f"{model_name} done")
 
+            print(f"--- Debug generazioni: {model_name} ---")
+            try:
+                print(f"  man.stats keys: {list(man.stats.keys())}")
+                preds = man.stats.get("greedy_texts")
+                n_show = min(10, len(preds) if preds is not None else 0, len(y_references))
+                for i in range(n_show):
+                    print(f"  [{i}] pred={preds[i]!r} true={y_references[i]!r}")
+            except Exception:
+                print("  (impossibile leggere man.stats per debug)")
+                traceback.print_exc()
+
             df = extract_prr_table(man, model_name)
             n_ok = df["value"].notna().sum() if "value" in df.columns else 0
             print(f"{model_name}: {n_ok}/{len(df)} righe metrica con valore.")
