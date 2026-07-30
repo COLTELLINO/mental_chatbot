@@ -9,6 +9,7 @@ docker run \
     -e HF_HOME="/llms" \
     -e WANDB_API_KEY="$WANDB_API_KEY" \
     -e HF_TOKEN="$HF_TOKEN" \
+    -e PYTORCH_JIT=0 \
     --rm \
     --memory="30g" \
     --gpus '"device='"$CUDA_VISIBLE_DEVICES"'"' \
