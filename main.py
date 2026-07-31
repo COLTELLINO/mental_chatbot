@@ -66,6 +66,16 @@ MODELS = {
 
 GATED_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
+# These are instruction-tuned ("-it") models trained with an explicit chat
+# template (turn markers like <start_of_turn>/<end_of_turn>). Fed the same
+# plain-text completion prompt as the base LFM2 models, they emit their
+# end-of-turn token as the very first generated token (confirmed via debug
+# logging on 2026-07-30: `greedy_texts` was pure "<pad><pad><pad>" for every
+# sample), which silently made AccuracyMetric constant and PRR degenerate to
+# exactly 0.5 for all 39 successfully-computed estimators. Fix: build their
+# prompts with tokenizer.apply_chat_template() instead of raw text.
+CHAT_TEMPLATE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
+
 FEWSHOT_EXAMPLES = [
     {
         "question": "A 3-month-old baby died suddenly at night while asleep. His mother noticed that he had died only after she awoke in the morning. No cause of death was determined based on the autopsy. Which of the following precautions could have prevented the death of the baby?",
@@ -138,7 +148,7 @@ def build_fewshot_block():
     return "\n\n".join(blocks)
 
 
-def format_prompt(example, fewshot_block):
+def build_user_content(example, fewshot_block):
     opts = example["options"]
     return (
         "Sei un assistente medico che risponde a domande in stile esame USMLE.\n"
@@ -148,9 +158,21 @@ def format_prompt(example, fewshot_block):
         f"A) {opts['A'].strip()}\n"
         f"B) {opts['B'].strip()}\n"
         f"C) {opts['C'].strip()}\n"
-        f"D) {opts['D'].strip()}\n\n"
-        "Risposta:"
+        f"D) {opts['D'].strip()}"
     )
+
+
+def format_prompt(example, fewshot_block):
+    """Plain-text completion prompt (LFM2 base models)."""
+    return build_user_content(example, fewshot_block) + "\n\nRisposta:"
+
+
+def format_chat_prompt(tokenizer, example, fewshot_block):
+    """Chat-template prompt for instruction-tuned models (MedGemma/Gemma3 -it).
+    See CHAT_TEMPLATE_MODELS comment for why this is needed."""
+    content = build_user_content(example, fewshot_block)
+    messages = [{"role": "user", "content": content}]
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 def build_estimators():
@@ -354,7 +376,6 @@ def main():
     print("Modelli da eseguire in questo run:", list(models_to_run.keys()))
 
     all_metrics_dfs = [results_df_existing] if results_df_existing is not None else []
-    full_dataset = PolygraphDataset(x_prompts, y_references, batch_size=args.batch_size)
 
     for model_name, model_id in models_to_run.items():
         print(f"\n=== Modello: {model_name} ({model_id}) ===")
@@ -364,8 +385,17 @@ def main():
         try:
             model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token)
             log_gpu_mem(f"{model_name} loaded")
+
+            if model_name in CHAT_TEMPLATE_MODELS:
+                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it).")
+                model_x_prompts = [format_chat_prompt(model.tokenizer, ex, fewshot_block) for ex in test_split]
+                print(model_x_prompts[0])
+            else:
+                model_x_prompts = x_prompts
+            model_dataset = PolygraphDataset(model_x_prompts, y_references, batch_size=args.batch_size)
+
             estimators = build_estimators()
-            man = build_manager(model, full_dataset, estimators, args.cache_dir, args.max_rejection, args.max_new_tokens)
+            man = build_manager(model, model_dataset, estimators, args.cache_dir, args.max_rejection, args.max_new_tokens)
             man()
             log_gpu_mem(f"{model_name} done")
 
