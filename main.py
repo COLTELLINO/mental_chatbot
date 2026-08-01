@@ -223,7 +223,7 @@ def build_estimators():
     return estimators
 
 
-def load_whitebox_model(model_id, cache_dir, hf_token=None):
+def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager"):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -240,12 +240,39 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None):
         device_map="auto",
         token=hf_token,
         cache_dir=cache_dir,
-        attn_implementation="eager",
+        attn_implementation=attn_implementation,
     )
     hf_model.eval()
 
     model = WhiteboxModel(hf_model, tokenizer, model_path=model_id)
     return model
+
+
+def debug_raw_generation(model, prompt, true_answer, max_new_tokens=5):
+    """Bypass lm-polygraph entirely: one raw HF generate() call with
+    output_scores=True to check whether the very first decoding step
+    produces NaN logits (a known bitsandbytes-4bit + eager-attention +
+    Gemma3-family interaction) or a legitimately confident pad/eos
+    prediction. Cheap (<5s) — run before the full ~15min UEManager pass
+    so a broken config is caught fast."""
+    inputs = model.tokenizer(prompt, return_tensors="pt").to(model.model.device)
+    with torch.no_grad():
+        out = model.model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+            output_scores=True, return_dict_in_generate=True,
+        )
+    first_scores = out.scores[0]
+    has_nan = torch.isnan(first_scores).any().item()
+    top_id = int(first_scores.argmax(-1).item())
+    decoded = model.tokenizer.decode(
+        out.sequences[0][inputs["input_ids"].shape[1]:], skip_special_tokens=False
+    )
+    print(f"  [raw-gen check] pad_token_id={model.tokenizer.pad_token_id} eos_token_id={model.tokenizer.eos_token_id}")
+    print(f"  [raw-gen check] model.generation_config: pad={model.model.generation_config.pad_token_id} eos={model.model.generation_config.eos_token_id}")
+    print(f"  [raw-gen check] NaN in first-step logits: {has_nan}")
+    print(f"  [raw-gen check] first-step argmax token id={top_id} -> {model.tokenizer.decode([top_id])!r}")
+    print(f"  [raw-gen check] full decode: {decoded!r} | true={true_answer!r}")
+    return top_id != model.tokenizer.pad_token_id
 
 
 def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens):
@@ -383,13 +410,26 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         try:
-            model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token)
+            # eager attention has a known bad interaction with bitsandbytes
+            # 4-bit + Gemma3-family models (NaN/garbage first-step logits);
+            # try sdpa for the two -it chat models instead (LFM2 unaffected,
+            # keeps eager since it already produces sensible results there).
+            attn_impl = "sdpa" if model_name in CHAT_TEMPLATE_MODELS else "eager"
+            model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token, attn_implementation=attn_impl)
             log_gpu_mem(f"{model_name} loaded")
 
             if model_name in CHAT_TEMPLATE_MODELS:
-                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it).")
+                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it), attn_implementation={attn_impl}.")
                 model_x_prompts = [format_chat_prompt(model.tokenizer, ex, fewshot_block) for ex in test_split]
                 print(model_x_prompts[0])
+                gen_ok = debug_raw_generation(model, model_x_prompts[0], y_references[0])
+                if not gen_ok:
+                    print(f"!!! {model_name}: ancora solo pad token dopo il fix -- salto il run pesante (~15min) "
+                          "per non sprecare tempo GPU, serve un'altra diagnosi.")
+                    del model
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    continue
             else:
                 model_x_prompts = x_prompts
             model_dataset = PolygraphDataset(model_x_prompts, y_references, batch_size=args.batch_size)
