@@ -223,12 +223,13 @@ def build_estimators():
     return estimators
 
 
-def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager"):
+def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager", skip_quant_modules=None):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
+        llm_int8_skip_modules=skip_quant_modules,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, cache_dir=cache_dir, padding_side="left")
     if tokenizer.pad_token is None:
@@ -410,16 +411,24 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         try:
-            # eager attention has a known bad interaction with bitsandbytes
-            # 4-bit + Gemma3-family models (NaN/garbage first-step logits);
-            # try sdpa for the two -it chat models instead (LFM2 unaffected,
-            # keeps eager since it already produces sensible results there).
-            attn_impl = "sdpa" if model_name in CHAT_TEMPLATE_MODELS else "eager"
-            model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token, attn_implementation=attn_impl)
+            # 2026-08-03: confirmed via debug_raw_generation that first-step
+            # logits are genuine NaN for both MedGemma/Gemma3 regardless of
+            # eager vs sdpa attention (ruled out attention backend as cause).
+            # Reverted to eager (attn backend wasn't it) and instead try
+            # excluding lm_head from 4-bit quantization -- a known fix for
+            # NaN logits on Gemma-family models, whose large embedding
+            # scaling factor makes the output projection numerically
+            # sensitive to blockwise 4-bit quant.
+            attn_impl = "eager"
+            skip_quant = ["lm_head"] if model_name in CHAT_TEMPLATE_MODELS else None
+            model = load_whitebox_model(
+                model_id, args.cache_dir, hf_token=hf_token,
+                attn_implementation=attn_impl, skip_quant_modules=skip_quant,
+            )
             log_gpu_mem(f"{model_name} loaded")
 
             if model_name in CHAT_TEMPLATE_MODELS:
-                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it), attn_implementation={attn_impl}.")
+                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it), attn_implementation={attn_impl}, skip_quant_modules={skip_quant}.")
                 model_x_prompts = [format_chat_prompt(model.tokenizer, ex, fewshot_block) for ex in test_split]
                 print(model_x_prompts[0])
                 gen_ok = debug_raw_generation(model, model_x_prompts[0], y_references[0])
