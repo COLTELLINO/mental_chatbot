@@ -223,26 +223,30 @@ def build_estimators():
     return estimators
 
 
-def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager", skip_quant_modules=None):
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        llm_int8_skip_modules=skip_quant_modules,
-    )
+def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager",
+                         skip_quant_modules=None, use_quantization=True):
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, cache_dir=cache_dir, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        quantization_config=bnb_config,
+    load_kwargs = dict(
         device_map="auto",
         token=hf_token,
         cache_dir=cache_dir,
         attn_implementation=attn_implementation,
     )
+    if use_quantization:
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            llm_int8_skip_modules=skip_quant_modules,
+        )
+    else:
+        load_kwargs["torch_dtype"] = torch.bfloat16
+
+    hf_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     hf_model.eval()
 
     model = WhiteboxModel(hf_model, tokenizer, model_path=model_id)
@@ -411,24 +415,26 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         try:
-            # 2026-08-03: confirmed via debug_raw_generation that first-step
-            # logits are genuine NaN for both MedGemma/Gemma3 regardless of
-            # eager vs sdpa attention (ruled out attention backend as cause).
-            # Reverted to eager (attn backend wasn't it) and instead try
-            # excluding lm_head from 4-bit quantization -- a known fix for
-            # NaN logits on Gemma-family models, whose large embedding
-            # scaling factor makes the output projection numerically
-            # sensitive to blockwise 4-bit quant.
+            # 2026-08-03: NaN persisted with both eager/sdpa attention AND
+            # with lm_head excluded from 4-bit quant -- both ruled out.
+            # Isolating further: drop bitsandbytes 4-bit quantization
+            # entirely for these two (load in bf16) to test whether
+            # quantization itself (anywhere in the model, not just lm_head)
+            # is the source of the NaN. Costs more VRAM (~5-6GB extra
+            # baseline vs 4-bit) -- may worsen the existing EigenScore/
+            # SemanticDensity OOM on the DeBERTa NLI stat calculator, but
+            # a working (non-degenerate) result on 39/41 estimators beats a
+            # "complete" but NaN-poisoned 0/41.
             attn_impl = "eager"
-            skip_quant = ["lm_head"] if model_name in CHAT_TEMPLATE_MODELS else None
+            use_quant = model_name not in CHAT_TEMPLATE_MODELS
             model = load_whitebox_model(
                 model_id, args.cache_dir, hf_token=hf_token,
-                attn_implementation=attn_impl, skip_quant_modules=skip_quant,
+                attn_implementation=attn_impl, use_quantization=use_quant,
             )
             log_gpu_mem(f"{model_name} loaded")
 
             if model_name in CHAT_TEMPLATE_MODELS:
-                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it), attn_implementation={attn_impl}, skip_quant_modules={skip_quant}.")
+                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it), attn_implementation={attn_impl}, use_quantization={use_quant}.")
                 model_x_prompts = [format_chat_prompt(model.tokenizer, ex, fewshot_block) for ex in test_split]
                 print(model_x_prompts[0])
                 gen_ok = debug_raw_generation(model, model_x_prompts[0], y_references[0])
