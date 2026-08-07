@@ -6,24 +6,23 @@ several small/medium LLMs on MedQA-USMLE-4-options. On Colab (T4, 15GB) many
 of the multi-sample/similarity-based estimators (Monte Carlo sequence entropy,
 lexical similarity, eigenvalue/degree-matrix graph methods, semantic entropy,
 SAR variants, LUQ, kernel language entropy, eigenscore, semantic density...)
-ran out of VRAM. This runs on a 24GB RTX 3090, hoping those now fit.
+ran out of VRAM; this runs on a 24GB RTX 3090 so they fit.
 
-Ported 1:1 from the notebook — same models, same estimator list, same
-experimental loop and resume/checkpoint logic. Only the environment glue
-changed (no Colab, no Drive, no notebook magics):
+Environment glue differs from the notebook (no Colab, no Drive, no notebook
+magics), but models/estimators/experimental loop are the same:
   - HF_TOKEN comes from the environment instead of google.colab.userdata
   - RESULTS_DIR/CACHE_DIR point into the bind-mounted /workspace and the
     cluster's shared /llms cache instead of Google Drive / /content
   - matplotlib uses the Agg backend (no display) and only saves figures
-  - added: an environment/GPU banner and per-model timing + VRAM stats,
-    since this is the first real run on this infra and OOM boundaries are
-    exactly what we're trying to find
+  - an environment/GPU banner and per-model timing + VRAM stats are printed
+    for each run
 
-lm-polygraph's UEManager(ignore_exceptions=True) already catches per-estimator
-failures internally (that's how the notebook silently "skipped" the ~29
-failing methods on Colab instead of crashing) — that resilience is unchanged
-here. The outer per-model try/except is an extra safety net for anything
-that escapes the manager (e.g. OOM during model loading itself).
+lm-polygraph's UEManager(ignore_exceptions=True) catches per-estimator
+failures internally (a single estimator OOMing or erroring doesn't take down
+the whole model's run). The outer per-model try/except is an extra safety net
+for anything that escapes the manager (e.g. OOM during model loading itself).
+Results are checkpointed after each model (results_partial.csv) and resumed
+by model name on the next run via results_final.csv.
 """
 import argparse
 import gc
@@ -66,14 +65,13 @@ MODELS = {
 
 GATED_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
-# These are instruction-tuned ("-it") models trained with an explicit chat
-# template (turn markers like <start_of_turn>/<end_of_turn>). Fed the same
-# plain-text completion prompt as the base LFM2 models, they emit their
-# end-of-turn token as the very first generated token (confirmed via debug
-# logging on 2026-07-30: `greedy_texts` was pure "<pad><pad><pad>" for every
-# sample), which silently made AccuracyMetric constant and PRR degenerate to
-# exactly 0.5 for all 39 successfully-computed estimators. Fix: build their
-# prompts with tokenizer.apply_chat_template() instead of raw text.
+# Instruction-tuned ("-it") models expect an explicit chat template (turn
+# markers like <start_of_turn>/<end_of_turn>); given the same plain-text
+# completion prompt as the LFM2 base models, they don't generate correctly.
+# Their prompts are built with tokenizer.apply_chat_template() instead.
+# They also produce NaN logits under bitsandbytes 4-bit quantization
+# (Gemma3-family issue) and are loaded in bf16 instead — see
+# load_whitebox_model's use_quantization flag.
 CHAT_TEMPLATE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
 FEWSHOT_EXAMPLES = [
@@ -223,8 +221,7 @@ def build_estimators():
     return estimators
 
 
-def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager",
-                         skip_quant_modules=None, use_quantization=True):
+def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager", use_quantization=True):
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, cache_dir=cache_dir, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -241,7 +238,6 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation=
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
-            llm_int8_skip_modules=skip_quant_modules,
         )
     else:
         load_kwargs["torch_dtype"] = torch.bfloat16
@@ -251,33 +247,6 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation=
 
     model = WhiteboxModel(hf_model, tokenizer, model_path=model_id)
     return model
-
-
-def debug_raw_generation(model, prompt, true_answer, max_new_tokens=5):
-    """Bypass lm-polygraph entirely: one raw HF generate() call with
-    output_scores=True to check whether the very first decoding step
-    produces NaN logits (a known bitsandbytes-4bit + eager-attention +
-    Gemma3-family interaction) or a legitimately confident pad/eos
-    prediction. Cheap (<5s) — run before the full ~15min UEManager pass
-    so a broken config is caught fast."""
-    inputs = model.tokenizer(prompt, return_tensors="pt").to(model.model.device)
-    with torch.no_grad():
-        out = model.model.generate(
-            **inputs, max_new_tokens=max_new_tokens, do_sample=False,
-            output_scores=True, return_dict_in_generate=True,
-        )
-    first_scores = out.scores[0]
-    has_nan = torch.isnan(first_scores).any().item()
-    top_id = int(first_scores.argmax(-1).item())
-    decoded = model.tokenizer.decode(
-        out.sequences[0][inputs["input_ids"].shape[1]:], skip_special_tokens=False
-    )
-    print(f"  [raw-gen check] pad_token_id={model.tokenizer.pad_token_id} eos_token_id={model.tokenizer.eos_token_id}")
-    print(f"  [raw-gen check] model.generation_config: pad={model.model.generation_config.pad_token_id} eos={model.model.generation_config.eos_token_id}")
-    print(f"  [raw-gen check] NaN in first-step logits: {has_nan}")
-    print(f"  [raw-gen check] first-step argmax token id={top_id} -> {model.tokenizer.decode([top_id])!r}")
-    print(f"  [raw-gen check] full decode: {decoded!r} | true={true_answer!r}")
-    return top_id != model.tokenizer.pad_token_id
 
 
 def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens):
@@ -308,10 +277,9 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
 
 
 def extract_prr_table(man, model_name):
-    """Converte man.metrics in un DataFrame lungo: model, method, generation_metric, PRR.
-    man.metrics e' tipicamente un dict con chiavi (livello, estimator_name, generation_metric_name,
-    ue_metric_name) -> valore. Verificare/adattare in base a quanto osservato nello smoke test
-    se la struttura reale differisce."""
+    """Converte man.metrics (dict con chiavi (livello, estimator_name,
+    generation_metric_name, ue_metric_name) -> valore) in un DataFrame lungo:
+    model, key, ue_metric, value."""
     rows = []
     for key, value in man.metrics.items():
         try:
@@ -415,36 +383,17 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         try:
-            # 2026-08-03: NaN persisted with both eager/sdpa attention AND
-            # with lm_head excluded from 4-bit quant -- both ruled out.
-            # Isolating further: drop bitsandbytes 4-bit quantization
-            # entirely for these two (load in bf16) to test whether
-            # quantization itself (anywhere in the model, not just lm_head)
-            # is the source of the NaN. Costs more VRAM (~5-6GB extra
-            # baseline vs 4-bit) -- may worsen the existing EigenScore/
-            # SemanticDensity OOM on the DeBERTa NLI stat calculator, but
-            # a working (non-degenerate) result on 39/41 estimators beats a
-            # "complete" but NaN-poisoned 0/41.
-            attn_impl = "eager"
+            # MedGemma/Gemma3 (-it, chat-tuned) need apply_chat_template()
+            # and produce NaN logits under 4-bit quant -- see
+            # CHAT_TEMPLATE_MODELS comment.
             use_quant = model_name not in CHAT_TEMPLATE_MODELS
             model = load_whitebox_model(
-                model_id, args.cache_dir, hf_token=hf_token,
-                attn_implementation=attn_impl, use_quantization=use_quant,
+                model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant,
             )
             log_gpu_mem(f"{model_name} loaded")
 
             if model_name in CHAT_TEMPLATE_MODELS:
-                print(f"{model_name}: uso tokenizer.apply_chat_template (modello -it), attn_implementation={attn_impl}, use_quantization={use_quant}.")
                 model_x_prompts = [format_chat_prompt(model.tokenizer, ex, fewshot_block) for ex in test_split]
-                print(model_x_prompts[0])
-                gen_ok = debug_raw_generation(model, model_x_prompts[0], y_references[0])
-                if not gen_ok:
-                    print(f"!!! {model_name}: ancora solo pad token dopo il fix -- salto il run pesante (~15min) "
-                          "per non sprecare tempo GPU, serve un'altra diagnosi.")
-                    del model
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    continue
             else:
                 model_x_prompts = x_prompts
             model_dataset = PolygraphDataset(model_x_prompts, y_references, batch_size=args.batch_size)
@@ -453,17 +402,6 @@ def main():
             man = build_manager(model, model_dataset, estimators, args.cache_dir, args.max_rejection, args.max_new_tokens)
             man()
             log_gpu_mem(f"{model_name} done")
-
-            print(f"--- Debug generazioni: {model_name} ---")
-            try:
-                print(f"  man.stats keys: {list(man.stats.keys())}")
-                preds = man.stats.get("greedy_texts")
-                n_show = min(10, len(preds) if preds is not None else 0, len(y_references))
-                for i in range(n_show):
-                    print(f"  [{i}] pred={preds[i]!r} true={y_references[i]!r}")
-            except Exception:
-                print("  (impossibile leggere man.stats per debug)")
-                traceback.print_exc()
 
             df = extract_prr_table(man, model_name)
             n_ok = df["value"].notna().sum() if "value" in df.columns else 0
