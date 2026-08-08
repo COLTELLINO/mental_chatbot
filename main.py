@@ -279,19 +279,23 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
 def extract_prr_table(man, model_name):
     """Converte man.metrics (dict con chiavi (livello, estimator_name,
     generation_metric_name, ue_metric_name) -> valore) in un DataFrame lungo:
-    model, key, ue_metric, value."""
+    model, key, estimator, ue_metric, value. `estimator` (solo il nome del
+    metodo UQ) e' pensato per essere usato come etichetta nei grafici, molto
+    piu' leggibile della tupla completa in `key`."""
     rows = []
     for key, value in man.metrics.items():
         try:
             *rest, ue_metric_name = key
+            estimator_name = key[1] if len(key) > 1 else str(key)
             rows.append({
                 "model": model_name,
                 "key": key,
+                "estimator": estimator_name,
                 "ue_metric": ue_metric_name,
                 "value": value,
             })
         except TypeError:
-            rows.append({"model": model_name, "key": str(key), "ue_metric": None, "value": value})
+            rows.append({"model": model_name, "key": str(key), "estimator": str(key), "ue_metric": None, "value": value})
     return pd.DataFrame(rows)
 
 
@@ -432,11 +436,23 @@ def main():
     results_df.to_csv(final_path, index=False)
     print(results_df.head(20))
 
+    # Plots use only the raw PRR ("prr_0.5"), not "prr_0.5_normalized": the
+    # normalized values swing from ~-2.5 to ~1.0 and swamp the color scale /
+    # bar range, hiding the much more informative raw 0-0.4 spread. Both
+    # metrics remain in the CSV either way. Labels use `estimator` (just the
+    # method name) instead of the full `key` tuple, which is unreadably long
+    # once rendered as an axis label across 41 estimators.
+    raw_df = results_df[results_df["ue_metric"] == "prr_0.5"] if "ue_metric" in results_df.columns else results_df
+    n_estimators = raw_df["estimator"].nunique() if "estimator" in raw_df.columns else 20
+
     try:
-        pivot = results_df.pivot_table(index="key", columns="model", values="value", aggfunc="first")
-        plt.figure(figsize=(10, 12))
-        sns.heatmap(pivot, annot=True, fmt=".3f", cmap="RdYlGn", center=0, cbar_kws={"label": "PRR"})
-        plt.title("Prediction-Rejection Ratio per metodo UQ e modello — MedQA-USMLE")
+        pivot = raw_df.pivot_table(index="estimator", columns="model", values="value", aggfunc="first").sort_index()
+        fig, ax = plt.subplots(figsize=(8, max(8, n_estimators * 0.32)))
+        sns.heatmap(pivot, annot=True, fmt=".3f", cmap="RdYlGn", center=pivot.stack().median(),
+                    cbar_kws={"label": "PRR (raw)"}, ax=ax, annot_kws={"size": 8})
+        ax.set_title("Prediction-Rejection Ratio (raw) per metodo UQ e modello — MedQA-USMLE")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
+        ax.set_yticklabels(ax.get_yticklabels(), fontsize=8)
         plt.tight_layout()
         heatmap_path = os.path.join(args.results_dir, "prr_heatmap.png")
         plt.savefig(heatmap_path, dpi=150)
@@ -446,19 +462,23 @@ def main():
         traceback.print_exc()
 
     try:
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig, axes = plt.subplots(1, 2, figsize=(16, max(10, n_estimators * 0.28)))
 
         compare_models = ["MedGemma-4B-it", "Gemma3-4B-it"]
-        subset = results_df[results_df["model"].isin(compare_models)]
-        subset_pivot = subset.pivot_table(index="key", columns="model", values="value", aggfunc="first")
+        subset = raw_df[raw_df["model"].isin(compare_models)]
+        subset_pivot = subset.pivot_table(index="estimator", columns="model", values="value", aggfunc="first").sort_index()
         subset_pivot.plot(kind="barh", ax=axes[0])
         axes[0].set_title("Medico (MedGemma) vs generico (Gemma3), stessa taglia")
+        axes[0].set_xlabel("PRR (raw)")
+        axes[0].tick_params(axis="y", labelsize=8)
 
         compare_sizes = ["LFM2-350M", "LFM2-1.2B"]
-        subset2 = results_df[results_df["model"].isin(compare_sizes)]
-        subset2_pivot = subset2.pivot_table(index="key", columns="model", values="value", aggfunc="first")
+        subset2 = raw_df[raw_df["model"].isin(compare_sizes)]
+        subset2_pivot = subset2.pivot_table(index="estimator", columns="model", values="value", aggfunc="first").sort_index()
         subset2_pivot.plot(kind="barh", ax=axes[1])
         axes[1].set_title("Effetto scala: LFM2-350M vs LFM2-1.2B")
+        axes[1].set_xlabel("PRR (raw)")
+        axes[1].tick_params(axis="y", labelsize=8)
 
         plt.tight_layout()
         comparisons_path = os.path.join(args.results_dir, "comparisons.png")
