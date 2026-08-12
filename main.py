@@ -1,29 +1,3 @@
-"""
-MedQA UQ Benchmark — ported from MedQA_UQ_Benchmark.ipynb.
-
-Benchmarks lm-polygraph's uncertainty-quantification estimators against
-several small/medium LLMs on MedQA-USMLE-4-options. On Colab (T4, 15GB) many
-of the multi-sample/similarity-based estimators (Monte Carlo sequence entropy,
-lexical similarity, eigenvalue/degree-matrix graph methods, semantic entropy,
-SAR variants, LUQ, kernel language entropy, eigenscore, semantic density...)
-ran out of VRAM; this runs on a 24GB RTX 3090 so they fit.
-
-Environment glue differs from the notebook (no Colab, no Drive, no notebook
-magics), but models/estimators/experimental loop are the same:
-  - HF_TOKEN comes from the environment instead of google.colab.userdata
-  - RESULTS_DIR/CACHE_DIR point into the bind-mounted /workspace and the
-    cluster's shared /llms cache instead of Google Drive / /content
-  - matplotlib uses the Agg backend (no display) and only saves figures
-  - an environment/GPU banner and per-model timing + VRAM stats are printed
-    for each run
-
-lm-polygraph's UEManager(ignore_exceptions=True) catches per-estimator
-failures internally (a single estimator OOMing or erroring doesn't take down
-the whole model's run). The outer per-model try/except is an extra safety net
-for anything that escapes the manager (e.g. OOM during model loading itself).
-Results are checkpointed after each model (results_partial.csv) and resumed
-by model name on the next run via results_final.csv.
-"""
 import argparse
 import gc
 import os
@@ -31,11 +5,10 @@ import sys
 import time
 import traceback
 
-# Must be set before `import torch` to take effect.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import matplotlib
-matplotlib.use("Agg")  # headless container, no display
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -52,7 +25,7 @@ from lm_polygraph.utils.builder_enviroment_stat_calculator import BuilderEnviron
 from lm_polygraph.defaults.register_default_stat_calculators import register_default_stat_calculators
 from lm_polygraph.generation_metrics import AccuracyMetric
 from lm_polygraph.ue_metrics import PredictionRejectionArea
-from lm_polygraph.estimators import *  # noqa: F401,F403 (same as notebook)
+from lm_polygraph.estimators import *
 
 SEED = 3407
 
@@ -166,59 +139,181 @@ def format_prompt(example, fewshot_block):
 
 
 def format_chat_prompt(tokenizer, example, fewshot_block):
-    """Chat-template prompt for instruction-tuned models (MedGemma/Gemma3 -it).
-    See CHAT_TEMPLATE_MODELS comment for why this is needed."""
+    """Chat-template prompt for instruction-tuned models (MedGemma/Gemma3 -it)."""
     content = build_user_content(example, fewshot_block)
     messages = [{"role": "user", "content": content}]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
+FIGURE_A_MODELS_NOTE = (
+    "Figura A ~ Vashurin et al. Fig. 2 (white-box, full access: StableLM v2 12b / "
+    "Mistral v0.2 7b base) -> sostituita da LFM2-350M / LFM2-1.2B / MedGemma-4B-it / Gemma3-4B-it."
+)
+FIGURE_B_MODELS_NOTE = (
+    "Figura B ~ Vashurin et al. Fig. 3 (black-box/reflexive: StableLM v2 12b Chat / "
+    "Mistral v0.2 7b Instruct / GPT-4o-mini) -> sostituita dagli stessi 4 modelli nostri "
+    "(nel nostro caso l'accesso e' sempre white-box, quindi i metodi 'black-box' producono "
+    "lo stesso valore che avrebbero in accesso ristretto)."
+)
+
+# ---------------------------------------------------------------------------
+# Mappatura 1:1 con le righe (etichette esatte) delle Figure 2/3 e della
+# Tabella 6 di Vashurin et al. (arXiv:2406.15627, TACL 2025), cosi' come
+# incollate da Filo. Ogni voce e':
+#   - "factory": callable che istanzia il nostro estimator equivalente,
+#     "alias:<paper_label>" se il metodo e' identico a un altro gia' incluso
+#     (nessuna seconda istanza, solo etichetta duplicata nelle tabelle finali),
+#     None se il metodo NON e' incluso (vedi "reason").
+#   - "figure": "A" (solo Fig. 2, white-box full-access, stesso set di
+#     metodi della Tabella 6), "B" (solo Fig. 3, reflexive/black-box),
+#     "AB" (in entrambe le figure: i metodi a diversita' campionaria che
+#     restano identici in entrambi gli scenari).
+# Questa lista e' la SINGOLA fonte di verita': build_estimators() e le
+# tabelle finali derivano entrambe da qui, quindi "inclusi + esclusi con
+# motivo" == esattamente le righe delle 3 immagini, senza aggiunte ne' omissioni.
+# ---------------------------------------------------------------------------
+PAPER_METHODS = [
+    # --- solo Figura A / Tabella 6 (white-box, full access) ---
+    {"paper_label": "CCP", "figure": "A", "factory": lambda: ClaimConditionedProbability()},
+    {"paper_label": "Maximum Sequence Probability", "figure": "A", "factory": lambda: MaximumSequenceProbability()},
+    {"paper_label": "SAR", "figure": "A", "factory": lambda: SAR()},
+    {"paper_label": "Perplexity", "figure": "A", "factory": lambda: Perplexity()},
+    {"paper_label": "TokenSAR", "figure": "A", "factory": lambda: TokenSAR()},
+    {"paper_label": "SentenceSAR", "figure": "A", "factory": lambda: SentenceSAR()},
+    {"paper_label": "Semantic Entropy", "figure": "A", "factory": lambda: SemanticEntropy()},
+    {"paper_label": "Mean Token Entropy", "figure": "A", "factory": lambda: MeanTokenEntropy()},
+    {"paper_label": "Monte Carlo Sequence Entropy", "figure": "A", "factory": lambda: MonteCarloSequenceEntropy()},
+    {"paper_label": "Monte Carlo Normalized Sequence Entropy", "figure": "A", "factory": lambda: MonteCarloNormalizedSequenceEntropy()},
+    {"paper_label": "Pointwise Mutual Information", "figure": "A", "factory": lambda: MeanPointwiseMutualInformation()},
+    {"paper_label": "P(True)", "figure": "A", "factory": lambda: PTrue()},
+    {"paper_label": "Conditional Pointwise Mutual Information", "figure": "A", "factory": lambda: MeanConditionalPointwiseMutualInformation()},
+    {"paper_label": "Fisher-Rao", "figure": "A", "factory": lambda: FisherRao()},
+    {"paper_label": "Renyi Divergence", "figure": "A", "factory": lambda: RenyiNeg()},
+
+    # --- Figura A + B (diversita' campionaria, presenti in entrambi gli scenari) ---
+    {"paper_label": "EigValLaplacian NLI Score Entail.", "figure": "AB", "factory": lambda: EigValLaplacian(similarity_score="NLI_score", affinity="entail")},
+    {"paper_label": "EigValLaplacian Jaccard Score", "figure": "AB", "factory": lambda: EigValLaplacian(similarity_score="Jaccard_score")},
+    {"paper_label": "DegMat NLI Score Entail.", "figure": "AB", "factory": lambda: DegMat(similarity_score="NLI_score", affinity="entail")},
+    {"paper_label": "DegMat Jaccard Score", "figure": "AB", "factory": lambda: DegMat(similarity_score="Jaccard_score")},
+    {"paper_label": "Eccentricity NLI Score Entail.", "figure": "AB", "factory": lambda: Eccentricity(similarity_score="NLI_score", affinity="entail")},
+    {"paper_label": "Eccentricity Jaccard Score", "figure": "AB", "factory": lambda: Eccentricity(similarity_score="Jaccard_score")},
+    {"paper_label": "Lexical Similarity Rouge-L", "figure": "AB", "factory": lambda: LexicalSimilarity(metric="rougeL")},
+    {"paper_label": "Lexical Similarity BLEU", "figure": "AB", "factory": lambda: LexicalSimilarity(metric="BLEU")},
+    {"paper_label": "NumSet", "figure": "AB", "factory": lambda: NumSemSets()},
+
+    # --- solo Figura B (reflexive / black-box) ---
+    {"paper_label": "BB Semantic Entropy", "figure": "B", "factory": "alias:Semantic Entropy",
+     "reason": "Stessa classe SemanticEntropy() del white-box (lm-polygraph non ha una classe black-box "
+               "separata): nessuna istanza in piu', il valore viene solo duplicato in tabella con questa etichetta."},
+    {"paper_label": "Label Prob.", "figure": "B", "factory": lambda: LabelProb()},
+    {"paper_label": "BB P(True)", "figure": "B", "factory": lambda: PTrueEmpirical()},
+
+    # --- esclusi: density-based, richiedono dati di training separati ---
+    {"paper_label": "Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
+     "reason": "Richiede fit di un modello di densita' su embeddings del train set MedQA "
+               "(TrainingStatisticExtractionCalculator + EmbeddingsCalculator, non registrati di default "
+               "in register_default_stat_calculators): forward pass extra per modello, costo di tempo "
+               "cluster e rischio OOM su MedGemma/Gemma3 in bf16 (gia' a 23.5/24GB). Escluso su richiesta esplicita (2026-08-12)."},
+    {"paper_label": "RDE - Decoder", "figure": "A", "factory": None,
+     "reason": "Stesso motivo di Mahalanobis Distance: richiede training data ed embeddings extra. Escluso su richiesta esplicita (2026-08-12)."},
+    {"paper_label": "Relative Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
+     "reason": "Stesso motivo di Mahalanobis Distance: richiede training data ed embeddings extra. Escluso su richiesta esplicita (2026-08-12)."},
+    {"paper_label": "HUQ-MD - Decoder", "figure": "A", "factory": None,
+     "reason": "Non esiste come classe in lm-polygraph (verificato nel sorgente del repo IINemo/lm-polygraph: "
+               "nessun file/import con 'HUQ' in src/lm_polygraph/estimators/) -- andrebbe implementato da zero "
+               "leggendo il paper originale del metodo, fuori scope."},
+
+    # --- esclusi: verbalized/linguistic, incompatibili con la pipeline a generazione condivisa ---
+    {"paper_label": "Verbalized 1S top-k", "figure": "B", "factory": None,
+     "reason": "Estrae la confidenza dalla STESSA generazione greedy condivisa con gli altri 26 stimatori, "
+               "che oggi contiene solo la lettera A/B/C/D (max_new_tokens=3, 'senza altro testo'). Per "
+               "renderlo utile dovremmo cambiare prompt/lunghezza di generazione per tutti gli stimatori."},
+    {"paper_label": "Verbalized 1S top-1", "figure": "B", "factory": None,
+     "reason": "Stesso motivo di Verbalized 1S top-k (legge la confidenza dalla generazione condivisa)."},
+    {"paper_label": "Verbalized 2S top-k", "figure": "B", "factory": None,
+     "reason": "Richiede come 'prima risposta' un campionamento top-k; la nostra risposta condivisa e' "
+               "sempre greedy/deterministica, non produciamo varianti top-k della risposta principale."},
+    {"paper_label": "Verbalized 2S CoT", "figure": "B", "factory": None,
+     "reason": "Richiede una risposta con ragionamento chain-of-thought come primo turno; incompatibile "
+               "col prompt attuale, che vieta esplicitamente testo oltre alla lettera."},
+    {"paper_label": "Verbalized 2S top-1", "figure": "B", "factory": None,
+     "reason": "Verificato in lm_polygraph.utils.model.WhiteboxModel.tokenize(): il turno di follow-up "
+               "chat (necessario per questo estimator) viene formattato solo se il modello e' istanziato "
+               "con instruct=True; noi usiamo sempre instruct=False perche' applichiamo gia' il chat "
+               "template a mano al prompt principale (vedi format_chat_prompt). Attivare instruct=True "
+               "applicherebbe il chat template due volte a tutta la generazione condivisa degli altri "
+               "26 stimatori su MedGemma/Gemma3, corrompendola."},
+    {"paper_label": "Linguistic 1S", "figure": "B", "factory": None,
+     "reason": "Stesso motivo di Verbalized 1S: legge un'espressione verbale di confidenza dalla "
+               "generazione condivisa, che non la contiene."},
+]
+
+
 def build_estimators():
-    estimators = [
-        MaximumSequenceProbability(),
-        Perplexity(),
-        MeanTokenEntropy(),
-        MeanPointwiseMutualInformation(),
-        SelfCertainty(),
-        MeanConditionalPointwiseMutualInformation(),
-        ClaimConditionedProbability(),
-        PTrue(),
-        PTrueSampling(),
-        MonteCarloSequenceEntropy(),
-        MonteCarloNormalizedSequenceEntropy(),
-        LexicalSimilarity(metric="rouge1"),
-        LexicalSimilarity(metric="rouge2"),
-        LexicalSimilarity(metric="rougeL"),
-        LexicalSimilarity(metric="BLEU"),
-        NumSemSets(),
-        EigValLaplacian(similarity_score="NLI_score", affinity="entail"),
-        EigValLaplacian(similarity_score="NLI_score", affinity="contra"),
-        EigValLaplacian(similarity_score="Jaccard_score"),
-        DegMat(similarity_score="NLI_score", affinity="entail"),
-        DegMat(similarity_score="NLI_score", affinity="contra"),
-        DegMat(similarity_score="Jaccard_score"),
-        Eccentricity(similarity_score="NLI_score", affinity="entail"),
-        Eccentricity(similarity_score="NLI_score", affinity="contra"),
-        Eccentricity(similarity_score="Jaccard_score"),
-        SemanticEntropy(),
-        SemanticEntropy(entropy_estimation="direct"),
-        SAR(),
-        TokenSAR(),
-        SentenceSAR(),
-        LUQ(),
-        KernelLanguageEntropy(),
-        EigenScore(),
-        RenyiNeg(),
-        FisherRao(),
-        CSL(),
-        CocoaMSP(),
-        CocoaPPL(),
-        CocoaMTE(),
-        SemanticDensity(),
-        BoostedProbSequence(),
-    ]
-    print(f"Totale stimatori: {len(estimators)}")
+    """Istanzia solo i metodi con una factory valida in PAPER_METHODS (esclude
+    alias e voci senza factory). Vedi PAPER_METHODS per la mappatura completa
+    e i motivi di ogni esclusione."""
+    estimators = [m["factory"]() for m in PAPER_METHODS if callable(m["factory"])]
+    n_alias = sum(1 for m in PAPER_METHODS if m["factory"] == "alias:Semantic Entropy" or (isinstance(m["factory"], str) and m["factory"].startswith("alias:")))
+    n_excluded = sum(1 for m in PAPER_METHODS if m["factory"] is None)
+    print(f"Totale stimatori: {len(estimators)} (+{n_alias} alias, {n_excluded} esclusi con motivo, "
+          f"su {len(PAPER_METHODS)} metodi mappati dalle Figure 2/3 e Tabella 6 del paper)")
     return estimators
+
+
+def write_excluded_methods_report(results_dir):
+    """Scrive un riepilogo leggibile dei metodi del paper esclusi (con motivo)
+    e degli alias, per confronto rapido senza dover leggere PAPER_METHODS nel sorgente."""
+    lines = ["# Metodi UQ: mappatura con le Figure 2/3 e Tabella 6 (arXiv:2406.15627)\n"]
+    lines.append(FIGURE_A_MODELS_NOTE + "\n")
+    lines.append(FIGURE_B_MODELS_NOTE + "\n\n")
+    lines.append("## Alias (stesso valore di un altro metodo gia' incluso)\n")
+    for m in PAPER_METHODS:
+        if isinstance(m["factory"], str) and m["factory"].startswith("alias:"):
+            lines.append(f"- **{m['paper_label']}** (Fig. {m['figure']}): {m.get('reason', '')}\n")
+    lines.append("\n## Esclusi\n")
+    for m in PAPER_METHODS:
+        if m["factory"] is None:
+            lines.append(f"- **{m['paper_label']}** (Fig. {m['figure']}): {m.get('reason', '')}\n")
+    lines.append(f"\nTotale metodi mappati: {len(PAPER_METHODS)}. "
+                  f"Inclusi: {sum(1 for m in PAPER_METHODS if callable(m['factory']))}. "
+                  f"Alias: {sum(1 for m in PAPER_METHODS if isinstance(m['factory'], str))}. "
+                  f"Esclusi: {sum(1 for m in PAPER_METHODS if m['factory'] is None)}.\n")
+    path = os.path.join(results_dir, "excluded_methods.md")
+    with open(path, "w") as f:
+        f.writelines(lines)
+    print(f"Report metodi esclusi salvato: {path}")
+    return path
+
+
+class TimedEstimator:
+    """Wrapper trasparente attorno a un Estimator di lm-polygraph: misura il
+    tempo speso in __call__ (con torch.cuda.synchronize() per un timing GPU
+    accurato) e lo accumula in timing_dict[str(estimator)], usato per la
+    tabella di efficienza per metodo/modello. Preserva __str__/level/
+    stats_dependencies cosi' che UEManager lo tratti in modo identico
+    all'estimator originale (stesse chiavi in man.metrics)."""
+
+    def __init__(self, estimator, timing_dict):
+        self._estimator = estimator
+        self._timing_dict = timing_dict
+        self.level = estimator.level
+        self.stats_dependencies = estimator.stats_dependencies
+
+    def __str__(self):
+        return str(self._estimator)
+
+    def __call__(self, stats):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.time()
+        result = self._estimator(stats)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.time() - start
+        key = str(self._estimator)
+        self._timing_dict[key] = self._timing_dict.get(key, 0.0) + elapsed
+        return result
 
 
 def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager", use_quantization=True):
@@ -278,10 +373,7 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
 
 def extract_prr_table(man, model_name):
     """Converte man.metrics (dict con chiavi (livello, estimator_name,
-    generation_metric_name, ue_metric_name) -> valore) in un DataFrame lungo:
-    model, key, estimator, ue_metric, value. `estimator` (solo il nome del
-    metodo UQ) e' pensato per essere usato come etichetta nei grafici, molto
-    piu' leggibile della tupla completa in `key`."""
+    generation_metric_name, ue_metric_name) -> valore) in un DataFrame lungo."""
     rows = []
     for key, value in man.metrics.items():
         try:
@@ -333,7 +425,7 @@ def main():
 
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token is None and any(m in GATED_MODELS for m in MODELS):
-        print("!! ATTENZIONE: HF_TOKEN non impostato ma MODELS include modelli gated "
+        print("HF_TOKEN non impostato ma MODELS include modelli gated "
               f"({', '.join(m for m in MODELS if m in GATED_MODELS)}). "
               "Il download fallira' senza accettare la licenza + passare un token. "
               "Esporta HF_TOKEN nella shell prima di lanciare sbatch_script.sh.")
@@ -379,7 +471,23 @@ def main():
     models_to_run = {k: v for k, v in MODELS.items() if k not in already_done}
     print("Modelli da eseguire in questo run:", list(models_to_run.keys()))
 
+    write_excluded_methods_report(args.results_dir)
+
+    # Nome-interno (str(estimator)) -> etichetta del paper, per rimappare i
+    # risultati alle Figure 2/3 / Tabella 6 senza toccare extract_prr_table.
+    paper_label_by_str = {
+        str(m["factory"]()): m["paper_label"] for m in PAPER_METHODS if callable(m["factory"])
+    }
+
     all_metrics_dfs = [results_df_existing] if results_df_existing is not None else []
+
+    timing_final_path = os.path.join(args.results_dir, "estimator_timings.csv")
+    all_timing_dfs = []
+    if os.path.exists(timing_final_path):
+        try:
+            all_timing_dfs = [pd.read_csv(timing_final_path)]
+        except Exception as e:
+            print(f"estimator_timings.csv presente ma illeggibile ({e}) -- riparto senza skip.")
 
     for model_name, model_id in models_to_run.items():
         print(f"\n=== Modello: {model_name} ({model_id}) ===")
@@ -387,9 +495,6 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         try:
-            # MedGemma/Gemma3 (-it, chat-tuned) need apply_chat_template()
-            # and produce NaN logits under 4-bit quant -- see
-            # CHAT_TEMPLATE_MODELS comment.
             use_quant = model_name not in CHAT_TEMPLATE_MODELS
             model = load_whitebox_model(
                 model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant,
@@ -402,7 +507,8 @@ def main():
                 model_x_prompts = x_prompts
             model_dataset = PolygraphDataset(model_x_prompts, y_references, batch_size=args.batch_size)
 
-            estimators = build_estimators()
+            timing_dict = {}
+            estimators = [TimedEstimator(e, timing_dict) for e in build_estimators()]
             man = build_manager(model, model_dataset, estimators, args.cache_dir, args.max_rejection, args.max_new_tokens)
             man()
             log_gpu_mem(f"{model_name} done")
@@ -411,6 +517,17 @@ def main():
             n_ok = df["value"].notna().sum() if "value" in df.columns else 0
             print(f"{model_name}: {n_ok}/{len(df)} righe metrica con valore.")
             all_metrics_dfs.append(df)
+
+            timing_rows = [
+                {
+                    "model": model_name,
+                    "estimator": est_str,
+                    "paper_label": paper_label_by_str.get(est_str, est_str),
+                    "seconds": seconds,
+                }
+                for est_str, seconds in timing_dict.items()
+            ]
+            all_timing_dfs.append(pd.DataFrame(timing_rows))
 
             del model, man
         except Exception:
@@ -427,6 +544,10 @@ def main():
                 os.path.join(args.results_dir, "results_partial.csv"), index=False
             )
             print(f"Checkpoint salvato dopo {model_name}.")
+        if all_timing_dfs:
+            pd.concat(all_timing_dfs, ignore_index=True).to_csv(
+                os.path.join(args.results_dir, "estimator_timings_partial.csv"), index=False
+            )
 
     if not all_metrics_dfs:
         print("Nessun modello completato con successo -- niente da salvare/plottare.")
@@ -436,56 +557,114 @@ def main():
     results_df.to_csv(final_path, index=False)
     print(results_df.head(20))
 
-    # Plots use only the raw PRR ("prr_0.5"), not "prr_0.5_normalized": the
-    # normalized values swing from ~-2.5 to ~1.0 and swamp the color scale /
-    # bar range, hiding the much more informative raw 0-0.4 spread. Both
-    # metrics remain in the CSV either way. Labels use `estimator` (just the
-    # method name) instead of the full `key` tuple, which is unreadably long
-    # once rendered as an axis label across 41 estimators.
+    if all_timing_dfs:
+        timing_df = pd.concat(all_timing_dfs, ignore_index=True)
+        timing_df.to_csv(timing_final_path, index=False)
+
     raw_df = results_df[results_df["ue_metric"] == "prr_0.5"] if "ue_metric" in results_df.columns else results_df
-    n_estimators = raw_df["estimator"].nunique() if "estimator" in raw_df.columns else 20
+    raw_df = raw_df.copy()
+    raw_df["paper_label"] = raw_df["estimator"].map(paper_label_by_str).fillna(raw_df["estimator"])
+
+    # Aggiunge le righe alias (es. "BB Semantic Entropy" = stesso valore di
+    # "Semantic Entropy") cosi' che le tabelle finali abbiano esattamente le
+    # etichette delle Figure 2/3, senza ricalcolare nulla.
+    alias_rows = []
+    for m in PAPER_METHODS:
+        if isinstance(m["factory"], str) and m["factory"].startswith("alias:"):
+            target_label = m["factory"].split("alias:", 1)[1]
+            src = raw_df[raw_df["paper_label"] == target_label]
+            for _, row in src.iterrows():
+                alias_rows.append({**row.to_dict(), "paper_label": m["paper_label"]})
+    if alias_rows:
+        raw_df = pd.concat([raw_df, pd.DataFrame(alias_rows)], ignore_index=True)
+
+    raw_df.to_csv(os.path.join(args.results_dir, "results_paper_mapped.csv"), index=False)
+
+    figure_a_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("A", "AB") and m["factory"] is not None]
+    figure_b_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("B", "AB") and m["factory"] is not None]
+    model_order = [m for m in MODELS.keys() if m in raw_df["model"].unique()]
+
+    def plot_paper_figure(labels, title, note, out_name):
+        subset = raw_df[raw_df["paper_label"].isin(labels)]
+        if subset.empty:
+            print(f"!!! Nessun dato per {out_name}, salto.")
+            return
+        pivot = subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
+        pivot = pivot.reindex(columns=model_order)
+        pivot["Mean"] = pivot.mean(axis=1)
+        pivot = pivot.sort_values("Mean", ascending=True)  # barh: prima riga in cima = ultima disegnata
+        fig, ax = plt.subplots(figsize=(10, max(6, len(pivot) * 0.4)))
+        pivot.plot(kind="barh", ax=ax, width=0.8)
+        ax.set_xlabel("Mean PRR (raw, max_rejection=0.5)")
+        ax.set_title(title)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.legend(loc="lower right", fontsize=8)
+        fig.text(0.01, 0.01, note, fontsize=6, wrap=True)
+        plt.tight_layout()
+        out_path = os.path.join(args.results_dir, out_name)
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Salvato: {out_path}")
 
     try:
-        pivot = raw_df.pivot_table(index="estimator", columns="model", values="value", aggfunc="first").sort_index()
-        fig, ax = plt.subplots(figsize=(8, max(8, n_estimators * 0.32)))
-        sns.heatmap(pivot, annot=True, fmt=".3f", cmap="RdYlGn", center=pivot.stack().median(),
-                    cbar_kws={"label": "PRR (raw)"}, ax=ax, annot_kws={"size": 8})
-        ax.set_title("Prediction-Rejection Ratio (raw) per metodo UQ e modello — MedQA-USMLE")
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")
-        ax.set_yticklabels(ax.get_yticklabels(), fontsize=8)
-        plt.tight_layout()
-        heatmap_path = os.path.join(args.results_dir, "prr_heatmap.png")
-        plt.savefig(heatmap_path, dpi=150)
-        print(f"Heatmap salvata: {heatmap_path}")
+        plot_paper_figure(
+            figure_a_labels,
+            "PRR per metodo UQ e modello (~ Fig. 2 Vashurin et al., white-box full-access) — MedQA-USMLE",
+            FIGURE_A_MODELS_NOTE,
+            "fig_a_white_box.png",
+        )
     except Exception:
-        print("!!! Heatmap fallita:")
+        print("!!! fig_a_white_box.png fallito:")
         traceback.print_exc()
 
     try:
-        fig, axes = plt.subplots(1, 2, figsize=(16, max(10, n_estimators * 0.28)))
-
-        compare_models = ["MedGemma-4B-it", "Gemma3-4B-it"]
-        subset = raw_df[raw_df["model"].isin(compare_models)]
-        subset_pivot = subset.pivot_table(index="estimator", columns="model", values="value", aggfunc="first").sort_index()
-        subset_pivot.plot(kind="barh", ax=axes[0])
-        axes[0].set_title("Medico (MedGemma) vs generico (Gemma3), stessa taglia")
-        axes[0].set_xlabel("PRR (raw)")
-        axes[0].tick_params(axis="y", labelsize=8)
-
-        compare_sizes = ["LFM2-350M", "LFM2-1.2B"]
-        subset2 = raw_df[raw_df["model"].isin(compare_sizes)]
-        subset2_pivot = subset2.pivot_table(index="estimator", columns="model", values="value", aggfunc="first").sort_index()
-        subset2_pivot.plot(kind="barh", ax=axes[1])
-        axes[1].set_title("Effetto scala: LFM2-350M vs LFM2-1.2B")
-        axes[1].set_xlabel("PRR (raw)")
-        axes[1].tick_params(axis="y", labelsize=8)
-
-        plt.tight_layout()
-        comparisons_path = os.path.join(args.results_dir, "comparisons.png")
-        plt.savefig(comparisons_path, dpi=150)
-        print(f"Comparazioni salvate: {comparisons_path}")
+        plot_paper_figure(
+            figure_b_labels,
+            "PRR per metodo UQ e modello (~ Fig. 3 Vashurin et al., reflexive/black-box) — MedQA-USMLE",
+            FIGURE_B_MODELS_NOTE,
+            "fig_b_reflexive.png",
+        )
     except Exception:
-        print("!!! Grafico di comparazione fallito:")
+        print("!!! fig_b_reflexive.png fallito:")
+        traceback.print_exc()
+
+    # Tabella stile Tabella 6 del paper: stesso set di metodi della Figura A,
+    # ma con i nostri 4 modelli al posto delle 4 dataset (CoQA/TriviaQA/
+    # MMLU/GSM8k) -- loro tenevano il modello fisso e variavano il dataset,
+    # noi teniamo il dataset fisso (MedQA) e variamo il modello.
+    try:
+        subset = raw_df[raw_df["paper_label"].isin(figure_a_labels)]
+        table6 = subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
+        table6 = table6.reindex(columns=model_order)
+        ranks = table6.rank(axis=0, ascending=False)
+        table6["Mean Rank"] = ranks.mean(axis=1)
+        table6["Mean PRR"] = table6[model_order].mean(axis=1)
+        table6 = table6.sort_values("Mean PRR", ascending=False)
+        table6_path = os.path.join(args.results_dir, "table6_style.csv")
+        table6.to_csv(table6_path)
+        print(f"Salvato: {table6_path}")
+    except Exception:
+        print("!!! table6_style.csv fallito:")
+        traceback.print_exc()
+
+    # Tabella di efficienza: tempo (secondi) speso da ciascun metodo UQ per
+    # modello, per verificare quali stimatori sono piu' costosi.
+    try:
+        if all_timing_dfs:
+            timing_all = pd.concat(all_timing_dfs, ignore_index=True).drop_duplicates(
+                subset=["model", "estimator"], keep="last"
+            )
+            timing_pivot = timing_all.pivot_table(
+                index="paper_label", columns="model", values="seconds", aggfunc="first"
+            )
+            timing_pivot = timing_pivot.reindex(columns=model_order)
+            timing_pivot["Total"] = timing_pivot.sum(axis=1)
+            timing_pivot = timing_pivot.sort_values("Total", ascending=False)
+            timing_path = os.path.join(args.results_dir, "estimator_timing_table.csv")
+            timing_pivot.to_csv(timing_path)
+            print(f"Salvato: {timing_path}")
+    except Exception:
+        print("!!! estimator_timing_table.csv fallito:")
         traceback.print_exc()
 
     print("\nBENCHMARK COMPLETATO.")
