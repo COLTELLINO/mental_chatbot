@@ -34,4 +34,10 @@ RUN pip install --no-cache-dir --no-deps -r requirements-nodeps.txt
 # version conflict with the pinned core stack fails loudly here, not silently.
 RUN pip install --no-cache-dir -r requirements-benchmark.txt
 
+# AlignScore (used by lm-polygraph's AlignScore generation metric, for
+# CoQA/TriviaQA free-form answers) uses spaCy for sentence splitting.
+# requirements-benchmark.txt already pins spacy itself, but the actual
+# language model is a separate download, not a pip dependency.
+RUN python -m spacy download en_core_web_sm
+
 ENV DEBIAN_FRONTEND=dialog

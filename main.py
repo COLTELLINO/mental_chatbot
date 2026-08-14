@@ -1,6 +1,7 @@
 import argparse
 import gc
 import os
+import re
 import sys
 import textwrap
 import time
@@ -13,7 +14,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -24,7 +24,8 @@ from lm_polygraph.utils.model import WhiteboxModel
 from lm_polygraph.utils.processor import Logger
 from lm_polygraph.utils.builder_enviroment_stat_calculator import BuilderEnvironmentStatCalculator
 from lm_polygraph.defaults.register_default_stat_calculators import register_default_stat_calculators
-from lm_polygraph.generation_metrics import AccuracyMetric
+from lm_polygraph.generation_metrics import AccuracyMetric, AlignScore
+from lm_polygraph.generation_metrics.generation_metric import GenerationMetric
 from lm_polygraph.ue_metrics import PredictionRejectionArea
 from lm_polygraph.estimators import *
 
@@ -48,43 +49,11 @@ GATED_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 # load_whitebox_model's use_quantization flag.
 CHAT_TEMPLATE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
-FEWSHOT_EXAMPLES = [
-    {
-        "question": "A 3-month-old baby died suddenly at night while asleep. His mother noticed that he had died only after she awoke in the morning. No cause of death was determined based on the autopsy. Which of the following precautions could have prevented the death of the baby?",
-        "options": {
-            "A": "Placing the infant in a supine position on a firm mattress while sleeping",
-            "B": "Keeping the infant covered and maintaining a high room temperature",
-            "C": "Application of a device to maintain the sleeping position",
-            "D": "Avoiding pacifier use during sleep",
-        },
-        "answer_idx": "A",
-    },
-    {
-        "question": "A 9-month-old female is brought to the emergency department after experiencing a seizure. She was born at home and was normal at birth according to her parents. Since then, they have noticed that she does not appear to be achieving developmental milestones as quickly as her siblings, and often appears lethargic. Physical exam reveals microcephaly, very light pigmentation (as compared to her family), and a \"musty\" body odor. The varied manifestations of this disease can most likely be attributed to which of the following genetic principles?",
-        "options": {
-            "A": "Anticipation",
-            "B": "Multiple gene mutations",
-            "C": "Pleiotropy",
-            "D": "Variable expressivity",
-        },
-        "answer_idx": "C",
-    },
-    {
-        "question": "A 68-year-old man presents to the emergency department with leg pain. He states that the pain started suddenly while he was walking outside. The patient has a past medical history of diabetes, hypertension, obesity, and atrial fibrillation. His temperature is 99.3°F (37.4°C), blood pressure is 152/98 mmHg, pulse is 97/min, respirations are 15/min, and oxygen saturation is 99% on room air. Physical exam is notable for a cold and pale left leg. The patient's sensation is markedly diminished in the left leg when compared to the right, and his muscle strength is 1/5 in his left leg. Which of the following is the best next step in management?",
-        "options": {
-            "A": "Graded exercise and aspirin",
-            "B": "Heparin drip",
-            "C": "Surgical thrombectomy",
-            "D": "Tissue plasminogen activator",
-        },
-        "answer_idx": "B",
-    },
-]
-
 
 def print_banner():
     print("=" * 70)
-    print("MEDQA UQ BENCHMARK")
+    print("UQ BENCHMARK -- Sezione 5.1 Vashurin et al. (arXiv:2406.15627)")
+    print("Selective QA: CoQA, TriviaQA, MMLU, GSM8k")
     print("=" * 70)
     print(f"Python: {sys.version}")
     print(f"Torch: {torch.__version__}")
@@ -105,56 +74,232 @@ def log_gpu_mem(tag):
     print(f"[GPU MEM] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB peak={peak:.2f}GB")
 
 
-def build_fewshot_block():
-    blocks = []
-    for ex in FEWSHOT_EXAMPLES:
-        opts = ex["options"]
-        blocks.append(
-            f"Domanda: {ex['question']}\n\n"
-            f"A) {opts['A']}\n"
-            f"B) {opts['B']}\n"
-            f"C) {opts['C']}\n"
-            f"D) {opts['D']}\n\n"
-            f"Risposta: {ex['answer_idx']}"
-        )
-    return "\n\n".join(blocks)
+# ---------------------------------------------------------------------------
+# Caricamento dataset (Sezione 5.1 del paper). Ogni loader restituisce una
+# lista di dict {"content": <corpo del prompt, senza suffisso finale>,
+# "reference": <testo/lettera/numero di riferimento>}, cosi' che il resto
+# della pipeline (format_prompt/format_chat_prompt, generation_metric) sia
+# identico per tutti i dataset.
+#
+# Dimensioni ridotte rispetto al paper (che usa 2000 istanze/dataset, 100/
+# subject per MMLU) per contenere il tempo di calcolo sul cluster: n=100 per
+# CoQA/TriviaQA/MMLU (stessa scala usata finora per MedQA), n=50 per GSM8k
+# (le sue generazioni sono molto piu' lunghe -- ~128 token medi di
+# ragionamento contro i ~4 degli altri tre -- quindi pesano di piu' su tutti
+# gli stimatori a campionamento). Deciso esplicitamente da Filo (2026-08-14).
+#
+# I prompt 5-shot (TriviaQA/MMLU/GSM8k) sono costruiti da noi in uno stile
+# coerente col resto della pipeline, NON sono una replica byte-per-byte dei
+# template di lm-evaluation-harness citati nel paper -- da tenere come
+# caveat in tesi. Per MMLU il paper campiona fino a 100 domande PER SUBJECT
+# (57 subject); noi campioniamo 100 domande totali su tutti i subject
+# insieme (stesso budget usato per gli altri dataset), quindi non tutti i
+# 57 subject saranno necessariamente rappresentati.
+# ---------------------------------------------------------------------------
+
+def prepare_coqa(n_test, seed):
+    """CoQA (stanfordnlp/coqa, split 'validation', 500 righe = 500 istanze
+    di test come da Table 2 del paper). Ogni riga e' una conversazione;
+    usiamo tutte le domande/risposte tranne l'ultima come storico della
+    conversazione (few-shot "naturale") e l'ultima domanda come target,
+    esattamente come descritto nel paper."""
+    raw = load_dataset("stanfordnlp/coqa")["validation"]
+    raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
+    examples = []
+    for row in raw:
+        questions = row["questions"]
+        answers = row["answers"]["input_text"]
+        if len(questions) < 1:
+            continue
+        history = list(zip(questions[:-1], answers[:-1]))
+        lines = [
+            "Leggi il passaggio seguente e rispondi in modo breve e diretto alla domanda "
+            "finale della conversazione, nello stesso stile delle risposte precedenti.",
+            "",
+            f"Passaggio: {row['story'].strip()}",
+            "",
+        ]
+        for q, a in history:
+            lines.append(f"D: {q.strip()}")
+            lines.append(f"R: {a.strip()}")
+        lines.append(f"D: {questions[-1].strip()}")
+        examples.append({"content": "\n".join(lines), "reference": answers[-1]})
+    return examples
 
 
-def build_user_content(example, fewshot_block):
-    opts = example["options"]
-    return (
-        "Sei un assistente medico che risponde a domande in stile esame USMLE.\n"
-        "Leggi il quesito clinico e rispondi SOLO con la lettera dell'opzione corretta (A, B, C o D), senza altro testo.\n\n"
-        f"{fewshot_block}\n\n"
-        f"Domanda: {example['question'].strip()}\n\n"
-        f"A) {opts['A'].strip()}\n"
-        f"B) {opts['B'].strip()}\n"
-        f"C) {opts['C'].strip()}\n"
-        f"D) {opts['D'].strip()}"
+def prepare_triviaqa(n_test, seed, n_fewshot=5):
+    """TriviaQA (mandarjoshi/trivia_qa, config 'rc.nocontext' -- "without
+    context" come nel paper). Split train/test hanno 138384/17210 righe,
+    identici ai numeri di Table 2. 5-shot da esempi del train set."""
+    raw = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext")
+    fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
+    fewshot_block = "\n\n".join(
+        f"Domanda: {r['question'].strip()}\nRisposta: {r['answer']['value']}" for r in fewshot
     )
+    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
+    examples = []
+    for r in test:
+        content = (
+            "Rispondi alla domanda in modo breve e diretto (poche parole), senza spiegazioni.\n\n"
+            f"{fewshot_block}\n\nDomanda: {r['question'].strip()}"
+        )
+        examples.append({"content": content, "reference": r["answer"]["value"]})
+    return examples
 
 
-def format_prompt(example, fewshot_block):
-    """Plain-text completion prompt (LFM2 base models)."""
-    return build_user_content(example, fewshot_block) + "\n\nRisposta:"
+def prepare_mmlu(n_test, seed):
+    """MMLU (cais/mmlu, config 'all'). 5-shot per-subject usando lo split
+    'dev' (5 esempi per subject, protocollo standard MMLU), come nel paper."""
+    raw = load_dataset("cais/mmlu", "all")
+    letters = ["A", "B", "C", "D"]
+    dev_by_subject = {}
+    for r in raw["dev"]:
+        dev_by_subject.setdefault(r["subject"], []).append(r)
+    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
+    examples = []
+    for r in test:
+        fewshot_rows = dev_by_subject.get(r["subject"], [])[:5]
+        blocks = []
+        for f in fewshot_rows:
+            opt_lines = "\n".join(f"{letters[i]}) {c}" for i, c in enumerate(f["choices"]))
+            blocks.append(f"Domanda: {f['question']}\n{opt_lines}\nRisposta: {letters[f['answer']]}")
+        fewshot_block = "\n\n".join(blocks)
+        opt_lines = "\n".join(f"{letters[i]}) {c}" for i, c in enumerate(r["choices"]))
+        content = (
+            "Rispondi SOLO con la lettera dell'opzione corretta (A, B, C o D), senza altro testo.\n\n"
+            f"{fewshot_block}\n\nDomanda: {r['question'].strip()}\n{opt_lines}"
+        )
+        examples.append({"content": content, "reference": letters[r["answer"]]})
+    return examples
 
 
-def format_chat_prompt(tokenizer, example, fewshot_block):
-    """Chat-template prompt for instruction-tuned models (MedGemma/Gemma3 -it)."""
-    content = build_user_content(example, fewshot_block)
+def prepare_gsm8k(n_test, seed, n_fewshot=5):
+    """GSM8k (openai/gsm8k, config 'main'). Split train/test hanno
+    7473/1319 righe, identici a Table 2. 5-shot dal train set, con la
+    risposta 'reference' ridotta al solo numero finale (dopo '####')."""
+    raw = load_dataset("openai/gsm8k", "main")
+    fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
+    blocks = []
+    for r in fewshot:
+        ans_clean = r["answer"].replace("####", "Risposta finale:")
+        blocks.append(f"Problema: {r['question'].strip()}\nSoluzione: {ans_clean}")
+    fewshot_block = "\n\n".join(blocks)
+    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
+    examples = []
+    for r in test:
+        content = (
+            "Risolvi il problema passo per passo, poi scrivi il risultato finale preceduto "
+            "esattamente da 'Risposta finale:'.\n\n"
+            f"{fewshot_block}\n\nProblema: {r['question'].strip()}"
+        )
+        final = r["answer"].split("####")[-1].strip().replace(",", "")
+        examples.append({"content": content, "reference": final})
+    return examples
+
+
+class GSM8kAccuracyMetric(GenerationMetric):
+    """lm-polygraph non ha una metrica pronta per problemi matematici a
+    risposta numerica (solo Accuracy per multiple-choice o AlignScore per
+    testo libero). Estrae l'ULTIMO numero presente nel testo generato
+    (robusto anche se il modello non segue esattamente il formato "Risposta
+    finale: X" richiesto nel prompt) e lo confronta con il numero di
+    riferimento con una tolleranza numerica minima."""
+
+    def __init__(self):
+        super().__init__(["greedy_texts"], "sequence")
+
+    def __str__(self):
+        return "GSM8kAccuracy"
+
+    @staticmethod
+    def _extract_number(text):
+        cleaned = text.replace(",", "")
+        matches = re.findall(r"-?\d+\.?\d*", cleaned)
+        if not matches:
+            return None
+        try:
+            return float(matches[-1])
+        except ValueError:
+            return None
+
+    def __call__(self, stats, target_texts):
+        preds = stats["greedy_texts"]
+        scores = []
+        for pred, ref in zip(preds, target_texts):
+            pred_num = self._extract_number(pred)
+            try:
+                ref_num = float(str(ref).replace(",", ""))
+            except (TypeError, ValueError):
+                ref_num = None
+            if pred_num is None or ref_num is None:
+                scores.append(0.0)
+            else:
+                scores.append(1.0 if abs(pred_num - ref_num) < 1e-4 else 0.0)
+        return np.array(scores)
+
+
+# Regex condivisa con MMLU/MedQA-style: tiene solo la lettera A-D, scarta
+# qualunque testo dopo (serve perche' AccuracyMetric confronta stringhe
+# esatte e i modelli a volte aggiungono testo/punteggiatura extra).
+_MCQ_IGNORE_REGEX = r"(?<=[ABCDabcd])[\s\S]*"
+
+DATASETS = {
+    "CoQA": {
+        "loader": prepare_coqa,
+        "n_test": 100,
+        "max_new_tokens": 30,
+        "plain_suffix": "\nR:",
+        "generation_metric_factory": lambda: AlignScore(),
+    },
+    "TriviaQA": {
+        "loader": prepare_triviaqa,
+        "n_test": 100,
+        "max_new_tokens": 20,
+        "plain_suffix": "\nRisposta:",
+        "generation_metric_factory": lambda: AlignScore(),
+    },
+    "MMLU": {
+        "loader": prepare_mmlu,
+        "n_test": 100,
+        "max_new_tokens": 3,
+        "plain_suffix": "\n\nRisposta:",
+        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
+    },
+    "GSM8k": {
+        "loader": prepare_gsm8k,
+        "n_test": 50,
+        # Target medio 128.6 token (Table 2, tokenizer Mistral 7B v0.2):
+        # margine ampio per lasciare spazio al ragionamento completo prima
+        # del numero finale (non calcoliamo il 99esimo percentile esatto
+        # come nel paper, usiamo un valore fisso prudente).
+        "max_new_tokens": 200,
+        "plain_suffix": "\nSoluzione:",
+        "generation_metric_factory": lambda: GSM8kAccuracyMetric(),
+    },
+}
+
+
+def format_prompt(content, suffix):
+    """Prompt a completamento di testo semplice (modelli base LFM2)."""
+    return content + suffix
+
+
+def format_chat_prompt(tokenizer, content):
+    """Prompt con chat template per modelli instruction-tuned (MedGemma/Gemma3 -it)."""
     messages = [{"role": "user", "content": content}]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
 FIGURE_A_MODELS_NOTE = (
     "Figura A ~ Vashurin et al. Fig. 2 (white-box, full access: StableLM v2 12b / "
-    "Mistral v0.2 7b base) -> sostituita da LFM2-350M / LFM2-1.2B / MedGemma-4B-it / Gemma3-4B-it."
+    "Mistral v0.2 7b base), Mean PRR aggregato su CoQA/TriviaQA/MMLU/GSM8k -> sostituita "
+    "da LFM2-350M / LFM2-1.2B / MedGemma-4B-it / Gemma3-4B-it."
 )
 FIGURE_B_MODELS_NOTE = (
     "Figura B ~ Vashurin et al. Fig. 3 (black-box/reflexive: StableLM v2 12b Chat / "
-    "Mistral v0.2 7b Instruct / GPT-4o-mini) -> sostituita dagli stessi 4 modelli nostri "
-    "(nel nostro caso l'accesso e' sempre white-box, quindi i metodi 'black-box' producono "
-    "lo stesso valore che avrebbero in accesso ristretto)."
+    "Mistral v0.2 7b Instruct / GPT-4o-mini), Mean PRR aggregato su CoQA/TriviaQA/MMLU/GSM8k -> "
+    "sostituita dagli stessi 4 modelli nostri (nel nostro caso l'accesso e' sempre white-box, "
+    "quindi i metodi 'black-box' producono lo stesso valore che avrebbero in accesso ristretto)."
 )
 
 # ---------------------------------------------------------------------------
@@ -211,7 +356,7 @@ PAPER_METHODS = [
 
     # --- esclusi: density-based, richiedono dati di training separati ---
     {"paper_label": "Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
-     "reason": "Richiede fit di un modello di densita' su embeddings del train set MedQA "
+     "reason": "Richiede fit di un modello di densita' su embeddings del train set "
                "(TrainingStatisticExtractionCalculator + EmbeddingsCalculator, non registrati di default "
                "in register_default_stat_calculators): forward pass extra per modello, costo di tempo "
                "cluster e rischio OOM su MedGemma/Gemma3 in bf16 (gia' a 23.5/24GB). Escluso su richiesta esplicita (2026-08-12)."},
@@ -227,8 +372,8 @@ PAPER_METHODS = [
     # --- esclusi: verbalized/linguistic, incompatibili con la pipeline a generazione condivisa ---
     {"paper_label": "Verbalized 1S top-k", "figure": "B", "factory": None,
      "reason": "Estrae la confidenza dalla STESSA generazione greedy condivisa con gli altri 26 stimatori, "
-               "che oggi contiene solo la lettera A/B/C/D (max_new_tokens=3, 'senza altro testo'). Per "
-               "renderlo utile dovremmo cambiare prompt/lunghezza di generazione per tutti gli stimatori."},
+               "che oggi contiene solo la risposta breve/lettera richiesta dal task (nessun testo di confidenza). "
+               "Per renderlo utile dovremmo cambiare prompt/lunghezza di generazione per tutti gli stimatori."},
     {"paper_label": "Verbalized 1S top-1", "figure": "B", "factory": None,
      "reason": "Stesso motivo di Verbalized 1S top-k (legge la confidenza dalla generazione condivisa)."},
     {"paper_label": "Verbalized 2S top-k", "figure": "B", "factory": None,
@@ -236,7 +381,8 @@ PAPER_METHODS = [
                "sempre greedy/deterministica, non produciamo varianti top-k della risposta principale."},
     {"paper_label": "Verbalized 2S CoT", "figure": "B", "factory": None,
      "reason": "Richiede una risposta con ragionamento chain-of-thought come primo turno; incompatibile "
-               "col prompt attuale, che vieta esplicitamente testo oltre alla lettera."},
+               "con i prompt CoQA/TriviaQA/MMLU (risposta breve richiesta) -- solo GSM8k ha gia' CoT, ma "
+               "e' un solo dataset su quattro e non e' comunque il formato standard atteso da questo estimator."},
     {"paper_label": "Verbalized 2S top-1", "figure": "B", "factory": None,
      "reason": "Verificato in lm_polygraph.utils.model.WhiteboxModel.tokenize(): il turno di follow-up "
                "chat (necessario per questo estimator) viene formattato solo se il modello e' istanziato "
@@ -255,7 +401,7 @@ def build_estimators():
     alias e voci senza factory). Vedi PAPER_METHODS per la mappatura completa
     e i motivi di ogni esclusione."""
     estimators = [m["factory"]() for m in PAPER_METHODS if callable(m["factory"])]
-    n_alias = sum(1 for m in PAPER_METHODS if m["factory"] == "alias:Semantic Entropy" or (isinstance(m["factory"], str) and m["factory"].startswith("alias:")))
+    n_alias = sum(1 for m in PAPER_METHODS if isinstance(m["factory"], str) and m["factory"].startswith("alias:"))
     n_excluded = sum(1 for m in PAPER_METHODS if m["factory"] is None)
     print(f"Totale stimatori: {len(estimators)} (+{n_alias} alias, {n_excluded} esclusi con motivo, "
           f"su {len(PAPER_METHODS)} metodi mappati dalle Figure 2/3 e Tabella 6 del paper)")
@@ -345,7 +491,7 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation=
     return model
 
 
-def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens):
+def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens, generation_metric):
     available_stat_calculators = register_default_stat_calculators(
         model_type="Whitebox",
         language="en",
@@ -363,7 +509,7 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
         estimators=estimators,
         builder_env_stat_calc=builder_env_stat_calc,
         available_stat_calculators=available_stat_calculators,
-        generation_metrics=[AccuracyMetric(output_ignore_regex=r"(?<=[ABCDabcd])[\s\S]*")],
+        generation_metrics=[generation_metric],
         ue_metrics=[PredictionRejectionArea(max_rejection=max_rejection)],
         processors=[Logger()],
         ignore_exceptions=True,
@@ -392,32 +538,14 @@ def extract_prr_table(man, model_name):
     return pd.DataFrame(rows)
 
 
-def run_smoke_test(x_prompts, y_references, cache_dir, hf_token, max_rejection, max_new_tokens):
-    print("\n--- SMOKE TEST: 25 esempi, un solo modello (LFM2-350M) ---")
-    smoke_dataset = PolygraphDataset(x_prompts[:25], y_references[:25], batch_size=4)
-    smoke_model = load_whitebox_model(MODELS["LFM2-350M"], cache_dir, hf_token=hf_token)
-    smoke_estimators = build_estimators()
-    smoke_man = build_manager(smoke_model, smoke_dataset, smoke_estimators, cache_dir, max_rejection, max_new_tokens)
-    smoke_man()
-    print(type(smoke_man.metrics))
-    print(smoke_man.metrics)
-    for i in range(8):
-        inputs = smoke_model.tokenizer(x_prompts[i], return_tensors="pt").to(smoke_model.model.device)
-        out = smoke_model.model.generate(**inputs, max_new_tokens=5, do_sample=False)
-        generated = smoke_model.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        print(f"Generato: {generated!r} | Riferimento: {y_references[i]!r}")
-    del smoke_model, smoke_man
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def main():
-    parser = argparse.ArgumentParser(description="MedQA UQ benchmark (lm-polygraph)")
-    parser.add_argument("--n_test_samples", type=int, default=100)
+    parser = argparse.ArgumentParser(
+        description="Selective QA UQ benchmark (lm-polygraph) -- replica Sezione 5.1 Vashurin et al."
+    )
+    parser.add_argument("--n_test_samples", type=int, default=None,
+                         help="Se specificato, sovrascrive n_test per TUTTI i dataset (utile per smoke test rapidi).")
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_new_tokens", type=int, default=3)
     parser.add_argument("--max_rejection", type=float, default=0.5)
-    parser.add_argument("--smoke_test", action="store_true", default=False)
     parser.add_argument("--results_dir", type=str, default=os.environ.get("RESULTS_DIR", "/workspace/results"))
     parser.add_argument("--cache_dir", type=str, default=os.environ.get("HF_HOME", "/llms"))
     args = parser.parse_args()
@@ -439,39 +567,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
-    print("\n--- Caricamento dataset: GBaker/MedQA-USMLE-4-options ---")
-    raw = load_dataset("GBaker/MedQA-USMLE-4-options")
-    print(raw)
-    print(raw["test"][0])
-
-    fewshot_block = build_fewshot_block()
-    test_split = raw["test"].shuffle(seed=SEED).select(range(args.n_test_samples))
-    x_prompts = [format_prompt(ex, fewshot_block) for ex in test_split]
-    y_references = [ex["answer_idx"] for ex in test_split]
-    print(x_prompts[0])
-    print("Riferimento:", y_references[0])
-
-    if args.smoke_test:
-        run_smoke_test(x_prompts, y_references, args.cache_dir, hf_token, args.max_rejection, args.max_new_tokens)
-
-    final_path = os.path.join(args.results_dir, "results_final.csv")
-    results_df_existing = None
-    already_done = set()
-
-    if os.path.exists(final_path):
-        try:
-            results_df_existing = pd.read_csv(final_path)
-            already_done = set(results_df_existing["model"].unique())
-            print("Modelli gia' completati (da results_final.csv):", already_done)
-        except Exception as e:
-            print(f"results_final.csv presente ma illeggibile ({e}) -- riparto senza skip.")
-            results_df_existing = None
-    else:
-        print("Nessun risultato precedente trovato -- primo avvio, eseguo tutti i modelli.")
-
-    models_to_run = {k: v for k, v in MODELS.items() if k not in already_done}
-    print("Modelli da eseguire in questo run:", list(models_to_run.keys()))
-
     write_excluded_methods_report(args.results_dir)
 
     # Nome-interno (str(estimator)) -> etichetta del paper, per rimappare i
@@ -479,6 +574,32 @@ def main():
     paper_label_by_str = {
         str(m["factory"]()): m["paper_label"] for m in PAPER_METHODS if callable(m["factory"])
     }
+
+    print("\n--- Caricamento dataset (Sezione 5.1: CoQA, TriviaQA, MMLU, GSM8k) ---")
+    dataset_examples = {}
+    for ds_name, cfg in DATASETS.items():
+        n_test = args.n_test_samples if args.n_test_samples is not None else cfg["n_test"]
+        print(f"Caricamento {ds_name} (n_test={n_test})...")
+        examples = cfg["loader"](n_test, SEED)
+        print(f"{ds_name}: {len(examples)} esempi caricati.")
+        print(examples[0]["content"][:500])
+        print("Riferimento:", examples[0]["reference"])
+        dataset_examples[ds_name] = examples
+
+    final_path = os.path.join(args.results_dir, "results_final.csv")
+    results_df_existing = None
+    already_done_pairs = set()
+
+    if os.path.exists(final_path):
+        try:
+            results_df_existing = pd.read_csv(final_path)
+            already_done_pairs = set(zip(results_df_existing["dataset"], results_df_existing["model"]))
+            print("Combinazioni dataset x modello gia' completate:", already_done_pairs)
+        except Exception as e:
+            print(f"results_final.csv presente ma illeggibile ({e}) -- riparto senza skip.")
+            results_df_existing = None
+    else:
+        print("Nessun risultato precedente trovato -- primo avvio, eseguo tutte le combinazioni.")
 
     all_metrics_dfs = [results_df_existing] if results_df_existing is not None else []
 
@@ -490,68 +611,99 @@ def main():
         except Exception as e:
             print(f"estimator_timings.csv presente ma illeggibile ({e}) -- riparto senza skip.")
 
-    for model_name, model_id in models_to_run.items():
-        print(f"\n=== Modello: {model_name} ({model_id}) ===")
-        start = time.time()
+    # Loop esterno sui MODELLI (non sui dataset): caricare un modello da 4B
+    # e' l'operazione piu' costosa, quindi lo facciamo una volta sola e gli
+    # facciamo girare tutti e 4 i dataset prima di scaricarlo, invece di
+    # ricaricarlo per ogni dataset.
+    for model_name, model_id in MODELS.items():
+        pending_datasets = [d for d in DATASETS if (d, model_name) not in already_done_pairs]
+        if not pending_datasets:
+            print(f"\n=== Modello: {model_name} -- tutti i dataset gia' completati, salto. ===")
+            continue
+
+        print(f"\n=== Modello: {model_name} ({model_id}) -- dataset da eseguire: {pending_datasets} ===")
+        model_start = time.time()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+
         try:
             use_quant = model_name not in CHAT_TEMPLATE_MODELS
-            model = load_whitebox_model(
-                model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant,
-            )
+            model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant)
             log_gpu_mem(f"{model_name} loaded")
-
-            if model_name in CHAT_TEMPLATE_MODELS:
-                model_x_prompts = [format_chat_prompt(model.tokenizer, ex, fewshot_block) for ex in test_split]
-            else:
-                model_x_prompts = x_prompts
-            model_dataset = PolygraphDataset(model_x_prompts, y_references, batch_size=args.batch_size)
-
-            timing_dict = {}
-            estimators = [TimedEstimator(e, timing_dict) for e in build_estimators()]
-            man = build_manager(model, model_dataset, estimators, args.cache_dir, args.max_rejection, args.max_new_tokens)
-            man()
-            log_gpu_mem(f"{model_name} done")
-
-            df = extract_prr_table(man, model_name)
-            n_ok = df["value"].notna().sum() if "value" in df.columns else 0
-            print(f"{model_name}: {n_ok}/{len(df)} righe metrica con valore.")
-            all_metrics_dfs.append(df)
-
-            timing_rows = [
-                {
-                    "model": model_name,
-                    "estimator": est_str,
-                    "paper_label": paper_label_by_str.get(est_str, est_str),
-                    "seconds": seconds,
-                }
-                for est_str, seconds in timing_dict.items()
-            ]
-            all_timing_dfs.append(pd.DataFrame(timing_rows))
-
-            del model, man
         except Exception:
-            print(f"!!! {model_name} fallito, salto al prossimo modello.")
+            print(f"!!! Caricamento di {model_name} fallito, salto tutti i suoi dataset.")
             traceback.print_exc()
-        finally:
             gc.collect()
             torch.cuda.empty_cache()
-            elapsed = time.time() - start
-            print(f"Tempo {model_name}: {elapsed:.1f}s")
+            continue
 
-        if all_metrics_dfs:
-            pd.concat(all_metrics_dfs, ignore_index=True).to_csv(
-                os.path.join(args.results_dir, "results_partial.csv"), index=False
-            )
-            print(f"Checkpoint salvato dopo {model_name}.")
-        if all_timing_dfs:
-            pd.concat(all_timing_dfs, ignore_index=True).to_csv(
-                os.path.join(args.results_dir, "estimator_timings_partial.csv"), index=False
-            )
+        for dataset_name in pending_datasets:
+            cfg = DATASETS[dataset_name]
+            print(f"\n--- {model_name} su {dataset_name} ---")
+            ds_start = time.time()
+            try:
+                examples = dataset_examples[dataset_name]
+                if model_name in CHAT_TEMPLATE_MODELS:
+                    prompts = [format_chat_prompt(model.tokenizer, ex["content"]) for ex in examples]
+                else:
+                    prompts = [format_prompt(ex["content"], cfg["plain_suffix"]) for ex in examples]
+                references = [ex["reference"] for ex in examples]
+
+                model_dataset = PolygraphDataset(prompts, references, batch_size=args.batch_size)
+
+                timing_dict = {}
+                estimators = [TimedEstimator(e, timing_dict) for e in build_estimators()]
+                man = build_manager(
+                    model, model_dataset, estimators, args.cache_dir, args.max_rejection,
+                    cfg["max_new_tokens"], cfg["generation_metric_factory"](),
+                )
+                man()
+                log_gpu_mem(f"{model_name}/{dataset_name} done")
+
+                df = extract_prr_table(man, model_name)
+                df["dataset"] = dataset_name
+                n_ok = df["value"].notna().sum() if "value" in df.columns else 0
+                print(f"{model_name}/{dataset_name}: {n_ok}/{len(df)} righe metrica con valore.")
+                all_metrics_dfs.append(df)
+
+                timing_rows = [
+                    {
+                        "model": model_name,
+                        "dataset": dataset_name,
+                        "estimator": est_str,
+                        "paper_label": paper_label_by_str.get(est_str, est_str),
+                        "seconds": seconds,
+                    }
+                    for est_str, seconds in timing_dict.items()
+                ]
+                all_timing_dfs.append(pd.DataFrame(timing_rows))
+
+                del man
+            except Exception:
+                print(f"!!! {model_name}/{dataset_name} fallito, salto alla prossima combinazione.")
+                traceback.print_exc()
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"Tempo {model_name}/{dataset_name}: {time.time() - ds_start:.1f}s")
+
+            if all_metrics_dfs:
+                pd.concat(all_metrics_dfs, ignore_index=True).to_csv(
+                    os.path.join(args.results_dir, "results_partial.csv"), index=False
+                )
+                print(f"Checkpoint salvato dopo {model_name}/{dataset_name}.")
+            if all_timing_dfs:
+                pd.concat(all_timing_dfs, ignore_index=True).to_csv(
+                    os.path.join(args.results_dir, "estimator_timings_partial.csv"), index=False
+                )
+
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"Tempo totale {model_name} (tutti i dataset): {time.time() - model_start:.1f}s")
 
     if not all_metrics_dfs:
-        print("Nessun modello completato con successo -- niente da salvare/plottare.")
+        print("Nessuna combinazione completata con successo -- niente da salvare/plottare.")
         return
 
     results_df = pd.concat(all_metrics_dfs, ignore_index=True)
@@ -562,8 +714,7 @@ def main():
         timing_df = pd.concat(all_timing_dfs, ignore_index=True)
         timing_df.to_csv(timing_final_path, index=False)
 
-    raw_df = results_df[results_df["ue_metric"] == "prr_0.5"] if "ue_metric" in results_df.columns else results_df
-    raw_df = raw_df.copy()
+    raw_df = results_df[results_df["ue_metric"] == "prr_0.5"].copy() if "ue_metric" in results_df.columns else results_df.copy()
     raw_df["paper_label"] = raw_df["estimator"].map(paper_label_by_str).fillna(raw_df["estimator"])
 
     # Aggiunge le righe alias (es. "BB Semantic Entropy" = stesso valore di
@@ -581,12 +732,19 @@ def main():
 
     raw_df.to_csv(os.path.join(args.results_dir, "results_paper_mapped.csv"), index=False)
 
+    model_order = [m for m in MODELS.keys() if m in raw_df["model"].unique()]
+    dataset_order = [d for d in DATASETS.keys() if d in raw_df["dataset"].unique()]
+
+    # Mean PRR aggregato su tutti i task di selective QA, esattamente come
+    # da didascalia originale delle Figure 2/3 del paper ("aggregated over
+    # all selective QA tasks for each ... LLM separately").
+    agg_df = raw_df.groupby(["model", "paper_label"], as_index=False)["value"].mean()
+
     figure_a_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("A", "AB") and m["factory"] is not None]
     figure_b_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("B", "AB") and m["factory"] is not None]
-    model_order = [m for m in MODELS.keys() if m in raw_df["model"].unique()]
 
     def plot_paper_figure(labels, title, note, out_name):
-        subset = raw_df[raw_df["paper_label"].isin(labels)]
+        subset = agg_df[agg_df["paper_label"].isin(labels)]
         if subset.empty:
             print(f"!!! Nessun dato per {out_name}, salto.")
             return
@@ -594,18 +752,12 @@ def main():
         pivot = pivot.reindex(columns=model_order)
         pivot["Mean"] = pivot.mean(axis=1)
         pivot = pivot.sort_values("Mean", ascending=True)  # barh: prima riga in cima = ultima disegnata
-        # Altezza minima piu' alta (8" invece di 6") cosi' anche i grafici con
-        # poche righe (es. Figura B, 12 metodi) hanno spazio a sufficienza in
-        # basso: prima la nota a piè di figura si sovrapponeva all'xlabel sui
-        # grafici bassi (bottom margin insufficiente per pochi metodi).
         fig, ax = plt.subplots(figsize=(10, max(8, len(pivot) * 0.4)))
         pivot.plot(kind="barh", ax=ax, width=0.8)
-        ax.set_xlabel("Mean PRR (raw, max_rejection=0.5)")
+        ax.set_xlabel("Mean PRR (raw, max_rejection=0.5, aggregato su CoQA/TriviaQA/MMLU/GSM8k)")
         ax.set_title(title)
         ax.axvline(0, color="black", linewidth=0.8)
         ax.legend(loc="lower right", fontsize=8)
-        # Margine inferiore fisso (non dipendente da tight_layout) per dare
-        # alla nota il suo spazio dedicato sotto l'xlabel, senza sovrapporsi.
         fig.subplots_adjust(bottom=0.16)
         wrapped_note = "\n".join(textwrap.wrap(note, width=115))
         fig.text(0.01, 0.02, wrapped_note, fontsize=7, va="bottom")
@@ -617,7 +769,7 @@ def main():
     try:
         plot_paper_figure(
             figure_a_labels,
-            "PRR per metodo UQ e modello (~ Fig. 2 Vashurin et al., white-box full-access) — MedQA-USMLE",
+            "Mean PRR aggregato su selective QA (~ Fig. 2 Vashurin et al., white-box full-access)",
             FIGURE_A_MODELS_NOTE,
             "fig_a_white_box.png",
         )
@@ -628,7 +780,7 @@ def main():
     try:
         plot_paper_figure(
             figure_b_labels,
-            "PRR per metodo UQ e modello (~ Fig. 3 Vashurin et al., reflexive/black-box) — MedQA-USMLE",
+            "Mean PRR aggregato su selective QA (~ Fig. 3 Vashurin et al., reflexive/black-box)",
             FIGURE_B_MODELS_NOTE,
             "fig_b_reflexive.png",
         )
@@ -636,34 +788,36 @@ def main():
         print("!!! fig_b_reflexive.png fallito:")
         traceback.print_exc()
 
-    # Tabella stile Tabella 6 del paper: stesso set di metodi della Figura A,
-    # ma con i nostri 4 modelli al posto delle 4 dataset (CoQA/TriviaQA/
-    # MMLU/GSM8k) -- loro tenevano il modello fisso e variavano il dataset,
-    # noi teniamo il dataset fisso (MedQA) e variamo il modello.
-    try:
-        subset = raw_df[raw_df["paper_label"].isin(figure_a_labels)]
-        table6 = subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
-        table6 = table6.reindex(columns=model_order)
-        ranks = table6.rank(axis=0, ascending=False)
-        table6["Mean Rank"] = ranks.mean(axis=1)
-        table6["Mean PRR"] = table6[model_order].mean(axis=1)
-        table6 = table6.sort_values("Mean PRR", ascending=False)
-        table6_path = os.path.join(args.results_dir, "table6_style.csv")
-        table6.to_csv(table6_path)
-        print(f"Salvato: {table6_path}")
-    except Exception:
-        print("!!! table6_style.csv fallito:")
-        traceback.print_exc()
+    # Tabella stile Tabella 6 del paper, UNA per ciascun nostro modello:
+    # righe = metodi di Figura A, colonne = i 4 dataset (CoQA/TriviaQA/MMLU/
+    # GSM8k) + Mean Rank + Mean PRR -- stessa identica struttura del paper
+    # (che pero' la applica solo a StableLM 2 12B), qui replicata per ognuno
+    # dei nostri 4 modelli.
+    for model_name in model_order:
+        try:
+            subset = raw_df[(raw_df["model"] == model_name) & (raw_df["paper_label"].isin(figure_a_labels))]
+            table6 = subset.pivot_table(index="paper_label", columns="dataset", values="value", aggfunc="first")
+            table6 = table6.reindex(columns=dataset_order)
+            ranks = table6.rank(axis=0, ascending=False)
+            table6["Mean Rank"] = ranks.mean(axis=1)
+            table6["Mean PRR"] = table6[dataset_order].mean(axis=1)
+            table6 = table6.sort_values("Mean PRR", ascending=False)
+            table6_path = os.path.join(args.results_dir, f"table6_style_{model_name}.csv")
+            table6.to_csv(table6_path)
+            print(f"Salvato: {table6_path}")
+        except Exception:
+            print(f"!!! table6_style_{model_name}.csv fallito:")
+            traceback.print_exc()
 
-    # Tabella di efficienza: tempo (secondi) speso da ciascun metodo UQ per
-    # modello, per verificare quali stimatori sono piu' costosi.
+    # Tabella + grafico di efficienza: tempo (secondi) speso da ciascun
+    # metodo UQ per modello, sommato su tutti i dataset.
     try:
         if all_timing_dfs:
             timing_all = pd.concat(all_timing_dfs, ignore_index=True).drop_duplicates(
-                subset=["model", "estimator"], keep="last"
+                subset=["model", "dataset", "estimator"], keep="last"
             )
             timing_pivot = timing_all.pivot_table(
-                index="paper_label", columns="model", values="seconds", aggfunc="first"
+                index="paper_label", columns="model", values="seconds", aggfunc="sum"
             )
             timing_pivot = timing_pivot.reindex(columns=model_order)
             timing_pivot["Total"] = timing_pivot.sum(axis=1)
@@ -672,17 +826,16 @@ def main():
             timing_pivot.to_csv(timing_path)
             print(f"Salvato: {timing_path}")
 
-            # Stesso identico grafico ma in forma leggibile a colpo d'occhio.
-            # Scala log sull'asse x: i tempi coprono ~5-6 ordini di
-            # grandezza (es. BB P(True) ~270s contro P(True) ~0.001s), in
-            # scala lineare tutte le barre tranne una sarebbero invisibili.
+            # Scala log sull'asse x: i tempi coprono diversi ordini di
+            # grandezza (es. BB P(True) molto piu' lento di tutto il resto),
+            # in scala lineare tutte le barre tranne una sarebbero invisibili.
             plot_pivot = timing_pivot.drop(columns=["Total"]).loc[
                 timing_pivot.sort_values("Total", ascending=True).index
             ]
             fig, ax = plt.subplots(figsize=(10, max(8, len(plot_pivot) * 0.4)))
             plot_pivot.plot(kind="barh", ax=ax, width=0.8, logx=True)
-            ax.set_xlabel("Tempo totale di calcolo, sommato su tutti i batch (secondi, scala log)")
-            ax.set_title("Tempo di calcolo per metodo UQ e modello — MedQA-USMLE")
+            ax.set_xlabel("Tempo totale di calcolo, sommato su tutti i batch e dataset (secondi, scala log)")
+            ax.set_title("Tempo di calcolo per metodo UQ e modello — CoQA+TriviaQA+MMLU+GSM8k")
             ax.legend(loc="lower right", fontsize=8)
             fig.subplots_adjust(bottom=0.12)
             plt.tight_layout()
@@ -691,7 +844,7 @@ def main():
             plt.close(fig)
             print(f"Salvato: {timing_chart_path}")
     except Exception:
-        print("!!! estimator_timing_table.csv fallito:")
+        print("!!! tabella/grafico tempi falliti:")
         traceback.print_exc()
 
     print("\nBENCHMARK COMPLETATO.")
