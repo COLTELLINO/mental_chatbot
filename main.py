@@ -2,6 +2,7 @@ import argparse
 import gc
 import os
 import sys
+import textwrap
 import time
 import traceback
 
@@ -593,16 +594,23 @@ def main():
         pivot = pivot.reindex(columns=model_order)
         pivot["Mean"] = pivot.mean(axis=1)
         pivot = pivot.sort_values("Mean", ascending=True)  # barh: prima riga in cima = ultima disegnata
-        fig, ax = plt.subplots(figsize=(10, max(6, len(pivot) * 0.4)))
+        # Altezza minima piu' alta (8" invece di 6") cosi' anche i grafici con
+        # poche righe (es. Figura B, 12 metodi) hanno spazio a sufficienza in
+        # basso: prima la nota a piè di figura si sovrapponeva all'xlabel sui
+        # grafici bassi (bottom margin insufficiente per pochi metodi).
+        fig, ax = plt.subplots(figsize=(10, max(8, len(pivot) * 0.4)))
         pivot.plot(kind="barh", ax=ax, width=0.8)
         ax.set_xlabel("Mean PRR (raw, max_rejection=0.5)")
         ax.set_title(title)
         ax.axvline(0, color="black", linewidth=0.8)
         ax.legend(loc="lower right", fontsize=8)
-        fig.text(0.01, 0.01, note, fontsize=6, wrap=True)
-        plt.tight_layout()
+        # Margine inferiore fisso (non dipendente da tight_layout) per dare
+        # alla nota il suo spazio dedicato sotto l'xlabel, senza sovrapporsi.
+        fig.subplots_adjust(bottom=0.16)
+        wrapped_note = "\n".join(textwrap.wrap(note, width=115))
+        fig.text(0.01, 0.02, wrapped_note, fontsize=7, va="bottom")
         out_path = os.path.join(args.results_dir, out_name)
-        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.savefig(out_path, dpi=150)
         plt.close(fig)
         print(f"Salvato: {out_path}")
 
@@ -663,6 +671,25 @@ def main():
             timing_path = os.path.join(args.results_dir, "estimator_timing_table.csv")
             timing_pivot.to_csv(timing_path)
             print(f"Salvato: {timing_path}")
+
+            # Stesso identico grafico ma in forma leggibile a colpo d'occhio.
+            # Scala log sull'asse x: i tempi coprono ~5-6 ordini di
+            # grandezza (es. BB P(True) ~270s contro P(True) ~0.001s), in
+            # scala lineare tutte le barre tranne una sarebbero invisibili.
+            plot_pivot = timing_pivot.drop(columns=["Total"]).loc[
+                timing_pivot.sort_values("Total", ascending=True).index
+            ]
+            fig, ax = plt.subplots(figsize=(10, max(8, len(plot_pivot) * 0.4)))
+            plot_pivot.plot(kind="barh", ax=ax, width=0.8, logx=True)
+            ax.set_xlabel("Tempo totale di calcolo, sommato su tutti i batch (secondi, scala log)")
+            ax.set_title("Tempo di calcolo per metodo UQ e modello — MedQA-USMLE")
+            ax.legend(loc="lower right", fontsize=8)
+            fig.subplots_adjust(bottom=0.12)
+            plt.tight_layout()
+            timing_chart_path = os.path.join(args.results_dir, "estimator_timing_chart.png")
+            plt.savefig(timing_chart_path, dpi=150)
+            plt.close(fig)
+            print(f"Salvato: {timing_chart_path}")
     except Exception:
         print("!!! estimator_timing_table.csv fallito:")
         traceback.print_exc()
