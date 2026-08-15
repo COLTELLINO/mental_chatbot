@@ -97,13 +97,13 @@ def log_gpu_mem(tag):
 # 57 subject saranno necessariamente rappresentati.
 # ---------------------------------------------------------------------------
 
-def prepare_coqa(n_test, seed):
+def prepare_coqa(n_test, seed, cache_dir=None):
     """CoQA (stanfordnlp/coqa, split 'validation', 500 righe = 500 istanze
     di test come da Table 2 del paper). Ogni riga e' una conversazione;
     usiamo tutte le domande/risposte tranne l'ultima come storico della
     conversazione (few-shot "naturale") e l'ultima domanda come target,
     esattamente come descritto nel paper."""
-    raw = load_dataset("stanfordnlp/coqa")["validation"]
+    raw = load_dataset("stanfordnlp/coqa", cache_dir=cache_dir)["validation"]
     raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
     examples = []
     for row in raw:
@@ -127,11 +127,11 @@ def prepare_coqa(n_test, seed):
     return examples
 
 
-def prepare_triviaqa(n_test, seed, n_fewshot=5):
+def prepare_triviaqa(n_test, seed, cache_dir=None, n_fewshot=5):
     """TriviaQA (mandarjoshi/trivia_qa, config 'rc.nocontext' -- "without
     context" come nel paper). Split train/test hanno 138384/17210 righe,
     identici ai numeri di Table 2. 5-shot da esempi del train set."""
-    raw = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext")
+    raw = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", cache_dir=cache_dir)
     fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
     fewshot_block = "\n\n".join(
         f"Domanda: {r['question'].strip()}\nRisposta: {r['answer']['value']}" for r in fewshot
@@ -147,10 +147,10 @@ def prepare_triviaqa(n_test, seed, n_fewshot=5):
     return examples
 
 
-def prepare_mmlu(n_test, seed):
+def prepare_mmlu(n_test, seed, cache_dir=None):
     """MMLU (cais/mmlu, config 'all'). 5-shot per-subject usando lo split
     'dev' (5 esempi per subject, protocollo standard MMLU), come nel paper."""
-    raw = load_dataset("cais/mmlu", "all")
+    raw = load_dataset("cais/mmlu", "all", cache_dir=cache_dir)
     letters = ["A", "B", "C", "D"]
     dev_by_subject = {}
     for r in raw["dev"]:
@@ -173,11 +173,11 @@ def prepare_mmlu(n_test, seed):
     return examples
 
 
-def prepare_gsm8k(n_test, seed, n_fewshot=5):
+def prepare_gsm8k(n_test, seed, cache_dir=None, n_fewshot=5):
     """GSM8k (openai/gsm8k, config 'main'). Split train/test hanno
     7473/1319 righe, identici a Table 2. 5-shot dal train set, con la
     risposta 'reference' ridotta al solo numero finale (dopo '####')."""
-    raw = load_dataset("openai/gsm8k", "main")
+    raw = load_dataset("openai/gsm8k", "main", cache_dir=cache_dir)
     fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
     blocks = []
     for r in fewshot:
@@ -548,6 +548,15 @@ def main():
     parser.add_argument("--max_rejection", type=float, default=0.5)
     parser.add_argument("--results_dir", type=str, default=os.environ.get("RESULTS_DIR", "/workspace/results"))
     parser.add_argument("--cache_dir", type=str, default=os.environ.get("HF_HOME", "/llms"))
+    # Cache separata per i dataset (load_dataset), diversa da --cache_dir
+    # (usata solo per i pesi dei modelli). /llms sembra essere una cache
+    # condivisa a livello di cluster: il primo run con GSM8k ha fallito con
+    # un PermissionError sul lock file "/llms/datasets/..." (probabilmente
+    # gia' scritto da un altro utente/processo con permessi diversi). Uso
+    # una directory privata sotto /workspace (il repo di Filo) per evitare
+    # qualunque conflitto di permessi sulla cache condivisa.
+    parser.add_argument("--datasets_cache_dir", type=str,
+                         default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
     args = parser.parse_args()
 
     print_banner()
@@ -561,6 +570,7 @@ def main():
 
     os.makedirs(args.results_dir, exist_ok=True)
     os.makedirs(args.cache_dir, exist_ok=True)
+    os.makedirs(args.datasets_cache_dir, exist_ok=True)
 
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -580,11 +590,21 @@ def main():
     for ds_name, cfg in DATASETS.items():
         n_test = args.n_test_samples if args.n_test_samples is not None else cfg["n_test"]
         print(f"Caricamento {ds_name} (n_test={n_test})...")
-        examples = cfg["loader"](n_test, SEED)
-        print(f"{ds_name}: {len(examples)} esempi caricati.")
-        print(examples[0]["content"][:500])
-        print("Riferimento:", examples[0]["reference"])
-        dataset_examples[ds_name] = examples
+        try:
+            examples = cfg["loader"](n_test, SEED, cache_dir=args.datasets_cache_dir)
+            print(f"{ds_name}: {len(examples)} esempi caricati.")
+            print(examples[0]["content"][:500])
+            print("Riferimento:", examples[0]["reference"])
+            dataset_examples[ds_name] = examples
+        except Exception:
+            # Un dataset rotto (es. problemi di cache/rete) non deve far
+            # cadere l'intero run: lo saltiamo e continuiamo con gli altri.
+            print(f"!!! Caricamento di {ds_name} fallito, questo dataset sara' saltato per tutti i modelli.")
+            traceback.print_exc()
+
+    if not dataset_examples:
+        print("Nessun dataset caricato con successo -- niente da fare.")
+        return
 
     final_path = os.path.join(args.results_dir, "results_final.csv")
     results_df_existing = None
@@ -616,7 +636,7 @@ def main():
     # facciamo girare tutti e 4 i dataset prima di scaricarlo, invece di
     # ricaricarlo per ogni dataset.
     for model_name, model_id in MODELS.items():
-        pending_datasets = [d for d in DATASETS if (d, model_name) not in already_done_pairs]
+        pending_datasets = [d for d in dataset_examples if (d, model_name) not in already_done_pairs]
         if not pending_datasets:
             print(f"\n=== Modello: {model_name} -- tutti i dataset gia' completati, salto. ===")
             continue
