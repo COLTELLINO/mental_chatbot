@@ -778,7 +778,14 @@ def main():
         ax.set_title(title)
         ax.axvline(0, color="black", linewidth=0.8)
         ax.legend(loc="lower right", fontsize=8)
-        fig.subplots_adjust(bottom=0.16)
+        # Margine sinistro proporzionale alla label piu' lunga (in caratteri):
+        # con figsize fisso a 10", il margine di default di matplotlib (~0.125)
+        # tronca etichette lunghe tipo "Monte Carlo Normalized Sequence
+        # Entropy" o "Eccentricity Jaccard Score". ~0.011 di frazione-figura
+        # per carattere e' una stima prudente per il font di default a 10".
+        max_label_len = max(len(str(lbl)) for lbl in pivot.index)
+        left_margin = min(0.55, max(0.22, max_label_len * 0.011))
+        fig.subplots_adjust(left=left_margin, bottom=0.16)
         wrapped_note = "\n".join(textwrap.wrap(note, width=115))
         fig.text(0.01, 0.02, wrapped_note, fontsize=7, va="bottom")
         out_path = os.path.join(args.results_dir, out_name)
