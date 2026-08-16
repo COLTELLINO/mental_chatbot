@@ -243,6 +243,133 @@ class GSM8kAccuracyMetric(GenerationMetric):
 # esatte e i modelli a volte aggiungono testo/punteggiatura extra).
 _MCQ_IGNORE_REGEX = r"(?<=[ABCDabcd])[\s\S]*"
 
+
+# ---------------------------------------------------------------------------
+# Confronto extra "safe vs non-safe": stessi 4 modelli, stessa pipeline UQ,
+# ma su due dataset medici con conseguenze molto diverse in caso di errore:
+#   - MedQA-USMLE: domande da esame di medicina. Un errore costa solo un
+#     punteggio piu' basso in un test, nessuna conseguenza reale.
+#   - MedicationQA: domande reali di pazienti su farmaci (dosaggi,
+#     interazioni, effetti collaterali). Un errore qui (dose sbagliata,
+#     interazione non segnalata) puo' avere conseguenze gravi o letali.
+# Voluto da Filo (2026-08-16) per vedere se il ranking dei metodi UQ cambia
+# tra uno scenario "a basso rischio" e uno "ad alto rischio".
+# ---------------------------------------------------------------------------
+
+MEDQA_FEWSHOT_EXAMPLES = [
+    {
+        "question": "A 3-month-old baby died suddenly at night while asleep. His mother noticed that he had died only after she awoke in the morning. No cause of death was determined based on the autopsy. Which of the following precautions could have prevented the death of the baby?",
+        "options": {
+            "A": "Placing the infant in a supine position on a firm mattress while sleeping",
+            "B": "Keeping the infant covered and maintaining a high room temperature",
+            "C": "Application of a device to maintain the sleeping position",
+            "D": "Avoiding pacifier use during sleep",
+        },
+        "answer_idx": "A",
+    },
+    {
+        "question": "A 9-month-old female is brought to the emergency department after experiencing a seizure. She was born at home and was normal at birth according to her parents. Since then, they have noticed that she does not appear to be achieving developmental milestones as quickly as her siblings, and often appears lethargic. Physical exam reveals microcephaly, very light pigmentation (as compared to her family), and a \"musty\" body odor. The varied manifestations of this disease can most likely be attributed to which of the following genetic principles?",
+        "options": {
+            "A": "Anticipation",
+            "B": "Multiple gene mutations",
+            "C": "Pleiotropy",
+            "D": "Variable expressivity",
+        },
+        "answer_idx": "C",
+    },
+    {
+        "question": "A 68-year-old man presents to the emergency department with leg pain. He states that the pain started suddenly while he was walking outside. The patient has a past medical history of diabetes, hypertension, obesity, and atrial fibrillation. His temperature is 99.3°F (37.4°C), blood pressure is 152/98 mmHg, pulse is 97/min, respirations are 15/min, and oxygen saturation is 99% on room air. Physical exam is notable for a cold and pale left leg. The patient's sensation is markedly diminished in the left leg when compared to the right, and his muscle strength is 1/5 in his left leg. Which of the following is the best next step in management?",
+        "options": {
+            "A": "Graded exercise and aspirin",
+            "B": "Heparin drip",
+            "C": "Surgical thrombectomy",
+            "D": "Tissue plasminogen activator",
+        },
+        "answer_idx": "B",
+    },
+]
+
+
+def _build_medqa_fewshot_block():
+    blocks = []
+    for ex in MEDQA_FEWSHOT_EXAMPLES:
+        opts = ex["options"]
+        blocks.append(
+            f"Domanda: {ex['question']}\n\n"
+            f"A) {opts['A']}\nB) {opts['B']}\nC) {opts['C']}\nD) {opts['D']}\n\n"
+            f"Risposta: {ex['answer_idx']}"
+        )
+    return "\n\n".join(blocks)
+
+
+def prepare_medqa(n_test, seed, cache_dir=None):
+    """MedQA-USMLE (GBaker/MedQA-USMLE-4-options, split 'test'). Scenario
+    SAFE: multiple-choice da esame di medicina, few-shot (3 esempi) +
+    istruzione a rispondere solo con la lettera. Stesso identico prompt gia'
+    usato prima che il dataset principale passasse a CoQA/TriviaQA/MMLU/
+    GSM8k (vedi commit 'port MedQA UQ benchmark notebook to main.py')."""
+    raw = load_dataset("GBaker/MedQA-USMLE-4-options", cache_dir=cache_dir)
+    fewshot_block = _build_medqa_fewshot_block()
+    test_split = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
+    examples = []
+    for ex in test_split:
+        opts = ex["options"]
+        content = (
+            "Sei un assistente medico che risponde a domande in stile esame USMLE.\n"
+            "Leggi il quesito clinico e rispondi SOLO con la lettera dell'opzione corretta "
+            "(A, B, C o D), senza altro testo.\n\n"
+            f"{fewshot_block}\n\n"
+            f"Domanda: {ex['question'].strip()}\n\n"
+            f"A) {opts['A'].strip()}\nB) {opts['B'].strip()}\nC) {opts['C'].strip()}\nD) {opts['D'].strip()}"
+        )
+        examples.append({"content": content, "reference": ex["answer_idx"]})
+    return examples
+
+
+def prepare_medicationqa(n_test, seed, cache_dir=None):
+    """MedicationQA (truehealth/medicationqa, unico split 'train', 690
+    righe). Scenario NON-SAFE: domande reali di pazienti su farmaci
+    (dosaggi, interazioni, effetti collaterali) con risposte in testo
+    libero -- niente few-shot nel dataset originale, prompt a zero-shot
+    diretto in stile CoQA/TriviaQA. Alcune righe hanno Question/Answer
+    vuoti (dataset raccolto da FAQ reali, non curato come benchmark): le
+    scartiamo prima di campionare."""
+    raw = load_dataset("truehealth/medicationqa", cache_dir=cache_dir)["train"]
+    raw = raw.filter(lambda ex: ex["Question"] and ex["Answer"])
+    raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
+    examples = []
+    for ex in raw:
+        content = (
+            "Sei un assistente farmaceutico che risponde a domande reali di pazienti sui farmaci "
+            "(dosaggi, interazioni, effetti collaterali). Rispondi in modo chiaro e conciso.\n\n"
+            f"Domanda: {ex['Question'].strip()}"
+        )
+        examples.append({"content": content, "reference": ex["Answer"].strip()})
+    return examples
+
+
+SAFETY_DATASETS = {
+    "MedQA": {
+        "loader": prepare_medqa,
+        "n_test": 100,
+        "max_new_tokens": 3,
+        "plain_suffix": "\n\nRisposta:",
+        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
+        "safety_label": "SAFE -- errore = domanda d'esame sbagliata, nessuna conseguenza reale",
+    },
+    "MedicationQA": {
+        "loader": prepare_medicationqa,
+        "n_test": 100,
+        # Le risposte reali (MedlinePlus/DailyMed) vanno da poche parole a
+        # spiegazioni di 60-80 parole (~100-120 token): margine piu' ampio
+        # di CoQA/TriviaQA per non troncare le risposte piu' lunghe.
+        "max_new_tokens": 100,
+        "plain_suffix": "\nRisposta:",
+        "generation_metric_factory": lambda: AlignScore(),
+        "safety_label": "NON-SAFE -- errore su farmaci = potenzialmente grave o letale",
+    },
+}
+
 DATASETS = {
     "CoQA": {
         "loader": prepare_coqa,
@@ -538,6 +665,163 @@ def extract_prr_table(man, model_name):
     return pd.DataFrame(rows)
 
 
+def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, paper_label_by_str, use_chat_template):
+    """Esegue tutti gli estimator UQ di build_estimators() su un singolo
+    modello gia' caricato contro un singolo dataset gia' preparato (prompt +
+    reference). Ritorna (prr_df, timing_df), oppure (None, None) se la
+    combinazione fallisce. Estratta dal loop principale (Sezione 5.1) cosi'
+    da poter essere riusata identica dai confronti extra (safety,
+    quantizzazione) senza duplicare tre volte la stessa logica."""
+    print(f"\n--- {model_name} su {dataset_name} ---")
+    ds_start = time.time()
+    df, timing_df = None, None
+    try:
+        if use_chat_template:
+            prompts = [format_chat_prompt(model.tokenizer, ex["content"]) for ex in examples]
+        else:
+            prompts = [format_prompt(ex["content"], cfg["plain_suffix"]) for ex in examples]
+        references = [ex["reference"] for ex in examples]
+
+        model_dataset = PolygraphDataset(prompts, references, batch_size=args.batch_size)
+
+        timing_dict = {}
+        estimators = [TimedEstimator(e, timing_dict) for e in build_estimators()]
+        man = build_manager(
+            model, model_dataset, estimators, args.cache_dir, args.max_rejection,
+            cfg["max_new_tokens"], cfg["generation_metric_factory"](),
+        )
+        man()
+        log_gpu_mem(f"{model_name}/{dataset_name} done")
+
+        df = extract_prr_table(man, model_name)
+        df["dataset"] = dataset_name
+        n_ok = df["value"].notna().sum() if "value" in df.columns else 0
+        print(f"{model_name}/{dataset_name}: {n_ok}/{len(df)} righe metrica con valore.")
+
+        timing_rows = [
+            {
+                "model": model_name,
+                "dataset": dataset_name,
+                "estimator": est_str,
+                "paper_label": paper_label_by_str.get(est_str, est_str),
+                "seconds": seconds,
+            }
+            for est_str, seconds in timing_dict.items()
+        ]
+        timing_df = pd.DataFrame(timing_rows)
+        del man
+    except Exception:
+        print(f"!!! {model_name}/{dataset_name} fallito, salto alla prossima combinazione.")
+        traceback.print_exc()
+        df, timing_df = None, None
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"Tempo {model_name}/{dataset_name}: {time.time() - ds_start:.1f}s")
+    return df, timing_df
+
+
+def plot_prr_bars(df, labels, group_order, title, note, out_path, xlabel, add_mean=True):
+    """Bar chart orizzontale generico: una barra per elemento di group_order
+    (colonna 'model' del df, che puo' contenere sia nomi di modelli veri
+    sia etichette di varianti come "quantized"/"full precision"), una riga
+    per etichetta 'paper_label' in labels. Se add_mean=True aggiunge anche
+    una barra "Mean". Usata sia per le Figure A/B aggregate sul paper sia
+    per i confronti extra (safety, quantizzazione) -- stesso identico stile
+    visivo, incluso il margine sinistro dinamico per non troncare le
+    etichette piu' lunghe."""
+    subset = df[df["paper_label"].isin(labels)]
+    if subset.empty:
+        print(f"!!! Nessun dato per {out_path}, salto.")
+        return None
+    pivot = subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
+    pivot = pivot.reindex(columns=group_order)
+    row_mean = pivot.mean(axis=1)
+    if add_mean:
+        pivot["Mean"] = row_mean
+    pivot = pivot.loc[row_mean.sort_values(ascending=True).index]  # barh: prima riga in cima = ultima disegnata
+    fig, ax = plt.subplots(figsize=(10, max(8, len(pivot) * 0.4)))
+    pivot.plot(kind="barh", ax=ax, width=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.legend(loc="lower right", fontsize=8)
+    # Margine sinistro proporzionale alla label piu' lunga (in caratteri):
+    # con figsize fisso a 10", il margine di default di matplotlib (~0.125)
+    # tronca etichette lunghe tipo "Monte Carlo Normalized Sequence
+    # Entropy" o "Eccentricity Jaccard Score". ~0.011 di frazione-figura
+    # per carattere e' una stima prudente per il font di default a 10".
+    max_label_len = max(len(str(lbl)) for lbl in pivot.index)
+    left_margin = min(0.55, max(0.22, max_label_len * 0.011))
+    fig.subplots_adjust(left=left_margin, bottom=0.16)
+    wrapped_note = "\n".join(textwrap.wrap(note, width=115))
+    fig.text(0.01, 0.02, wrapped_note, fontsize=7, va="bottom")
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Salvato: {out_path}")
+    return pivot
+
+
+def plot_safety_comparison(df, labels, group_order, out_path):
+    """Confronto affiancato (2 pannelli, stesso ordine di metodi in
+    entrambi) PRR su MedQA (scenario safe) vs MedicationQA (scenario
+    non-safe/potenzialmente letale). L'ordine comune e' dato dalla media
+    delle due "Mean PRR aggregate sui 4 modelli", cosi' lo stesso metodo
+    occupa la stessa riga in entrambi i pannelli e il confronto visivo e'
+    immediato."""
+    subset = df[df["paper_label"].isin(labels)]
+    if subset.empty:
+        print(f"!!! Nessun dato per {out_path}, salto.")
+        return
+    pivots = {}
+    for ds_name in SAFETY_DATASETS:
+        ds_subset = subset[subset["dataset"] == ds_name]
+        if ds_subset.empty:
+            continue
+        pivot = ds_subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
+        pivot = pivot.reindex(columns=group_order)
+        pivot["Mean"] = pivot.mean(axis=1)
+        pivots[ds_name] = pivot
+    if len(pivots) < 2:
+        print(f"!!! Solo {len(pivots)}/2 dataset disponibili per {out_path}, salto il confronto affiancato.")
+        return
+
+    ds_names = list(SAFETY_DATASETS.keys())
+    combined_mean = sum(pivots[d]["Mean"] for d in ds_names) / len(ds_names)
+    common_order = combined_mean.sort_values(ascending=True).index
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, max(8, len(common_order) * 0.4)), sharey=True)
+    for i, (ax, ds_name) in enumerate(zip(axes, ds_names)):
+        pivot = pivots[ds_name].reindex(common_order)
+        pivot.plot(kind="barh", ax=ax, width=0.8, legend=False)
+        ax.set_title(f"{ds_name}\n({SAFETY_DATASETS[ds_name]['safety_label']})", fontsize=9)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("Mean PRR (raw, max_rejection=0.5)")
+    handles, legend_labels = axes[-1].get_legend_handles_labels()
+    axes[-1].legend(handles, legend_labels, loc="lower right", fontsize=8)
+    fig.suptitle("PRR per metodo UQ e modello: MedQA (safe) vs MedicationQA (non-safe/potenzialmente letale)")
+    max_label_len = max(len(str(lbl)) for lbl in common_order)
+    left_margin = min(0.45, max(0.20, max_label_len * 0.009))
+    fig.subplots_adjust(left=left_margin, bottom=0.1, top=0.90, wspace=0.06)
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Salvato: {out_path}")
+
+
+# Modello scelto per il confronto quantizzato vs non-quantizzato (vedi
+# --run_quant_comparison in main()). MedGemma-4B-it e Gemma3-4B-it sono
+# esclusi a priori: producono logit NaN sotto bitsandbytes 4-bit (vedi
+# CHAT_TEMPLATE_MODELS sopra) e per questo nella pipeline vengono SEMPRE
+# caricati in bf16 -- un confronto quantizzato/non-quantizzato su di loro
+# non e' fattibile con questo codice. Tra i due modelli rimasti (LFM2-350M,
+# LFM2-1.2B) scegliamo il piu' grande: la quantizzazione 4-bit comprime
+# maggiormente un modello con piu' parametri, quindi un eventuale effetto
+# sulla qualita' delle stime di incertezza ha piu' probabilita' di essere
+# misurabile rispetto al modello da 350M. Scelta di Filo (2026-08-16):
+# "scegli te un modello".
+QUANT_COMPARE_MODEL_DEFAULT = "LFM2-1.2B"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Selective QA UQ benchmark (lm-polygraph) -- replica Sezione 5.1 Vashurin et al."
@@ -557,6 +841,19 @@ def main():
     # qualunque conflitto di permessi sulla cache condivisa.
     parser.add_argument("--datasets_cache_dir", type=str,
                          default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
+    parser.add_argument("--run_safety_comparison", action="store_true",
+                         help="In piu' rispetto alla pipeline principale, esegue anche il confronto "
+                              "MedQA (safe) vs MedicationQA (non-safe) su tutti e 4 i modelli "
+                              "(fig_safety_comparison.png).")
+    parser.add_argument("--run_quant_comparison", action="store_true",
+                         help="In piu' rispetto alla pipeline principale, esegue anche il confronto "
+                              "quantizzato (4-bit) vs non-quantizzato (bf16) su un modello "
+                              "(--quant_compare_model) sui 4 dataset principali.")
+    parser.add_argument("--quant_compare_model", type=str, default=QUANT_COMPARE_MODEL_DEFAULT,
+                         choices=list(MODELS.keys()),
+                         help="Modello su cui eseguire --run_quant_comparison (default: %(default)s). "
+                              "MedGemma-4B-it/Gemma3-4B-it non sono utilizzabili: producono NaN sotto "
+                              "quantizzazione 4-bit (vedi CHAT_TEMPLATE_MODELS).")
     args = parser.parse_args()
 
     print_banner()
@@ -659,53 +956,14 @@ def main():
 
         for dataset_name in pending_datasets:
             cfg = DATASETS[dataset_name]
-            print(f"\n--- {model_name} su {dataset_name} ---")
-            ds_start = time.time()
-            try:
-                examples = dataset_examples[dataset_name]
-                if model_name in CHAT_TEMPLATE_MODELS:
-                    prompts = [format_chat_prompt(model.tokenizer, ex["content"]) for ex in examples]
-                else:
-                    prompts = [format_prompt(ex["content"], cfg["plain_suffix"]) for ex in examples]
-                references = [ex["reference"] for ex in examples]
-
-                model_dataset = PolygraphDataset(prompts, references, batch_size=args.batch_size)
-
-                timing_dict = {}
-                estimators = [TimedEstimator(e, timing_dict) for e in build_estimators()]
-                man = build_manager(
-                    model, model_dataset, estimators, args.cache_dir, args.max_rejection,
-                    cfg["max_new_tokens"], cfg["generation_metric_factory"](),
-                )
-                man()
-                log_gpu_mem(f"{model_name}/{dataset_name} done")
-
-                df = extract_prr_table(man, model_name)
-                df["dataset"] = dataset_name
-                n_ok = df["value"].notna().sum() if "value" in df.columns else 0
-                print(f"{model_name}/{dataset_name}: {n_ok}/{len(df)} righe metrica con valore.")
+            df, timing_df = run_model_on_dataset(
+                model, model_name, dataset_name, dataset_examples[dataset_name], cfg, args,
+                paper_label_by_str, use_chat_template=(model_name in CHAT_TEMPLATE_MODELS),
+            )
+            if df is not None:
                 all_metrics_dfs.append(df)
-
-                timing_rows = [
-                    {
-                        "model": model_name,
-                        "dataset": dataset_name,
-                        "estimator": est_str,
-                        "paper_label": paper_label_by_str.get(est_str, est_str),
-                        "seconds": seconds,
-                    }
-                    for est_str, seconds in timing_dict.items()
-                ]
-                all_timing_dfs.append(pd.DataFrame(timing_rows))
-
-                del man
-            except Exception:
-                print(f"!!! {model_name}/{dataset_name} fallito, salto alla prossima combinazione.")
-                traceback.print_exc()
-            finally:
-                gc.collect()
-                torch.cuda.empty_cache()
-                print(f"Tempo {model_name}/{dataset_name}: {time.time() - ds_start:.1f}s")
+            if timing_df is not None:
+                all_timing_dfs.append(timing_df)
 
             if all_metrics_dfs:
                 pd.concat(all_metrics_dfs, ignore_index=True).to_csv(
@@ -764,34 +1022,11 @@ def main():
     figure_b_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("B", "AB") and m["factory"] is not None]
 
     def plot_paper_figure(labels, title, note, out_name):
-        subset = agg_df[agg_df["paper_label"].isin(labels)]
-        if subset.empty:
-            print(f"!!! Nessun dato per {out_name}, salto.")
-            return
-        pivot = subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
-        pivot = pivot.reindex(columns=model_order)
-        pivot["Mean"] = pivot.mean(axis=1)
-        pivot = pivot.sort_values("Mean", ascending=True)  # barh: prima riga in cima = ultima disegnata
-        fig, ax = plt.subplots(figsize=(10, max(8, len(pivot) * 0.4)))
-        pivot.plot(kind="barh", ax=ax, width=0.8)
-        ax.set_xlabel("Mean PRR (raw, max_rejection=0.5, aggregato su CoQA/TriviaQA/MMLU/GSM8k)")
-        ax.set_title(title)
-        ax.axvline(0, color="black", linewidth=0.8)
-        ax.legend(loc="lower right", fontsize=8)
-        # Margine sinistro proporzionale alla label piu' lunga (in caratteri):
-        # con figsize fisso a 10", il margine di default di matplotlib (~0.125)
-        # tronca etichette lunghe tipo "Monte Carlo Normalized Sequence
-        # Entropy" o "Eccentricity Jaccard Score". ~0.011 di frazione-figura
-        # per carattere e' una stima prudente per il font di default a 10".
-        max_label_len = max(len(str(lbl)) for lbl in pivot.index)
-        left_margin = min(0.55, max(0.22, max_label_len * 0.011))
-        fig.subplots_adjust(left=left_margin, bottom=0.16)
-        wrapped_note = "\n".join(textwrap.wrap(note, width=115))
-        fig.text(0.01, 0.02, wrapped_note, fontsize=7, va="bottom")
-        out_path = os.path.join(args.results_dir, out_name)
-        plt.savefig(out_path, dpi=150)
-        plt.close(fig)
-        print(f"Salvato: {out_path}")
+        plot_prr_bars(
+            agg_df, labels, model_order, title, note,
+            os.path.join(args.results_dir, out_name),
+            "Mean PRR (raw, max_rejection=0.5, aggregato su CoQA/TriviaQA/MMLU/GSM8k)",
+        )
 
     try:
         plot_paper_figure(
@@ -873,6 +1108,173 @@ def main():
     except Exception:
         print("!!! tabella/grafico tempi falliti:")
         traceback.print_exc()
+
+    # -------------------------------------------------------------------
+    # Confronto extra 1: MedQA (safe) vs MedicationQA (non-safe). Stessi 4
+    # modelli, stessa pipeline, dataset e figura separati dalla riproduzione
+    # del paper qui sopra (non entrano in agg_df/fig_a/fig_b/table6).
+    # -------------------------------------------------------------------
+    if args.run_safety_comparison:
+        print("\n--- Confronto extra: MedQA (safe) vs MedicationQA (non-safe) ---")
+        try:
+            safety_examples = {}
+            for ds_name, cfg in SAFETY_DATASETS.items():
+                n_test = args.n_test_samples if args.n_test_samples is not None else cfg["n_test"]
+                print(f"Caricamento {ds_name} (n_test={n_test})...")
+                try:
+                    examples = cfg["loader"](n_test, SEED, cache_dir=args.datasets_cache_dir)
+                    print(f"{ds_name}: {len(examples)} esempi caricati.")
+                    safety_examples[ds_name] = examples
+                except Exception:
+                    print(f"!!! Caricamento di {ds_name} fallito, salto.")
+                    traceback.print_exc()
+
+            if len(safety_examples) < 2:
+                print("!!! Meno di 2 dataset safety caricati con successo, salto il confronto.")
+            else:
+                safety_final_path = os.path.join(args.results_dir, "results_safety_comparison.csv")
+                safety_metrics_dfs = []
+                safety_already_done = set()
+                if os.path.exists(safety_final_path):
+                    try:
+                        existing = pd.read_csv(safety_final_path)
+                        safety_already_done = set(zip(existing["dataset"], existing["model"]))
+                        safety_metrics_dfs.append(existing)
+                        print("Combinazioni safety gia' completate:", safety_already_done)
+                    except Exception as e:
+                        print(f"results_safety_comparison.csv illeggibile ({e}) -- riparto senza skip.")
+
+                for model_name, model_id in MODELS.items():
+                    pending = [d for d in safety_examples if (d, model_name) not in safety_already_done]
+                    if not pending:
+                        continue
+                    try:
+                        use_quant = model_name not in CHAT_TEMPLATE_MODELS
+                        model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant)
+                    except Exception:
+                        print(f"!!! Caricamento di {model_name} fallito, salto i suoi dataset safety.")
+                        traceback.print_exc()
+                        continue
+
+                    for dataset_name in pending:
+                        cfg = SAFETY_DATASETS[dataset_name]
+                        df, _ = run_model_on_dataset(
+                            model, model_name, dataset_name, safety_examples[dataset_name], cfg, args,
+                            paper_label_by_str, use_chat_template=(model_name in CHAT_TEMPLATE_MODELS),
+                        )
+                        if df is not None:
+                            safety_metrics_dfs.append(df)
+                            pd.concat(safety_metrics_dfs, ignore_index=True).to_csv(safety_final_path, index=False)
+                            print(f"Checkpoint safety salvato dopo {model_name}/{dataset_name}.")
+
+                    del model
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                if safety_metrics_dfs:
+                    safety_df = pd.concat(safety_metrics_dfs, ignore_index=True)
+                    safety_raw = (
+                        safety_df[safety_df["ue_metric"] == "prr_0.5"].copy()
+                        if "ue_metric" in safety_df.columns else safety_df.copy()
+                    )
+                    safety_raw["paper_label"] = safety_raw["estimator"].map(paper_label_by_str).fillna(safety_raw["estimator"])
+                    safety_raw.to_csv(os.path.join(args.results_dir, "results_safety_comparison_mapped.csv"), index=False)
+
+                    safety_model_order = [m for m in MODELS.keys() if m in safety_raw["model"].unique()]
+                    plot_safety_comparison(
+                        safety_raw, figure_a_labels, safety_model_order,
+                        os.path.join(args.results_dir, "fig_safety_comparison.png"),
+                    )
+                    print("Confronto safety completato.")
+                else:
+                    print("!!! Nessuna combinazione safety completata con successo.")
+        except Exception:
+            print("!!! Confronto safety fallito:")
+            traceback.print_exc()
+
+    # -------------------------------------------------------------------
+    # Confronto extra 2: quantizzato (4-bit) vs non-quantizzato (bf16), su
+    # un solo modello scelto (--quant_compare_model, default LFM2-1.2B --
+    # vedi QUANT_COMPARE_MODEL_DEFAULT per la motivazione della scelta),
+    # aggregato sugli stessi 4 dataset della pipeline principale (riusa
+    # dataset_examples gia' caricato, nessun ricaricamento).
+    # -------------------------------------------------------------------
+    if args.run_quant_comparison:
+        quant_model_name = args.quant_compare_model
+        print(f"\n--- Confronto extra: quantizzato vs non-quantizzato ({quant_model_name}) ---")
+        if quant_model_name in CHAT_TEMPLATE_MODELS:
+            print(f"!!! {quant_model_name} produce NaN sotto quantizzazione 4-bit (vedi CHAT_TEMPLATE_MODELS), "
+                  "confronto non eseguibile su questo modello -- salto.")
+        else:
+            try:
+                model_id = MODELS[quant_model_name]
+                quant_final_path = os.path.join(args.results_dir, "results_quant_comparison.csv")
+                quant_metrics_dfs = []
+                quant_already_done = set()
+                if os.path.exists(quant_final_path):
+                    try:
+                        existing = pd.read_csv(quant_final_path)
+                        quant_already_done = set(zip(existing["dataset"], existing["model"]))
+                        quant_metrics_dfs.append(existing)
+                        print("Combinazioni quant gia' completate:", quant_already_done)
+                    except Exception as e:
+                        print(f"results_quant_comparison.csv illeggibile ({e}) -- riparto senza skip.")
+
+                variants = [("quantized (4-bit nf4)", True), ("full precision (bf16)", False)]
+                for variant_label, use_quant in variants:
+                    pending = [d for d in dataset_examples if (d, variant_label) not in quant_already_done]
+                    if not pending:
+                        continue
+                    try:
+                        model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant)
+                    except Exception:
+                        print(f"!!! Caricamento di {quant_model_name} ({variant_label}) fallito, salto questa variante.")
+                        traceback.print_exc()
+                        continue
+
+                    for dataset_name in pending:
+                        cfg = DATASETS[dataset_name]
+                        df, _ = run_model_on_dataset(
+                            model, variant_label, dataset_name, dataset_examples[dataset_name], cfg, args,
+                            paper_label_by_str, use_chat_template=False,
+                        )
+                        if df is not None:
+                            quant_metrics_dfs.append(df)
+                            pd.concat(quant_metrics_dfs, ignore_index=True).to_csv(quant_final_path, index=False)
+                            print(f"Checkpoint quant salvato dopo {variant_label}/{dataset_name}.")
+
+                    del model
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                if quant_metrics_dfs:
+                    quant_df = pd.concat(quant_metrics_dfs, ignore_index=True)
+                    quant_raw = (
+                        quant_df[quant_df["ue_metric"] == "prr_0.5"].copy()
+                        if "ue_metric" in quant_df.columns else quant_df.copy()
+                    )
+                    quant_raw["paper_label"] = quant_raw["estimator"].map(paper_label_by_str).fillna(quant_raw["estimator"])
+                    quant_raw.to_csv(os.path.join(args.results_dir, "results_quant_comparison_mapped.csv"), index=False)
+
+                    quant_agg = quant_raw.groupby(["model", "paper_label"], as_index=False)["value"].mean()
+                    variant_order = [v for v, _ in variants if v in quant_agg["model"].unique()]
+                    plot_prr_bars(
+                        quant_agg, figure_a_labels, variant_order,
+                        f"Mean PRR per metodo UQ -- {quant_model_name}: 4-bit vs bf16 "
+                        "(aggregato su CoQA/TriviaQA/MMLU/GSM8k)",
+                        f"Confronto quantizzazione su {quant_model_name} (vedi commento su "
+                        "QUANT_COMPARE_MODEL_DEFAULT nel codice per la motivazione della scelta: "
+                        "MedGemma-4B-it/Gemma3-4B-it producono NaN sotto 4-bit e sono esclusi a priori).",
+                        os.path.join(args.results_dir, f"fig_quant_comparison_{quant_model_name}.png"),
+                        "Mean PRR (raw, max_rejection=0.5)",
+                        add_mean=False,
+                    )
+                    print("Confronto quantizzazione completato.")
+                else:
+                    print("!!! Nessuna combinazione quant completata con successo.")
+            except Exception:
+                print("!!! Confronto quantizzazione fallito:")
+                traceback.print_exc()
 
     print("\nBENCHMARK COMPLETATO.")
 
