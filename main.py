@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from omegaconf import OmegaConf
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -23,10 +24,12 @@ from lm_polygraph.utils.dataset import Dataset as PolygraphDataset
 from lm_polygraph.utils.model import WhiteboxModel
 from lm_polygraph.utils.processor import Logger
 from lm_polygraph.utils.builder_enviroment_stat_calculator import BuilderEnvironmentStatCalculator
+from lm_polygraph.utils.factory_stat_calculator import StatCalculatorContainer
 from lm_polygraph.defaults.register_default_stat_calculators import register_default_stat_calculators
 from lm_polygraph.generation_metrics import AccuracyMetric, AlignScore
 from lm_polygraph.generation_metrics.generation_metric import GenerationMetric
 from lm_polygraph.ue_metrics import PredictionRejectionArea
+from lm_polygraph.stat_calculators.statistic_extraction import TrainingStatisticExtractionCalculator
 from lm_polygraph.estimators import *
 
 SEED = 3407
@@ -74,347 +77,25 @@ def log_gpu_mem(tag):
     print(f"[GPU MEM] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB peak={peak:.2f}GB")
 
 
-# ---------------------------------------------------------------------------
-# Caricamento dataset (Sezione 5.1 del paper). Ogni loader restituisce una
-# lista di dict {"content": <corpo del prompt, senza suffisso finale>,
-# "reference": <testo/lettera/numero di riferimento>}, cosi' che il resto
-# della pipeline (format_prompt/format_chat_prompt, generation_metric) sia
-# identico per tutti i dataset.
-#
-# Dimensioni ridotte rispetto al paper (che usa 2000 istanze/dataset, 100/
-# subject per MMLU) per contenere il tempo di calcolo sul cluster: n=100 per
-# CoQA/TriviaQA/MMLU (stessa scala usata finora per MedQA), n=50 per GSM8k
-# (le sue generazioni sono molto piu' lunghe -- ~128 token medi di
-# ragionamento contro i ~4 degli altri tre -- quindi pesano di piu' su tutti
-# gli stimatori a campionamento). Deciso esplicitamente da Filo (2026-08-14).
-#
-# I prompt 5-shot (TriviaQA/MMLU/GSM8k) sono costruiti da noi in uno stile
-# coerente col resto della pipeline, NON sono una replica byte-per-byte dei
-# template di lm-evaluation-harness citati nel paper -- da tenere come
-# caveat in tesi. Per MMLU il paper campiona fino a 100 domande PER SUBJECT
-# (57 subject); noi campioniamo 100 domande totali su tutti i subject
-# insieme (stesso budget usato per gli altri dataset), quindi non tutti i
-# 57 subject saranno necessariamente rappresentati.
-# ---------------------------------------------------------------------------
-
-def prepare_coqa(n_test, seed, cache_dir=None):
-    """CoQA (stanfordnlp/coqa, split 'validation', 500 righe = 500 istanze
-    di test come da Table 2 del paper). Ogni riga e' una conversazione;
-    usiamo tutte le domande/risposte tranne l'ultima come storico della
-    conversazione (few-shot "naturale") e l'ultima domanda come target,
-    esattamente come descritto nel paper."""
-    raw = load_dataset("stanfordnlp/coqa", cache_dir=cache_dir)["validation"]
-    raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
-    examples = []
-    for row in raw:
-        questions = row["questions"]
-        answers = row["answers"]["input_text"]
-        if len(questions) < 1:
-            continue
-        history = list(zip(questions[:-1], answers[:-1]))
-        lines = [
-            "Leggi il passaggio seguente e rispondi in modo breve e diretto alla domanda "
-            "finale della conversazione, nello stesso stile delle risposte precedenti.",
-            "",
-            f"Passaggio: {row['story'].strip()}",
-            "",
-        ]
-        for q, a in history:
-            lines.append(f"D: {q.strip()}")
-            lines.append(f"R: {a.strip()}")
-        lines.append(f"D: {questions[-1].strip()}")
-        examples.append({"content": "\n".join(lines), "reference": answers[-1]})
-    return examples
-
-
-def prepare_triviaqa(n_test, seed, cache_dir=None, n_fewshot=5):
-    """TriviaQA (mandarjoshi/trivia_qa, config 'rc.nocontext' -- "without
-    context" come nel paper). Split train/test hanno 138384/17210 righe,
-    identici ai numeri di Table 2. 5-shot da esempi del train set."""
-    raw = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", cache_dir=cache_dir)
-    fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
-    fewshot_block = "\n\n".join(
-        f"Domanda: {r['question'].strip()}\nRisposta: {r['answer']['value']}" for r in fewshot
-    )
-    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
-    examples = []
-    for r in test:
-        content = (
-            "Rispondi alla domanda in modo breve e diretto (poche parole), senza spiegazioni.\n\n"
-            f"{fewshot_block}\n\nDomanda: {r['question'].strip()}"
-        )
-        examples.append({"content": content, "reference": r["answer"]["value"]})
-    return examples
-
-
-def prepare_mmlu(n_test, seed, cache_dir=None):
-    """MMLU (cais/mmlu, config 'all'). 5-shot per-subject usando lo split
-    'dev' (5 esempi per subject, protocollo standard MMLU), come nel paper."""
-    raw = load_dataset("cais/mmlu", "all", cache_dir=cache_dir)
-    letters = ["A", "B", "C", "D"]
-    dev_by_subject = {}
-    for r in raw["dev"]:
-        dev_by_subject.setdefault(r["subject"], []).append(r)
-    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
-    examples = []
-    for r in test:
-        fewshot_rows = dev_by_subject.get(r["subject"], [])[:5]
-        blocks = []
-        for f in fewshot_rows:
-            opt_lines = "\n".join(f"{letters[i]}) {c}" for i, c in enumerate(f["choices"]))
-            blocks.append(f"Domanda: {f['question']}\n{opt_lines}\nRisposta: {letters[f['answer']]}")
-        fewshot_block = "\n\n".join(blocks)
-        opt_lines = "\n".join(f"{letters[i]}) {c}" for i, c in enumerate(r["choices"]))
-        content = (
-            "Rispondi SOLO con la lettera dell'opzione corretta (A, B, C o D), senza altro testo.\n\n"
-            f"{fewshot_block}\n\nDomanda: {r['question'].strip()}\n{opt_lines}"
-        )
-        examples.append({"content": content, "reference": letters[r["answer"]]})
-    return examples
-
-
-def prepare_gsm8k(n_test, seed, cache_dir=None, n_fewshot=5):
-    """GSM8k (openai/gsm8k, config 'main'). Split train/test hanno
-    7473/1319 righe, identici a Table 2. 5-shot dal train set, con la
-    risposta 'reference' ridotta al solo numero finale (dopo '####')."""
-    raw = load_dataset("openai/gsm8k", "main", cache_dir=cache_dir)
-    fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
-    blocks = []
-    for r in fewshot:
-        ans_clean = r["answer"].replace("####", "Risposta finale:")
-        blocks.append(f"Problema: {r['question'].strip()}\nSoluzione: {ans_clean}")
-    fewshot_block = "\n\n".join(blocks)
-    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
-    examples = []
-    for r in test:
-        content = (
-            "Risolvi il problema passo per passo, poi scrivi il risultato finale preceduto "
-            "esattamente da 'Risposta finale:'.\n\n"
-            f"{fewshot_block}\n\nProblema: {r['question'].strip()}"
-        )
-        final = r["answer"].split("####")[-1].strip().replace(",", "")
-        examples.append({"content": content, "reference": final})
-    return examples
-
-
-class GSM8kAccuracyMetric(GenerationMetric):
-    """lm-polygraph non ha una metrica pronta per problemi matematici a
-    risposta numerica (solo Accuracy per multiple-choice o AlignScore per
-    testo libero). Estrae l'ULTIMO numero presente nel testo generato
-    (robusto anche se il modello non segue esattamente il formato "Risposta
-    finale: X" richiesto nel prompt) e lo confronta con il numero di
-    riferimento con una tolleranza numerica minima."""
-
-    def __init__(self):
-        super().__init__(["greedy_texts"], "sequence")
-
-    def __str__(self):
-        return "GSM8kAccuracy"
-
-    @staticmethod
-    def _extract_number(text):
-        cleaned = text.replace(",", "")
-        matches = re.findall(r"-?\d+\.?\d*", cleaned)
-        if not matches:
-            return None
-        try:
-            return float(matches[-1])
-        except ValueError:
-            return None
-
-    def __call__(self, stats, target_texts):
-        preds = stats["greedy_texts"]
-        scores = []
-        for pred, ref in zip(preds, target_texts):
-            pred_num = self._extract_number(pred)
-            try:
-                ref_num = float(str(ref).replace(",", ""))
-            except (TypeError, ValueError):
-                ref_num = None
-            if pred_num is None or ref_num is None:
-                scores.append(0.0)
-            else:
-                scores.append(1.0 if abs(pred_num - ref_num) < 1e-4 else 0.0)
-        return np.array(scores)
-
-
-# Regex condivisa con MMLU/MedQA-style: tiene solo la lettera A-D, scarta
-# qualunque testo dopo (serve perche' AccuracyMetric confronta stringhe
-# esatte e i modelli a volte aggiungono testo/punteggiatura extra).
-_MCQ_IGNORE_REGEX = r"(?<=[ABCDabcd])[\s\S]*"
-
-
-# ---------------------------------------------------------------------------
-# Confronto extra "safe vs non-safe": stessi 4 modelli, stessa pipeline UQ,
-# ma su due dataset medici con conseguenze molto diverse in caso di errore:
-#   - MedQA-USMLE: domande da esame di medicina. Un errore costa solo un
-#     punteggio piu' basso in un test, nessuna conseguenza reale.
-#   - MedicationQA: domande reali di pazienti su farmaci (dosaggi,
-#     interazioni, effetti collaterali). Un errore qui (dose sbagliata,
-#     interazione non segnalata) puo' avere conseguenze gravi o letali.
-# Voluto da Filo (2026-08-16) per vedere se il ranking dei metodi UQ cambia
-# tra uno scenario "a basso rischio" e uno "ad alto rischio".
-# ---------------------------------------------------------------------------
-
-MEDQA_FEWSHOT_EXAMPLES = [
-    {
-        "question": "A 3-month-old baby died suddenly at night while asleep. His mother noticed that he had died only after she awoke in the morning. No cause of death was determined based on the autopsy. Which of the following precautions could have prevented the death of the baby?",
-        "options": {
-            "A": "Placing the infant in a supine position on a firm mattress while sleeping",
-            "B": "Keeping the infant covered and maintaining a high room temperature",
-            "C": "Application of a device to maintain the sleeping position",
-            "D": "Avoiding pacifier use during sleep",
-        },
-        "answer_idx": "A",
-    },
-    {
-        "question": "A 9-month-old female is brought to the emergency department after experiencing a seizure. She was born at home and was normal at birth according to her parents. Since then, they have noticed that she does not appear to be achieving developmental milestones as quickly as her siblings, and often appears lethargic. Physical exam reveals microcephaly, very light pigmentation (as compared to her family), and a \"musty\" body odor. The varied manifestations of this disease can most likely be attributed to which of the following genetic principles?",
-        "options": {
-            "A": "Anticipation",
-            "B": "Multiple gene mutations",
-            "C": "Pleiotropy",
-            "D": "Variable expressivity",
-        },
-        "answer_idx": "C",
-    },
-    {
-        "question": "A 68-year-old man presents to the emergency department with leg pain. He states that the pain started suddenly while he was walking outside. The patient has a past medical history of diabetes, hypertension, obesity, and atrial fibrillation. His temperature is 99.3°F (37.4°C), blood pressure is 152/98 mmHg, pulse is 97/min, respirations are 15/min, and oxygen saturation is 99% on room air. Physical exam is notable for a cold and pale left leg. The patient's sensation is markedly diminished in the left leg when compared to the right, and his muscle strength is 1/5 in his left leg. Which of the following is the best next step in management?",
-        "options": {
-            "A": "Graded exercise and aspirin",
-            "B": "Heparin drip",
-            "C": "Surgical thrombectomy",
-            "D": "Tissue plasminogen activator",
-        },
-        "answer_idx": "B",
-    },
-]
-
-
-def _build_medqa_fewshot_block():
-    blocks = []
-    for ex in MEDQA_FEWSHOT_EXAMPLES:
-        opts = ex["options"]
-        blocks.append(
-            f"Domanda: {ex['question']}\n\n"
-            f"A) {opts['A']}\nB) {opts['B']}\nC) {opts['C']}\nD) {opts['D']}\n\n"
-            f"Risposta: {ex['answer_idx']}"
-        )
-    return "\n\n".join(blocks)
-
-
-def prepare_medqa(n_test, seed, cache_dir=None):
-    """MedQA-USMLE (GBaker/MedQA-USMLE-4-options, split 'test'). Scenario
-    SAFE: multiple-choice da esame di medicina, few-shot (3 esempi) +
-    istruzione a rispondere solo con la lettera. Stesso identico prompt gia'
-    usato prima che il dataset principale passasse a CoQA/TriviaQA/MMLU/
-    GSM8k (vedi commit 'port MedQA UQ benchmark notebook to main.py')."""
-    raw = load_dataset("GBaker/MedQA-USMLE-4-options", cache_dir=cache_dir)
-    fewshot_block = _build_medqa_fewshot_block()
-    test_split = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
-    examples = []
-    for ex in test_split:
-        opts = ex["options"]
-        content = (
-            "Sei un assistente medico che risponde a domande in stile esame USMLE.\n"
-            "Leggi il quesito clinico e rispondi SOLO con la lettera dell'opzione corretta "
-            "(A, B, C o D), senza altro testo.\n\n"
-            f"{fewshot_block}\n\n"
-            f"Domanda: {ex['question'].strip()}\n\n"
-            f"A) {opts['A'].strip()}\nB) {opts['B'].strip()}\nC) {opts['C'].strip()}\nD) {opts['D'].strip()}"
-        )
-        examples.append({"content": content, "reference": ex["answer_idx"]})
-    return examples
-
-
-def prepare_medicationqa(n_test, seed, cache_dir=None):
-    """MedicationQA (truehealth/medicationqa, unico split 'train', 690
-    righe). Scenario NON-SAFE: domande reali di pazienti su farmaci
-    (dosaggi, interazioni, effetti collaterali) con risposte in testo
-    libero -- niente few-shot nel dataset originale, prompt a zero-shot
-    diretto in stile CoQA/TriviaQA. Alcune righe hanno Question/Answer
-    vuoti (dataset raccolto da FAQ reali, non curato come benchmark): le
-    scartiamo prima di campionare."""
-    raw = load_dataset("truehealth/medicationqa", cache_dir=cache_dir)["train"]
-    raw = raw.filter(lambda ex: ex["Question"] and ex["Answer"])
-    raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
-    examples = []
-    for ex in raw:
-        content = (
-            "Sei un assistente farmaceutico che risponde a domande reali di pazienti sui farmaci "
-            "(dosaggi, interazioni, effetti collaterali). Rispondi in modo chiaro e conciso.\n\n"
-            f"Domanda: {ex['Question'].strip()}"
-        )
-        examples.append({"content": content, "reference": ex["Answer"].strip()})
-    return examples
-
-
-SAFETY_DATASETS = {
-    "MedQA": {
-        "loader": prepare_medqa,
-        "n_test": 100,
-        "max_new_tokens": 3,
-        "plain_suffix": "\n\nRisposta:",
-        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
-        "safety_label": "SAFE -- errore = domanda d'esame sbagliata, nessuna conseguenza reale",
-    },
-    "MedicationQA": {
-        "loader": prepare_medicationqa,
-        "n_test": 100,
-        # Le risposte reali (MedlinePlus/DailyMed) vanno da poche parole a
-        # spiegazioni di 60-80 parole (~100-120 token): margine piu' ampio
-        # di CoQA/TriviaQA per non troncare le risposte piu' lunghe.
-        "max_new_tokens": 100,
-        "plain_suffix": "\nRisposta:",
-        "generation_metric_factory": lambda: AlignScore(),
-        "safety_label": "NON-SAFE -- errore su farmaci = potenzialmente grave o letale",
-    },
-}
-
-DATASETS = {
-    "CoQA": {
-        "loader": prepare_coqa,
-        "n_test": 100,
-        "max_new_tokens": 30,
-        "plain_suffix": "\nR:",
-        "generation_metric_factory": lambda: AlignScore(),
-    },
-    "TriviaQA": {
-        "loader": prepare_triviaqa,
-        "n_test": 100,
-        "max_new_tokens": 20,
-        "plain_suffix": "\nRisposta:",
-        "generation_metric_factory": lambda: AlignScore(),
-    },
-    "MMLU": {
-        "loader": prepare_mmlu,
-        "n_test": 100,
-        "max_new_tokens": 3,
-        "plain_suffix": "\n\nRisposta:",
-        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
-    },
-    "GSM8k": {
-        "loader": prepare_gsm8k,
-        "n_test": 50,
-        # Target medio 128.6 token (Table 2, tokenizer Mistral 7B v0.2):
-        # margine ampio per lasciare spazio al ragionamento completo prima
-        # del numero finale (non calcoliamo il 99esimo percentile esatto
-        # come nel paper, usiamo un valore fisso prudente).
-        "max_new_tokens": 200,
-        "plain_suffix": "\nSoluzione:",
-        "generation_metric_factory": lambda: GSM8kAccuracyMetric(),
-    },
-}
-
-
-def format_prompt(content, suffix):
-    """Prompt a completamento di testo semplice (modelli base LFM2)."""
-    return content + suffix
-
-
-def format_chat_prompt(tokenizer, content):
-    """Prompt con chat template per modelli instruction-tuned (MedGemma/Gemma3 -it)."""
-    messages = [{"role": "user", "content": content}]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+# Loader/dataset config estratti in dataset_prep.py (2026-08-18), cosi' da
+# poter essere importati anche da train_stat_builder.py senza incorrere nel
+# problema "main" vs "__main__" quando lm-polygraph importa builder custom
+# dinamicamente (vedi commento in cima a dataset_prep.py).
+from dataset_prep import (
+    DATASETS,
+    SAFETY_DATASETS,
+    GSM8kAccuracyMetric,
+    _MCQ_IGNORE_REGEX,
+    prepare_coqa,
+    prepare_triviaqa,
+    prepare_mmlu,
+    prepare_gsm8k,
+    prepare_medqa,
+    prepare_medicationqa,
+    prepare_wikitext_background,
+    format_prompt,
+    format_chat_prompt,
+)
 
 
 FIGURE_A_MODELS_NOTE = (
@@ -481,16 +162,19 @@ PAPER_METHODS = [
     {"paper_label": "Label Prob.", "figure": "B", "factory": lambda: LabelProb()},
     {"paper_label": "BB P(True)", "figure": "B", "factory": lambda: PTrueEmpirical()},
 
-    # --- esclusi: density-based, richiedono dati di training separati ---
-    {"paper_label": "Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
-     "reason": "Richiede fit di un modello di densita' su embeddings del train set "
-               "(TrainingStatisticExtractionCalculator + EmbeddingsCalculator, non registrati di default "
-               "in register_default_stat_calculators): forward pass extra per modello, costo di tempo "
-               "cluster e rischio OOM su MedGemma/Gemma3 in bf16 (gia' a 23.5/24GB). Escluso su richiesta esplicita (2026-08-12)."},
-    {"paper_label": "RDE - Decoder", "figure": "A", "factory": None,
-     "reason": "Stesso motivo di Mahalanobis Distance: richiede training data ed embeddings extra. Escluso su richiesta esplicita (2026-08-12)."},
-    {"paper_label": "Relative Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
-     "reason": "Stesso motivo di Mahalanobis Distance: richiede training data ed embeddings extra. Escluso su richiesta esplicita (2026-08-12)."},
+    # --- density-based: richiedono un train set + un modello di densita' ---
+    # Aggiunti il 2026-08-18 (inizialmente esclusi il 2026-08-12 per lo
+    # stesso motivo, poi rivalutati su richiesta di Filo: il costo aggiuntivo
+    # e' un solo forward pass extra per combinazione modello/dataset, non
+    # proibitivo). Wiring: EmbeddingsCalculator + TrainingStatisticExtractionCalculator
+    # aggiunti a mano in build_manager() (non registrati di default per
+    # Whitebox), train/background dataset costruiti in train_stat_builder.py.
+    {"paper_label": "Mahalanobis Distance - Decoder", "figure": "A",
+     "factory": lambda: MahalanobisDistanceSeq(embeddings_type="decoder")},
+    {"paper_label": "RDE - Decoder", "figure": "A",
+     "factory": lambda: RDESeq(embeddings_type="decoder")},
+    {"paper_label": "Relative Mahalanobis Distance - Decoder", "figure": "A",
+     "factory": lambda: RelativeMahalanobisDistanceSeq(embeddings_type="decoder")},
     {"paper_label": "HUQ-MD - Decoder", "figure": "A", "factory": None,
      "reason": "Non esiste come classe in lm-polygraph (verificato nel sorgente del repo IINemo/lm-polygraph: "
                "nessun file/import con 'HUQ' in src/lm_polygraph/estimators/) -- andrebbe implementato da zero "
@@ -618,7 +302,7 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation=
     return model
 
 
-def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens, generation_metric):
+def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens, generation_metric, train_stat_cfg=None):
     available_stat_calculators = register_default_stat_calculators(
         model_type="Whitebox",
         language="en",
@@ -628,6 +312,36 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
         blackbox_supports_logprobs=False,
         deberta_batch_size=10,
     )
+
+    # TrainingStatisticExtractionCalculator NON e' registrato di default per
+    # Whitebox (verificato nel sorgente di register_default_stat_calculators):
+    # serve solo a Mahalanobis Distance/RDE/Relative Mahalanobis Distance,
+    # quindi lo aggiungiamo qui a mano con un builder custom
+    # (train_stat_builder.py) che gli passa due dataset veri (train +
+    # background) costruiti al volo. Non serve registrare anche
+    # EmbeddingsCalculator: GreedyProbsCalculator (gia' registrato sopra,
+    # con output_hidden_states=True) produce gia' "embeddings_decoder" per
+    # il batch di eval corrente, e TrainingStatisticExtractionCalculator usa
+    # internamente lo stesso GreedyProbsCalculator sul train/background set,
+    # producendo "train_embeddings_decoder"/"background_train_embeddings_decoder"
+    # in automatico (via il suo prefisso dataset_name + nome-statistica) --
+    # verificato leggendo statistic_extraction.py: la classe EmbeddingsCalculator
+    # standalone dichiara nomi di output diversi ("train_embeddings" senza
+    # suffisso _decoder) che non corrispondono a quello che gli estimator
+    # cercano davvero, quindi va evitata qui per non confondere la
+    # risoluzione delle dipendenze di UEManager.
+    if train_stat_cfg is not None:
+        available_stat_calculators.append(
+            StatCalculatorContainer(
+                name="TrainingStatisticExtractionCalculator",
+                obj=TrainingStatisticExtractionCalculator,
+                builder="train_stat_builder",
+                cfg=OmegaConf.create(train_stat_cfg),
+                dependencies=TrainingStatisticExtractionCalculator.meta_info()[1],
+                stats=TrainingStatisticExtractionCalculator.meta_info()[0],
+            )
+        )
+
     builder_env_stat_calc = BuilderEnvironmentStatCalculator(model=model)
 
     man = UEManager(
@@ -684,11 +398,27 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
 
         model_dataset = PolygraphDataset(prompts, references, batch_size=args.batch_size)
 
+        # Config per Mahalanobis Distance/RDE/Relative Mahalanobis Distance
+        # (vedi train_stat_builder.py): dataset_name serve al builder per
+        # pescare lo stesso loader/plain_suffix usati per il test, su un
+        # campione indipendente (seed diverso).
+        train_stat_cfg = {
+            "dataset_name": dataset_name,
+            "n_train": args.n_train_samples,
+            "n_background": args.n_train_samples,
+            "seed": SEED,
+            "cache_dir": args.datasets_cache_dir,
+            "batch_size": args.batch_size,
+            "use_chat_template": use_chat_template,
+            "plain_suffix": cfg["plain_suffix"],
+        }
+
         timing_dict = {}
         estimators = [TimedEstimator(e, timing_dict) for e in build_estimators()]
         man = build_manager(
             model, model_dataset, estimators, args.cache_dir, args.max_rejection,
             cfg["max_new_tokens"], cfg["generation_metric_factory"](),
+            train_stat_cfg=train_stat_cfg,
         )
         man()
         log_gpu_mem(f"{model_name}/{dataset_name} done")
@@ -841,6 +571,11 @@ def main():
     # qualunque conflitto di permessi sulla cache condivisa.
     parser.add_argument("--datasets_cache_dir", type=str,
                          default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
+    parser.add_argument("--n_train_samples", type=int, default=100,
+                         help="Dimensione del train set (in-domain) e del background set (WikiText) usati "
+                              "da Mahalanobis Distance/RDE/Relative Mahalanobis Distance. RDE usa PCA a "
+                              "100 componenti quindi richiede almeno 100 -- non scendere sotto questo valore "
+                              "a meno di non voler rinunciare a RDE specificamente (default: %(default)s).")
     parser.add_argument("--run_safety_comparison", action="store_true",
                          help="In piu' rispetto alla pipeline principale, esegue anche il confronto "
                               "MedQA (safe) vs MedicationQA (non-safe) su tutti e 4 i modelli "
