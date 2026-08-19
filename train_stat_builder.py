@@ -19,16 +19,27 @@ TrainingStatisticExtractionCalculator, seguendo lo stesso pattern del
 builder ufficiale (verificato via sorgente GitHub), adattato per riusare i
 nostri loader invece di lm_polygraph.utils.dataset.Dataset.load().
 
-Caveat noto (non risolvibile senza modificare la libreria): il codice di
-TrainingStatisticExtractionCalculator confronta erroneamente la LISTA
-["train_", "background_train_"] anziche' l'elemento corrente del loop
-contro la stringa "train_" (vedi statistic_extraction.py, riga con
-`train_max_new_tokens = (max_new_tokens if datasets_name == "train_" ...`),
-quindi il ramo True non scatta mai: sia il train set in-domain sia il
-background set vengono generati con max_new_tokens=100 (il default
-dell'argomento background_train_dataset_max_new_tokens), MAI col
-max_new_tokens del dataset corrente (es. 200 per GSM8k). Non e' un nostro
-bug, e' nella libreria; accettato come limitazione documentata."""
+Caveat noti (bug di libreria, non risolvibili senza patchare lm-polygraph):
+
+1. Il codice di TrainingStatisticExtractionCalculator confronta erroneamente
+   la LISTA ["train_", "background_train_"] anziche' l'elemento corrente del
+   loop contro la stringa "train_" (statistic_extraction.py, riga con
+   `train_max_new_tokens = (max_new_tokens if datasets_name == "train_" ...`),
+   quindi il ramo True non scatta mai: sia il train set in-domain sia il
+   background set vengono generati con max_new_tokens=100 (il default
+   dell'argomento background_train_dataset_max_new_tokens), mai col
+   max_new_tokens del dataset corrente (es. 200 per GSM8k).
+
+2. Su LFM2-350M/LFM2-1.2B, Mahalanobis Distance/RDE/Relative Mahalanobis
+   Distance falliscono sistematicamente con `could not broadcast input
+   array from shape (N,1) into shape (M,1)` dentro
+   TrainingStatisticExtractionCalculator: non e' OOM (i modelli LFM2 sono
+   piccoli), ma un mismatch di forma quando la libreria impila le statistiche
+   per-sample, verosimilmente conseguenza del bug #1 sopra (batch che
+   generano meno token del previsto disallineano il conteggio atteso). Su
+   MedGemma-4B-it/Gemma3-4B-it questi 3 metodi funzionano regolarmente.
+   Coverage risultante: solo 2 modelli su 4, documentato come limitazione
+   nota in tesi anziche' investigato ulteriormente."""
 
 from lm_polygraph.utils.dataset import Dataset as PolygraphDataset
 from lm_polygraph.stat_calculators.statistic_extraction import (

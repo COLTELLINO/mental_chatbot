@@ -77,10 +77,9 @@ def log_gpu_mem(tag):
     print(f"[GPU MEM] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB peak={peak:.2f}GB")
 
 
-# Loader/dataset config estratti in dataset_prep.py (2026-08-18), cosi' da
-# poter essere importati anche da train_stat_builder.py senza incorrere nel
-# problema "main" vs "__main__" quando lm-polygraph importa builder custom
-# dinamicamente (vedi commento in cima a dataset_prep.py).
+# Loader/config dei dataset vivono in dataset_prep.py cosi' da poter essere
+# importati anche da train_stat_builder.py (vedi commento in cima a quel
+# file per il motivo tecnico della separazione).
 from dataset_prep import (
     DATASETS,
     SAFETY_DATASETS,
@@ -163,12 +162,15 @@ PAPER_METHODS = [
     {"paper_label": "BB P(True)", "figure": "B", "factory": lambda: PTrueEmpirical()},
 
     # --- density-based: richiedono un train set + un modello di densita' ---
-    # Aggiunti il 2026-08-18 (inizialmente esclusi il 2026-08-12 per lo
-    # stesso motivo, poi rivalutati su richiesta di Filo: il costo aggiuntivo
-    # e' un solo forward pass extra per combinazione modello/dataset, non
-    # proibitivo). Wiring: EmbeddingsCalculator + TrainingStatisticExtractionCalculator
-    # aggiunti a mano in build_manager() (non registrati di default per
-    # Whitebox), train/background dataset costruiti in train_stat_builder.py.
+    # Costo extra: un forward pass in piu' per combinazione modello/dataset,
+    # per estrarre gli embedding di un train set in-domain (e, per RMD, di
+    # un background set generico fuori dominio). Wiring:
+    # TrainingStatisticExtractionCalculator aggiunto a mano in build_manager()
+    # (non registrato di default per Whitebox), train/background dataset
+    # costruiti in train_stat_builder.py. NOTA: su LFM2-350M/LFM2-1.2B questi
+    # 3 metodi falliscono sistematicamente per un bug di libreria (vedi
+    # caveat in train_stat_builder.py) -- coperti solo su MedGemma-4B-it/
+    # Gemma3-4B-it, non e' un problema del nostro codice.
     {"paper_label": "Mahalanobis Distance - Decoder", "figure": "A",
      "factory": lambda: MahalanobisDistanceSeq(embeddings_type="decoder")},
     {"paper_label": "RDE - Decoder", "figure": "A",
@@ -538,17 +540,15 @@ def plot_safety_comparison(df, labels, group_order, out_path):
     print(f"Salvato: {out_path}")
 
 
-# Modello scelto per il confronto quantizzato vs non-quantizzato (vedi
+# Modello di default per il confronto quantizzato vs non-quantizzato (vedi
 # --run_quant_comparison in main()). MedGemma-4B-it e Gemma3-4B-it sono
 # esclusi a priori: producono logit NaN sotto bitsandbytes 4-bit (vedi
-# CHAT_TEMPLATE_MODELS sopra) e per questo nella pipeline vengono SEMPRE
-# caricati in bf16 -- un confronto quantizzato/non-quantizzato su di loro
-# non e' fattibile con questo codice. Tra i due modelli rimasti (LFM2-350M,
-# LFM2-1.2B) scegliamo il piu' grande: la quantizzazione 4-bit comprime
-# maggiormente un modello con piu' parametri, quindi un eventuale effetto
-# sulla qualita' delle stime di incertezza ha piu' probabilita' di essere
-# misurabile rispetto al modello da 350M. Scelta di Filo (2026-08-16):
-# "scegli te un modello".
+# CHAT_TEMPLATE_MODELS sopra) e per questo vengono SEMPRE caricati in bf16 --
+# un confronto quantizzato/non-quantizzato su di loro non e' fattibile con
+# questo codice. Tra i due modelli rimasti (LFM2-350M, LFM2-1.2B) si sceglie
+# il piu' grande: la quantizzazione 4-bit comprime maggiormente un modello
+# con piu' parametri, quindi un eventuale effetto sulla qualita' delle stime
+# di incertezza ha piu' probabilita' di essere misurabile.
 QUANT_COMPARE_MODEL_DEFAULT = "LFM2-1.2B"
 
 
@@ -563,12 +563,9 @@ def main():
     parser.add_argument("--results_dir", type=str, default=os.environ.get("RESULTS_DIR", "/workspace/results"))
     parser.add_argument("--cache_dir", type=str, default=os.environ.get("HF_HOME", "/llms"))
     # Cache separata per i dataset (load_dataset), diversa da --cache_dir
-    # (usata solo per i pesi dei modelli). /llms sembra essere una cache
-    # condivisa a livello di cluster: il primo run con GSM8k ha fallito con
-    # un PermissionError sul lock file "/llms/datasets/..." (probabilmente
-    # gia' scritto da un altro utente/processo con permessi diversi). Uso
-    # una directory privata sotto /workspace (il repo di Filo) per evitare
-    # qualunque conflitto di permessi sulla cache condivisa.
+    # (usata solo per i pesi dei modelli). /llms e' una cache condivisa a
+    # livello di cluster tra piu' utenti: usare una directory privata sotto
+    # /workspace evita conflitti di permessi sui file di lock di HF datasets.
     parser.add_argument("--datasets_cache_dir", type=str,
                          default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
     parser.add_argument("--n_train_samples", type=int, default=100,

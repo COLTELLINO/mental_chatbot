@@ -1,13 +1,14 @@
-"""Loader di dataset e configurazione DATASETS/SAFETY_DATASETS, estratti da
-main.py in un modulo separato (2026-08-18) cosi' da poter essere importati
-sia da main.py sia da train_stat_builder.py (il builder custom usato per
-Mahalanobis Distance/RDE/Relative Mahalanobis Distance) senza incorrere nel
-problema "main" vs "__main__": lm-polygraph importa i builder custom via
-import_module(nome_modulo), e se quel modulo provasse a fare
-`from main import ...` mentre main.py e' in esecuzione come script
-(__main__), Python ri-eseguirebbe l'intero file da capo sotto un nome di
-modulo diverso invece di riusare l'istanza gia' caricata. Con questo modulo
-dedicato (mai eseguito come script) il problema non si pone."""
+"""Loader di dataset e configurazione DATASETS/SAFETY_DATASETS.
+
+Modulo separato da main.py cosi' da poter essere importato sia da main.py
+sia da train_stat_builder.py (il builder custom usato per Mahalanobis
+Distance/RDE/Relative Mahalanobis Distance) senza incorrere nel problema
+"main" vs "__main__": lm-polygraph importa i builder custom via
+import_module(nome_modulo), e se quel modulo facesse `from main import ...`
+mentre main.py e' in esecuzione come script (__main__), Python
+ri-eseguirebbe l'intero file da capo sotto un nome di modulo diverso invece
+di riusare l'istanza gia' caricata. Un modulo dedicato, mai eseguito come
+script, evita il problema."""
 
 import re
 
@@ -27,10 +28,9 @@ from lm_polygraph.generation_metrics.generation_metric import GenerationMetric
 #
 # Dimensioni ridotte rispetto al paper (che usa 2000 istanze/dataset, 100/
 # subject per MMLU) per contenere il tempo di calcolo sul cluster: n=100 per
-# CoQA/TriviaQA/MMLU (stessa scala usata finora per MedQA), n=50 per GSM8k
-# (le sue generazioni sono molto piu' lunghe -- ~128 token medi di
-# ragionamento contro i ~4 degli altri tre -- quindi pesano di piu' su tutti
-# gli stimatori a campionamento). Deciso esplicitamente da Filo (2026-08-14).
+# CoQA/TriviaQA/MMLU, n=50 per GSM8k (le sue generazioni sono molto piu'
+# lunghe -- ~128 token medi di ragionamento contro i ~4 degli altri tre --
+# quindi pesano di piu' su tutti gli stimatori a campionamento).
 #
 # I prompt 5-shot (TriviaQA/MMLU/GSM8k) sono costruiti da noi in uno stile
 # coerente col resto della pipeline, NON sono una replica byte-per-byte dei
@@ -196,8 +196,8 @@ _MCQ_IGNORE_REGEX = r"(?<=[ABCDabcd])[\s\S]*"
 #   - MedicationQA: domande reali di pazienti su farmaci (dosaggi,
 #     interazioni, effetti collaterali). Un errore qui (dose sbagliata,
 #     interazione non segnalata) puo' avere conseguenze gravi o letali.
-# Voluto da Filo (2026-08-16) per vedere se il ranking dei metodi UQ cambia
-# tra uno scenario "a basso rischio" e uno "ad alto rischio".
+# Obiettivo: vedere se il ranking dei metodi UQ cambia tra uno scenario "a
+# basso rischio" e uno "ad alto rischio".
 # ---------------------------------------------------------------------------
 
 MEDQA_FEWSHOT_EXAMPLES = [
@@ -249,9 +249,7 @@ def _build_medqa_fewshot_block():
 def prepare_medqa(n_test, seed, cache_dir=None):
     """MedQA-USMLE (GBaker/MedQA-USMLE-4-options, split 'test'). Scenario
     SAFE: multiple-choice da esame di medicina, few-shot (3 esempi) +
-    istruzione a rispondere solo con la lettera. Stesso identico prompt gia'
-    usato prima che il dataset principale passasse a CoQA/TriviaQA/MMLU/
-    GSM8k (vedi commit 'port MedQA UQ benchmark notebook to main.py')."""
+    istruzione a rispondere solo con la lettera."""
     raw = load_dataset("GBaker/MedQA-USMLE-4-options", cache_dir=cache_dir)
     fewshot_block = _build_medqa_fewshot_block()
     test_split = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
