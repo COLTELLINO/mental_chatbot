@@ -37,7 +37,7 @@ MODELS = {
     # serve a verificare che la nostra pipeline riproduca i loro risultati nel
     # loro stesso regime di scala. Senza questo controllo, qualunque scostamento
     # osservato sui modelli piccoli sarebbe attribuibile alla pipeline invece
-    # che alla scala.
+    # che alla scala. Licenza Apache 2.0, non gated: nessun token necessario.
     "Mistral-7B-it":  "mistralai/Mistral-7B-Instruct-v0.2",
 }
 
@@ -57,7 +57,10 @@ MODEL_PARAMS_B = {
 REPLICATION_ANCHOR_MODEL = "Mistral-7B-it"
 
 # Richiedono di accettare la licenza su huggingface.co + un HF_TOKEN esportato.
-GATED_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it", "Mistral-7B-it"}
+# Mistral-7B-Instruct-v0.2 NON e' gated (verificato via API HuggingFace:
+# "gated": false, licenza Apache 2.0), quindi non compare qui: si scarica
+# liberamente anche senza token.
+GATED_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
 # Modelli instruction-tuned: si aspettano un chat template esplicito (marcatori
 # di turno tipo <start_of_turn>/<end_of_turn> o [INST]). Dando loro lo stesso
