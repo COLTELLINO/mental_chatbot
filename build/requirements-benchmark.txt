@@ -7,3 +7,9 @@ pandas
 matplotlib
 seaborn
 tqdm
+# Usata direttamente da main.py per il Kendall tau del confronto fra ranking.
+# E' gia' una dipendenza transitiva di lm-polygraph (scipy.linalg.eigh in
+# eig_val_laplacian.py / eccentricity.py, che usiamo), quindi elencarla qui non
+# richiede una ricostruzione dell'immagine: serve solo a non dipendere dal fatto
+# che lm-polygraph continui a tirarsela dietro.
+scipy
