@@ -1,2 +1,8 @@
 slurm-*.out
 hf_datasets_cache/
+
+# Bytecode Python: rigenerato a ogni esecuzione e legato alla versione
+# dell'interprete (il .pyc committato era cpython-310, mentre il container gira
+# python3.11). Tenerlo tracciato produce un conflitto binario a ogni run.
+__pycache__/
+*.pyc

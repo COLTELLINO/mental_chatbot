@@ -80,10 +80,43 @@ CHAT_TEMPLATE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it", "Mistral-7B-it"}
 NO_QUANT_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
 
+# Batch size per modello, sovrascrive --batch_size solo dove serve.
+#
+# Motivo: i pesi non sono il problema (Mistral-7B in 4-bit ne occupa ~4.1GB su
+# una 3090 da 23.6GB). Il picco arriva durante il campionamento dei K sample
+# richiesti dagli stimatori a diversita' campionaria (SemanticEntropy, DegMat,
+# Eccentricity, ...), dove logit e KV-cache di batch_size*K sequenze stanno in
+# memoria insieme, e cresce con la lunghezza dei prompt. Nella run del
+# 2026-09-01 Mistral con batch_size=4 e' andato OOM su tutti e 4 i dataset
+# principali (23.55GiB usati su 23.57GiB disponibili, il campionamento non
+# riusciva ad allocare nemmeno 28MiB), mentre nella griglia severita' -- prompt
+# piu' corti -- passava di misura con peak=22.34GB. Ridurre il batch del solo
+# 7B abbassa il picco senza rallentare gli altri quattro modelli.
+MODEL_BATCH_SIZE = {"Mistral-7B-it": 1}
+
+# Batch del modello NLI (DeBERTa-large-mnli) usato da SemanticEntropy/DegMat/
+# Eccentricity per la matrice di similarita' tra i campioni. Gira sulla STESSA
+# GPU del LLM e i suoi tensori si sommano al picco di cui sopra, quindi per i
+# modelli al limite di memoria va ridotto insieme al batch di generazione.
+DEBERTA_BATCH_SIZE_DEFAULT = 10
+MODEL_DEBERTA_BATCH_SIZE = {"Mistral-7B-it": 2}
+
+
 def uses_quantization(model_name):
     """4-bit nf4 per default; bf16 solo per i modelli che sotto quantizzazione
     producono NaN (vedi NO_QUANT_MODELS)."""
     return model_name not in NO_QUANT_MODELS
+
+
+def batch_size_for(model_name, default_batch_size):
+    """Batch di generazione effettivo: il default da riga di comando, salvo
+    override per modelli al limite di memoria (vedi MODEL_BATCH_SIZE)."""
+    return MODEL_BATCH_SIZE.get(model_name, default_batch_size)
+
+
+def deberta_batch_size_for(model_name):
+    """Batch del modello NLI, ridotto per i modelli al limite di memoria."""
+    return MODEL_DEBERTA_BATCH_SIZE.get(model_name, DEBERTA_BATCH_SIZE_DEFAULT)
 
 
 def print_banner():
@@ -420,7 +453,8 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation=
 
 
 def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens,
-                  generation_metric, stat_timing_dict=None):
+                  generation_metric, stat_timing_dict=None,
+                  deberta_batch_size=DEBERTA_BATCH_SIZE_DEFAULT):
     available_stat_calculators = register_default_stat_calculators(
         model_type="Whitebox",
         language="en",
@@ -428,7 +462,7 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
         output_attentions=False,
         output_hidden_states=True,
         blackbox_supports_logprobs=False,
-        deberta_batch_size=10,
+        deberta_batch_size=deberta_batch_size,
     )
     builder_env_stat_calc = BuilderEnvironmentStatCalculator(model=model)
 
@@ -709,7 +743,13 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             prompts = [format_prompt(c, cfg["plain_suffix"]) for c in contents]
         references = [ex["reference"] for ex in examples]
 
-        model_dataset = PolygraphDataset(prompts, references, batch_size=args.batch_size)
+        batch_size = batch_size_for(model_name, args.batch_size)
+        deberta_batch_size = deberta_batch_size_for(model_name)
+        if batch_size != args.batch_size or deberta_batch_size != DEBERTA_BATCH_SIZE_DEFAULT:
+            print(f"  batch ridotto per {model_name}: generazione={batch_size} "
+                  f"(default {args.batch_size}), NLI={deberta_batch_size} "
+                  f"(default {DEBERTA_BATCH_SIZE_DEFAULT}) -- vedi MODEL_BATCH_SIZE.")
+        model_dataset = PolygraphDataset(prompts, references, batch_size=batch_size)
 
         max_new_tokens = max_new_tokens_override or cfg["max_new_tokens"]
         base_estimators = estimators_factory() if estimators_factory else build_estimators()
@@ -728,6 +768,7 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             model, model_dataset, estimators, args.cache_dir, args.max_rejection,
             max_new_tokens, cfg["generation_metric_factory"](),
             stat_timing_dict=stat_timing_dict,
+            deberta_batch_size=deberta_batch_size,
         )
         man()
         log_gpu_mem(f"{model_name}/{dataset_name} done")
@@ -1308,6 +1349,58 @@ def build_verbalized_estimators(style):
     raise ValueError(f"Stile verbalized sconosciuto: {style}")
 
 
+# ---------------------------------------------------------------------------
+# Ripresa da checkpoint.
+#
+# main.py salta le combinazioni modello x dataset gia' presenti in
+# results_final.csv, cosi' che un run interrotto (job SLURM scaduto, OOM, nodo
+# riavviato) possa riprendere senza rifare ore di GPU. Questo pero' e' sicuro
+# solo se i checkpoint sono stati prodotti dalla STESSA versione del codice.
+#
+# Nella run del 2026-09-01 non lo erano: la results_dir conteneva ancora i file
+# di agosto, precedenti sia all'aggiunta di Mistral-7B-it sia alle colonne di
+# costo per-istanza. Conseguenza: i quattro modelli piccoli sono stati saltati
+# in blocco (risultavano "gia' fatti"), e' stato eseguito il solo Mistral --
+# che e' andato OOM su tutti e 4 i dataset -- e le figure finali sono state
+# rigenerate da dati di agosto con un timestamp fresco, mentre la tabella dei
+# costi moriva con KeyError sulle colonne che il vecchio CSV non aveva.
+# Silenziosamente: nessuna di queste tre cose ferma il job, che e' uscito con
+# COMPLETED / ExitCode 0:0 dopo 14 ore.
+#
+# Le due difese qui sotto: verificare lo schema prima di fidarsi di un
+# checkpoint, e dire a voce alta cosa viene saltato e da dove viene.
+# ---------------------------------------------------------------------------
+RESULTS_REQUIRED_COLUMNS = {"model", "dataset", "estimator", "ue_metric", "value"}
+TIMINGS_REQUIRED_COLUMNS = {
+    "model", "dataset", "estimator", "paper_label", "seconds",
+    "seconds_marginal_per_instance", "seconds_full_per_instance",
+    "needs_sampling", "needs_nli", "peak_memory_gb",
+}
+
+
+def load_checkpoint_csv(path, required_columns, label):
+    """Ricarica un checkpoint solo se ha lo schema che il resto della pipeline
+    si aspetta. Uno schema incompleto significa "prodotto da una versione
+    precedente del codice": in quel caso il file viene ignorato (meglio
+    rieseguire che mescolare due versioni in una figura sola)."""
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        print(f"!!! {label} presente ma illeggibile ({e}) -- ignorato, si riparte da zero.")
+        return None
+    missing = required_columns - set(df.columns)
+    if missing:
+        print(f"!!! {label} e' stato prodotto da una versione PRECEDENTE del codice "
+              f"(colonne mancanti: {sorted(missing)}). Lo ignoro e riparto da zero su "
+              f"questa parte: riprendere da li' mescolerebbe risultati di due versioni "
+              f"diverse nelle stesse figure. Sposta o cancella la vecchia results_dir "
+              f"per non rivedere questo avviso.")
+        return None
+    return df
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Selective QA UQ benchmark (lm-polygraph) -- replica Sezione 5.1 Vashurin et al."
@@ -1327,6 +1420,12 @@ def main():
     # qualunque conflitto di permessi sulla cache condivisa.
     parser.add_argument("--datasets_cache_dir", type=str,
                          default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
+    parser.add_argument("--no_resume", action="store_true",
+                         help="Ignora i checkpoint presenti in --results_dir e riesegue TUTTE le "
+                              "combinazioni modello x dataset. Da usare ogni volta che il codice e' "
+                              "cambiato dall'ultimo run: senza questo, i modelli gia' presenti in "
+                              "results_final.csv vengono saltati e le figure finiscono per mescolare "
+                              "risultati vecchi e nuovi (vedi il commento sopra load_checkpoint_csv).")
     parser.add_argument("--n_bootstrap", type=int, default=1000,
                          help="Numero di ricampionamenti bootstrap per gli intervalli di confidenza "
                               "sul PRR. Non costa GPU (ricampiona valori gia' calcolati), ma su molti "
@@ -1405,26 +1504,30 @@ def main():
     results_df_existing = None
     already_done_pairs = set()
 
-    if os.path.exists(final_path):
-        try:
-            results_df_existing = pd.read_csv(final_path)
-            already_done_pairs = set(zip(results_df_existing["dataset"], results_df_existing["model"]))
-            print("Combinazioni dataset x modello gia' completate:", already_done_pairs)
-        except Exception as e:
-            print(f"results_final.csv presente ma illeggibile ({e}) -- riparto senza skip.")
-            results_df_existing = None
-    else:
-        print("Nessun risultato precedente trovato -- primo avvio, eseguo tutte le combinazioni.")
-
-    all_metrics_dfs = [results_df_existing] if results_df_existing is not None else []
-
     timing_final_path = os.path.join(args.results_dir, "estimator_timings.csv")
     all_timing_dfs = []
-    if os.path.exists(timing_final_path):
-        try:
-            all_timing_dfs = [pd.read_csv(timing_final_path)]
-        except Exception as e:
-            print(f"estimator_timings.csv presente ma illeggibile ({e}) -- riparto senza skip.")
+
+    if args.no_resume:
+        print("--no_resume: ignoro qualunque checkpoint, eseguo tutte le combinazioni da zero.")
+    else:
+        results_df_existing = load_checkpoint_csv(
+            final_path, RESULTS_REQUIRED_COLUMNS, "results_final.csv")
+        if results_df_existing is not None:
+            already_done_pairs = set(zip(results_df_existing["dataset"], results_df_existing["model"]))
+            skipped_models = sorted({m for _, m in already_done_pairs})
+            print(f"ATTENZIONE: riprendo da results_final.csv. I risultati di questi modelli "
+                  f"NON vengono ricalcolati e provengono da un run precedente: {skipped_models}. "
+                  f"Se il codice e' cambiato da allora, rilancia con --no_resume.")
+            print("Combinazioni dataset x modello gia' completate:", already_done_pairs)
+        else:
+            print("Nessun risultato precedente utilizzabile -- eseguo tutte le combinazioni.")
+
+        timing_existing = load_checkpoint_csv(
+            timing_final_path, TIMINGS_REQUIRED_COLUMNS, "estimator_timings.csv")
+        if timing_existing is not None:
+            all_timing_dfs = [timing_existing]
+
+    all_metrics_dfs = [results_df_existing] if results_df_existing is not None else []
 
     # Statistiche a livello di istanza (accuracy, intervalli bootstrap, silent
     # failure rate) e valori grezzi per-istanza. Questi ultimi vengono salvati
@@ -1537,6 +1640,18 @@ def main():
         raw_df = pd.concat([raw_df, pd.DataFrame(alias_rows)], ignore_index=True)
 
     raw_df.to_csv(os.path.join(args.results_dir, "results_paper_mapped.csv"), index=False)
+
+    # Le statistiche per-istanza (accuracy, intervalli bootstrap, silent
+    # failure rate) esistono solo per le combinazioni eseguite IN QUESTO run:
+    # non vengono ricaricate dai checkpoint. Quindi, in una ripresa, accuracy
+    # table e Kendall tau coprono meno modelli delle figure PRR, e le barre
+    # d'errore dei modelli saltati risultano assenti. Meglio dirlo che lasciarlo
+    # scoprire da una figura con meta' delle barre senza intervallo.
+    if already_done_pairs:
+        covered = sorted(stats_all["model"].unique()) if stats_all is not None else []
+        print(f"ATTENZIONE: statistiche per-istanza disponibili solo per {covered} "
+              f"(i modelli ripresi da checkpoint non le hanno). Accuracy table, intervalli "
+              f"di confidenza e Kendall tau saranno limitati a questi modelli.")
 
     # Accuracy di base per modello e dataset: indispensabile per leggere ogni
     # figura PRR (vedi build_accuracy_table per il perche').
