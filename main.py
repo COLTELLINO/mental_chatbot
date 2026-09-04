@@ -80,26 +80,34 @@ CHAT_TEMPLATE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it", "Mistral-7B-it"}
 NO_QUANT_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
 
-# Batch size per modello, sovrascrive --batch_size solo dove serve.
+# Riduzione automatica del batch per i modelli che stanno stretti nei 24GB
+# della 3090.
 #
-# Motivo: i pesi non sono il problema (Mistral-7B in 4-bit ne occupa ~4.1GB su
-# una 3090 da 23.6GB). Il picco arriva durante il campionamento dei K sample
-# richiesti dagli stimatori a diversita' campionaria (SemanticEntropy, DegMat,
-# Eccentricity, ...), dove logit e KV-cache di batch_size*K sequenze stanno in
-# memoria insieme, e cresce con la lunghezza dei prompt. Nella run del
-# 2026-09-01 Mistral con batch_size=4 e' andato OOM su tutti e 4 i dataset
-# principali (23.55GiB usati su 23.57GiB disponibili, il campionamento non
-# riusciva ad allocare nemmeno 28MiB), mentre nella griglia severita' -- prompt
-# piu' corti -- passava di misura con peak=22.34GB. Ridurre il batch del solo
-# 7B abbassa il picco senza rallentare gli altri quattro modelli.
-MODEL_BATCH_SIZE = {"Mistral-7B-it": 1}
+# I pesi da soli non saturano mai la scheda: il picco arriva durante il
+# campionamento dei K sample richiesti dagli stimatori a diversita'
+# campionaria (SemanticEntropy, DegMat, Eccentricity, SAR, ...), dove logit e
+# KV-cache di batch_size*K sequenze stanno in memoria insieme, piu' i tensori
+# del modello NLI che gira sulla STESSA GPU. Quanto spazio resta per tutto
+# questo dipende da quanto ne hanno gia' preso i pesi.
+#
+# La soglia sotto e' tarata sui fallimenti osservati, non derivata da un
+# calcolo -- va rivista se si cambia GPU o si aggiungono modelli:
+#   run 2026-09-01: Mistral-7B 4-bit (~3.5GB di pesi), batch 4 -> OOM su tutti
+#                   e 4 i dataset principali.
+#   run 2026-09-02: Mistral a batch 1 passa; falliscono pero' Gemma3-4B e
+#                   MedGemma-4B in bf16 (~8GB di pesi) e la variante bf16 di
+#                   LFM2-1.2B (~2.4GB), tutte ancora a batch 4.
+#   sempre riusciti a batch 4: LFM2-350M e LFM2-1.2B quantizzati (0.2-0.6GB).
+# Il confine osservato cade quindi tra 0.6GB e 2.4GB di pesi.
+HEAVY_WEIGHTS_GB = 2.0
+BYTES_PER_PARAM = {True: 0.5, False: 2.0}  # nf4 ~4 bit, bf16 = 2 byte
 
-# Batch del modello NLI (DeBERTa-large-mnli) usato da SemanticEntropy/DegMat/
-# Eccentricity per la matrice di similarita' tra i campioni. Gira sulla STESSA
-# GPU del LLM e i suoi tensori si sommano al picco di cui sopra, quindi per i
-# modelli al limite di memoria va ridotto insieme al batch di generazione.
 DEBERTA_BATCH_SIZE_DEFAULT = 10
-MODEL_DEBERTA_BATCH_SIZE = {"Mistral-7B-it": 2}
+DEBERTA_BATCH_SIZE_HEAVY = 2
+
+# Override espliciti, per i casi che la regola sopra non prende. Ha la
+# precedenza su tutto.
+MODEL_BATCH_SIZE = {}
 
 
 def uses_quantization(model_name):
@@ -108,15 +116,29 @@ def uses_quantization(model_name):
     return model_name not in NO_QUANT_MODELS
 
 
-def batch_size_for(model_name, default_batch_size):
-    """Batch di generazione effettivo: il default da riga di comando, salvo
-    override per modelli al limite di memoria (vedi MODEL_BATCH_SIZE)."""
-    return MODEL_BATCH_SIZE.get(model_name, default_batch_size)
+def weights_gb(model_name, quantized):
+    """GB occupati dai soli pesi. Serve a stimare quanta memoria resta per il
+    campionamento, non a essere esatto."""
+    return MODEL_PARAMS_B.get(model_name, 1.0) * BYTES_PER_PARAM[bool(quantized)]
 
 
-def deberta_batch_size_for(model_name):
-    """Batch del modello NLI, ridotto per i modelli al limite di memoria."""
-    return MODEL_DEBERTA_BATCH_SIZE.get(model_name, DEBERTA_BATCH_SIZE_DEFAULT)
+def is_memory_heavy(model_name, quantized):
+    return weights_gb(model_name, quantized) >= HEAVY_WEIGHTS_GB
+
+
+def batch_size_for(model_name, default_batch_size, quantized=True):
+    """Batch di generazione: il default da riga di comando, ridotto a 1 per i
+    modelli i cui pesi non lasciano spazio al campionamento."""
+    if model_name in MODEL_BATCH_SIZE:
+        return MODEL_BATCH_SIZE[model_name]
+    return 1 if is_memory_heavy(model_name, quantized) else default_batch_size
+
+
+def deberta_batch_size_for(model_name, quantized=True):
+    """Batch del modello NLI, ridotto insieme a quello di generazione."""
+    if is_memory_heavy(model_name, quantized):
+        return DEBERTA_BATCH_SIZE_HEAVY
+    return DEBERTA_BATCH_SIZE_DEFAULT
 
 
 def print_banner():
@@ -711,7 +733,7 @@ def compute_instance_level_stats(man, model_name, dataset_name, paper_label_by_s
 
 def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, paper_label_by_str,
                          use_chat_template, estimators_factory=None, content_transform=None,
-                         max_new_tokens_override=None):
+                         max_new_tokens_override=None, quantized=None, weights_model_name=None):
     """Esegue gli stimatori UQ su un singolo modello gia' caricato contro un
     singolo dataset gia' preparato (prompt + reference).
 
@@ -743,12 +765,20 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             prompts = [format_prompt(c, cfg["plain_suffix"]) for c in contents]
         references = [ex["reference"] for ex in examples]
 
-        batch_size = batch_size_for(model_name, args.batch_size)
-        deberta_batch_size = deberta_batch_size_for(model_name)
+        # `model_name` puo' essere un'etichetta di variante ("full precision
+        # (bf16)") invece di un nome in MODELS: in quel caso il conteggio dei
+        # parametri va cercato sotto il nome del modello vero, passato dal
+        # chiamante in weights_model_name.
+        weights_name = weights_model_name or model_name
+        is_quantized = uses_quantization(weights_name) if quantized is None else quantized
+        batch_size = batch_size_for(weights_name, args.batch_size, is_quantized)
+        deberta_batch_size = deberta_batch_size_for(weights_name, is_quantized)
         if batch_size != args.batch_size or deberta_batch_size != DEBERTA_BATCH_SIZE_DEFAULT:
-            print(f"  batch ridotto per {model_name}: generazione={batch_size} "
+            print(f"  batch ridotto per {model_name} "
+                  f"({weights_gb(weights_name, is_quantized):.1f}GB di pesi, "
+                  f"{'4-bit' if is_quantized else 'bf16'}): generazione={batch_size} "
                   f"(default {args.batch_size}), NLI={deberta_batch_size} "
-                  f"(default {DEBERTA_BATCH_SIZE_DEFAULT}) -- vedi MODEL_BATCH_SIZE.")
+                  f"(default {DEBERTA_BATCH_SIZE_DEFAULT}).")
         model_dataset = PolygraphDataset(prompts, references, batch_size=batch_size)
 
         max_new_tokens = max_new_tokens_override or cfg["max_new_tokens"]
@@ -1376,6 +1406,15 @@ TIMINGS_REQUIRED_COLUMNS = {
     "seconds_marginal_per_instance", "seconds_full_per_instance",
     "needs_sampling", "needs_nli", "peak_memory_gb",
 }
+# Le statistiche per-istanza vanno ricaricate insieme ai risultati: senza,
+# una ripresa produce figure PRR complete ma accuracy table, intervalli di
+# confidenza e Kendall tau calcolati sui soli modelli rieseguiti.
+STATS_REQUIRED_COLUMNS = {
+    "model", "dataset", "estimator", "paper_label", "prr",
+    "prr_ci_low", "prr_ci_high", "quality_metric", "mean_quality",
+    "n_instances", "nan_rate", "silent_failure_rate",
+}
+PER_INSTANCE_REQUIRED_COLUMNS = {"model", "dataset", "quality"}
 
 
 def load_checkpoint_csv(path, required_columns, label):
@@ -1536,6 +1575,24 @@ def main():
     all_stats_dfs = []
     all_per_instance_dfs = []
 
+    # Ricaricate insieme ai risultati (vedi STATS_REQUIRED_COLUMNS): sono i
+    # dati da cui derivano accuracy table, barre d'errore e Kendall tau.
+    if not args.no_resume and results_df_existing is not None:
+        stats_existing = load_checkpoint_csv(
+            os.path.join(args.results_dir, "instance_level_stats.csv"),
+            STATS_REQUIRED_COLUMNS, "instance_level_stats.csv")
+        if stats_existing is not None:
+            all_stats_dfs.append(stats_existing)
+        else:
+            print("ATTENZIONE: risultati ripresi da checkpoint ma le statistiche per-istanza "
+                  "non sono ricaricabili. Accuracy table, intervalli di confidenza e Kendall tau "
+                  "copriranno solo i modelli rieseguiti in questo run.")
+        per_inst_existing = load_checkpoint_csv(
+            os.path.join(args.results_dir, "per_instance_scores.csv"),
+            PER_INSTANCE_REQUIRED_COLUMNS, "per_instance_scores.csv")
+        if per_inst_existing is not None:
+            all_per_instance_dfs.append(per_inst_existing)
+
     # Loop esterno sui MODELLI (non sui dataset): caricare un modello da 4B
     # e' l'operazione piu' costosa, quindi lo facciamo una volta sola e gli
     # facciamo girare tutti e 4 i dataset prima di scaricarlo, invece di
@@ -1608,7 +1665,13 @@ def main():
         timing_df = pd.concat(all_timing_dfs, ignore_index=True)
         timing_df.to_csv(timing_final_path, index=False)
 
-    stats_all = pd.concat(all_stats_dfs, ignore_index=True) if all_stats_dfs else None
+    # keep="last": se una combinazione e' stata rieseguita in questo run, il
+    # suo valore nuovo prevale su quello ricaricato dal checkpoint.
+    stats_all = (
+        pd.concat(all_stats_dfs, ignore_index=True).drop_duplicates(
+            subset=["model", "dataset", "estimator"], keep="last")
+        if all_stats_dfs else None
+    )
     if stats_all is not None:
         stats_all.to_csv(os.path.join(args.results_dir, "instance_level_stats.csv"), index=False)
     if all_per_instance_dfs:
@@ -1985,6 +2048,11 @@ def main():
                             model, variant_label, dataset_name, dataset_examples[dataset_name], cfg, args,
                             paper_label_by_str,
                             use_chat_template=(quant_model_name in CHAT_TEMPLATE_MODELS),
+                            # La variante bf16 ha pesi 4 volte piu' grandi di
+                            # quella 4-bit a parita' di modello: il batch va
+                            # deciso sul modello vero e sulla precisione vera,
+                            # non sull'etichetta della serie.
+                            quantized=use_quant, weights_model_name=quant_model_name,
                         )
                         if df is not None:
                             quant_metrics_dfs.append(df)
