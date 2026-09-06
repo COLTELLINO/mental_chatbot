@@ -178,6 +178,7 @@ from dataset_prep import (
     build_verbalized_content,
     format_prompt,
     format_chat_prompt,
+    self_test_mcq_metric,
 )
 
 
@@ -1508,6 +1509,11 @@ def main():
     args = parser.parse_args()
 
     print_banner()
+
+    # Controlli che devono fallire SUBITO se qualcosa non va, invece di
+    # produrre celle vuote dopo ore di GPU.
+    n_casi = self_test_mcq_metric()
+    print(f"Self-test estrazione risposte MCQ: {n_casi} casi, tutti corretti.")
 
     # Sottoinsieme di modelli su cui lavorare. Vale per la pipeline principale
     # e per TUTTE le sezioni extra, cosi' che un rerun mirato non riesegua di

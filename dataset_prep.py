@@ -272,6 +272,40 @@ class MCQAccuracyMetric(GenerationMetric):
         return np.array(scores)
 
 
+def self_test_mcq_metric():
+    """Verifica all'avvio che l'estrazione della lettera funzioni.
+
+    Costa millisecondi e trasforma un errore in questa metrica da "scoperto
+    dopo ore di GPU, con le celle MCQ vuote" in "il job muore subito con un
+    messaggio chiaro". Vale la pena perche' e' il punto in cui il benchmark ha
+    gia' sbagliato una volta: la regex precedente marcava sbagliata qualunque
+    risposta non fosse la lettera nuda, e il sintomo (accuracy 0.01 su un MCQ a
+    quattro opzioni) e' emerso solo guardando la tabella delle accuracy giorni
+    dopo.
+
+    Solleva RuntimeError se un caso non passa.
+    """
+    metric = MCQAccuracyMetric()
+    casi = [
+        ("C", "C", 1.0), (" C ", "C", 1.0), ("C.", "C", 1.0), ("(C)", "C", 1.0),
+        ("**C**", "C", 1.0), ("\n\nC", "C", 1.0), ("C) Aspirina", "C", 1.0),
+        ("La risposta e' C", "C", 1.0), ("Risposta: B", "B", 1.0),
+        ("The answer is B", "B", 1.0), ("D", "A", 0.0), ("Non lo so", "A", 0.0),
+    ]
+    preds = [c[0] for c in casi]
+    refs = [c[1] for c in casi]
+    attesi = np.array([c[2] for c in casi])
+    ottenuti = metric({"greedy_texts": preds}, refs)
+
+    if not np.array_equal(ottenuti, attesi):
+        sbagliati = [f"{preds[i]!r} (gold {refs[i]}): atteso {attesi[i]}, ottenuto {ottenuti[i]}"
+                     for i in range(len(casi)) if ottenuti[i] != attesi[i]]
+        raise RuntimeError(
+            "MCQAccuracyMetric non estrae correttamente la lettera:\n  "
+            + "\n  ".join(sbagliati))
+    return len(casi)
+
+
 # ---------------------------------------------------------------------------
 # SEZIONE 2 -- Griglia 2x2 severita' x formato di risposta.
 #
