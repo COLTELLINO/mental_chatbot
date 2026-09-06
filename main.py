@@ -1468,6 +1468,12 @@ def main():
     # qualunque conflitto di permessi sulla cache condivisa.
     parser.add_argument("--datasets_cache_dir", type=str,
                          default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
+    parser.add_argument("--models", nargs="+", default=None, choices=list(MODELS.keys()),
+                         help="Esegue solo i modelli indicati invece di tutti. Serve per i rerun "
+                              "mirati (un modello fallito, un test su piu' istanze) e per isolare i "
+                              "problemi di memoria: caricato da solo, un modello trova la GPU pulita "
+                              "invece che frammentata dai modelli eseguiti prima di lui. "
+                              "Default: tutti i modelli di MODELS.")
     parser.add_argument("--no_resume", action="store_true",
                          help="Ignora i checkpoint presenti in --results_dir e riesegue TUTTE le "
                               "combinazioni modello x dataset. Da usare ogni volta che il codice e' "
@@ -1502,6 +1508,16 @@ def main():
     args = parser.parse_args()
 
     print_banner()
+
+    # Sottoinsieme di modelli su cui lavorare. Vale per la pipeline principale
+    # e per TUTTE le sezioni extra, cosi' che un rerun mirato non riesegua di
+    # nascosto gli altri modelli in una delle sezioni.
+    selected_models = MODELS if not args.models else {
+        name: MODELS[name] for name in MODELS if name in set(args.models)
+    }
+    if args.models:
+        print(f"--models: eseguo solo {list(selected_models)} "
+              f"(gli altri restano ai valori gia' presenti nei checkpoint).")
 
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token is None and any(m in GATED_MODELS for m in MODELS):
@@ -1606,7 +1622,7 @@ def main():
     # e' l'operazione piu' costosa, quindi lo facciamo una volta sola e gli
     # facciamo girare tutti e 4 i dataset prima di scaricarlo, invece di
     # ricaricarlo per ogni dataset.
-    for model_name, model_id in MODELS.items():
+    for model_name, model_id in selected_models.items():
         pending_datasets = [d for d in dataset_examples if (d, model_name) not in already_done_pairs]
         if not pending_datasets:
             print(f"\n=== Modello: {model_name} -- tutti i dataset gia' completati, salto. ===")
@@ -1892,7 +1908,8 @@ def main():
         try:
             severity_raw, severity_stats = run_dataset_section(
                 "Griglia severita' x formato", SEVERITY_DATASETS, args, hf_token,
-                paper_label_by_str, "results_severity_grid", min_datasets=2,
+                paper_label_by_str, "results_severity_grid", models=selected_models,
+                min_datasets=2,
             )
             if severity_raw is not None:
                 severity_model_order = [m for m in MODELS if m in severity_raw["model"].unique()]
@@ -1956,6 +1973,7 @@ def main():
                 verb_raw, verb_stats = run_dataset_section(
                     f"Metodi verbalized ({style})", DATASETS, args, hf_token,
                     paper_label_by_str, f"results_verbalized_{style}",
+                    models=selected_models,
                     estimators_factory=lambda s=style: build_verbalized_estimators(s),
                     content_transform=lambda c, s=style: build_verbalized_content(c, s),
                     max_new_tokens_override=args.verbalized_max_new_tokens,
