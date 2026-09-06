@@ -81,40 +81,68 @@ def prr_fast(ue, quality, max_rejection=0.5):
     return float(np.mean(means))
 
 
-def check_equivalence(n_checks=25, seed=SEED):
-    """Verifica prr_fast contro l'implementazione di main.py su dati casuali.
+def reference_prr(ue, quality, max_rejection=0.5):
+    """Implementazione di riferimento, riga per riga come
+    lm_polygraph.ue_metrics.PredictionRejectionArea piu' il preprocessing di
+    main._prr_from_arrays. Lenta e volutamente letterale: serve solo come
+    termine di paragone per prr_fast.
 
-    Se main.py non e' importabile (fuori dal container, senza lm-polygraph) il
-    controllo viene saltato con un avviso esplicito invece di far finta di
-    averlo fatto.
+    E' riprodotta qui invece di importare main.py perche' quell'import
+    trascina torch, torchao e lm-polygraph, che senza driver NVIDIA vanno in
+    segmentation fault (visto: exit 139) -- e un segfault non e' catturabile
+    con try/except, quindi non basterebbe un fallback. Questo script fa analisi
+    su CSV e non ha alcun bisogno della GPU: tenerlo indipendente da quella
+    catena di import lo rende eseguibile ovunque ci siano numpy e pandas.
     """
-    try:
-        import main as reference_module
-        from lm_polygraph.ue_metrics import PredictionRejectionArea
-    except Exception as e:
-        print(f"ATTENZIONE: main.py non importabile ({type(e).__name__}), "
-              f"equivalenza di prr_fast NON verificata in questa esecuzione.")
-        return None
+    ue = np.nan_to_num(np.asarray(ue, dtype=float), nan=-1e7, neginf=-1e7, posinf=1e7)
+    quality = np.asarray(quality, dtype=float)
+    keep = ~np.isnan(quality)
+    ue, target = ue[keep], quality[keep]
+    if len(target) == 0:
+        return np.nan
+    if np.nanmax(target) == np.nanmin(target):
+        return np.nan
+    target = (target - target.min()) / (target.max() - target.min())
+    sorted_target = target[np.argsort(ue)]
+    n = len(target)
+    n_max = int(n * max_rejection)
+    scores = [(sorted_target[: n - k] if k > 0 else sorted_target).mean()
+              for k in range(n_max + 1)]
+    return float(np.mean(scores))
 
+
+def check_equivalence(n_checks=200, seed=SEED):
+    """Verifica prr_fast contro reference_prr su dati casuali, inclusi i casi
+    scomodi: pareggi nei punteggi (frequenti, perche' tutti i NaN diventano
+    -1e7 e finiscono appaiati), qualita' con NaN, accuracy vicine agli estremi.
+
+    Non e' cerimoniale: la prima versione di prr_fast usava argsort stabile e
+    divergeva fino a 8e-3 proprio sui pareggi, abbastanza da riordinare una
+    classifica. Se questo controllo non passa, i risultati non vanno usati.
+    """
     rng = np.random.default_rng(seed)
-    metric = PredictionRejectionArea(max_rejection=0.5)
     worst = 0.0
-    for _ in range(n_checks):
-        n = int(rng.integers(30, 200))
-        quality = (rng.random(n) < rng.uniform(0.2, 0.8)).astype(float)
+    for t in range(n_checks):
+        n = int(rng.integers(20, 250))
+        quality = (rng.random(n) < rng.uniform(0.05, 0.95)).astype(float)
         ue = rng.normal(0, 1, n)
-        if rng.random() < 0.3:
+        if t % 4 == 0:
+            ue[rng.integers(0, n, size=max(1, n // 10))] = np.nan
+        if t % 5 == 0:
             quality[rng.integers(0, n, size=3)] = np.nan
-        mine = prr_fast(ue, quality)
-        theirs = reference_module._prr_from_arrays(metric, ue, quality)
+        if t % 7 == 0:
+            ue = np.round(ue, 1)
+        mine, theirs = prr_fast(ue, quality), reference_prr(ue, quality)
         if np.isnan(mine) and np.isnan(theirs):
             continue
+        if np.isnan(mine) != np.isnan(theirs):
+            raise SystemExit(f"!!! prr_fast e riferimento non concordano sui NaN (caso {t}).")
         worst = max(worst, abs(mine - theirs))
-    print(f"Equivalenza prr_fast vs main._prr_from_arrays: scarto massimo {worst:.2e} "
+    print(f"Equivalenza prr_fast vs riferimento: scarto massimo {worst:.2e} "
           f"su {n_checks} casi casuali.")
     if worst > 1e-9:
-        raise SystemExit("!!! prr_fast NON e' equivalente all'implementazione di "
-                         "riferimento: risultati non affidabili, mi fermo.")
+        raise SystemExit("!!! prr_fast NON e' equivalente al riferimento: "
+                         "risultati non affidabili, mi fermo.")
     return worst
 
 
