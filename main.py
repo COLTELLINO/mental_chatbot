@@ -252,14 +252,23 @@ PAPER_METHODS = [
 
     # --- esclusi: density-based, richiedono dati di training separati ---
     {"paper_label": "Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
-     "reason": "Richiede fit di un modello di densita' su embeddings del train set "
-               "(TrainingStatisticExtractionCalculator + EmbeddingsCalculator, non registrati di default "
-               "in register_default_stat_calculators): forward pass extra per modello, costo di tempo "
-               "cluster e rischio OOM su MedGemma/Gemma3 in bf16 (gia' a 23.5/24GB). Escluso su richiesta esplicita (2026-08-12)."},
+     "reason": "ESCLUSIONE DI DESIGN, non limitazione pratica. I metodi density-based stimano "
+               "l'incertezza come distanza dalla distribuzione degli embeddings del TRAINING SET, "
+               "che va quindi conservata a disposizione al momento dell'inferenza: e' esattamente "
+               "cio' che un deployment on-device non puo' fare, ed e' il vincolo che questo lavoro "
+               "assume. Un metodo che richiede di spedire sul telefono le statistiche del training "
+               "e' fuori scope per costruzione, indipendentemente da quanto sia accurato. "
+               "(Secondariamente: richiederebbe anche TrainingStatisticExtractionCalculator + "
+               "EmbeddingsCalculator, non registrati di default in register_default_stat_calculators, "
+               "con forward pass extra per modello. Escluso su richiesta esplicita, 2026-08-12.)"},
     {"paper_label": "RDE - Decoder", "figure": "A", "factory": None,
-     "reason": "Stesso motivo di Mahalanobis Distance: richiede training data ed embeddings extra. Escluso su richiesta esplicita (2026-08-12)."},
+     "reason": "Stesso motivo di Mahalanobis Distance: e' density-based, quindi richiede di tenere "
+               "a disposizione le statistiche del training set in inferenza -- incompatibile con il "
+               "vincolo on-device che questo lavoro assume. Escluso su richiesta esplicita (2026-08-12)."},
     {"paper_label": "Relative Mahalanobis Distance - Decoder", "figure": "A", "factory": None,
-     "reason": "Stesso motivo di Mahalanobis Distance: richiede training data ed embeddings extra. Escluso su richiesta esplicita (2026-08-12)."},
+     "reason": "Stesso motivo di Mahalanobis Distance: e' density-based, quindi richiede di tenere "
+               "a disposizione le statistiche del training set in inferenza -- incompatibile con il "
+               "vincolo on-device che questo lavoro assume. Escluso su richiesta esplicita (2026-08-12)."},
     {"paper_label": "HUQ-MD - Decoder", "figure": "A", "factory": None,
      "reason": "Non esiste come classe in lm-polygraph (verificato nel sorgente del repo IINemo/lm-polygraph: "
                "nessun file/import con 'HUQ' in src/lm_polygraph/estimators/) -- andrebbe implementato da zero "
