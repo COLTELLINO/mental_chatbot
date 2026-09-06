@@ -187,7 +187,89 @@ class GSM8kAccuracyMetric(GenerationMetric):
 # iniziale (A-D) e scarta qualunque testo dopo. Serve perche' AccuracyMetric
 # confronta stringhe esatte e i modelli aggiungono spesso punteggiatura o
 # spiegazioni dopo la lettera.
-_MCQ_IGNORE_REGEX = r"(?<=[ABCDabcd])[\s\S]*"
+#
+# NON PIU' USATA -- conservata per documentare il difetto che ha invalidato le
+# celle MCQ della run 14978811. Il lookbehind include le minuscole [abcd], e
+# quindi aggancia la prima a/b/c/d che incontra ANCHE dentro una parola: su
+# "La risposta e' C" il match parte dopo la "a" di "La", tutto il resto viene
+# cancellato e il predetto diventa "La", che non coincide con "C". Il risultato
+# e' che ogni modello che non emette la lettera nuda viene marcato sbagliato
+# quasi sempre. Sintomo osservato: MedGemma-4B-it con accuracy 0.01 su un MCQ a
+# quattro opzioni, dove il puro caso darebbe 0.25 -- impossibile per ignoranza,
+# la probabilita' di 1 successo su 100 con p=0.25 e' dell'ordine di 1e-11.
+_MCQ_IGNORE_REGEX_DEPRECATA = r"(?<=[ABCDabcd])[\s\S]*"
+
+
+class MCQAccuracyMetric(GenerationMetric):
+    """Accuracy per multiple-choice con estrazione robusta della lettera.
+
+    Sostituisce AccuracyMetric(output_ignore_regex=...) perche' il confronto
+    per stringa esatta dopo una cancellazione con regex e' fragile: dipende dal
+    fatto che il modello emetta esattamente la lettera e nient'altro, che e'
+    proprio cio' che i modelli instruction-tuned non fanno (premettono
+    "Risposta:", "La lettera corretta e'", asterischi di markdown, a capo).
+
+    Strategia, dalla piu' affidabile alla piu' permissiva:
+      1. lettera isolata come parola a se' ("C", "C)", "(C)", "**C**", " C.")
+         -> e' il caso di gran lunga piu' frequente col prompt attuale, che
+         chiede esplicitamente la sola lettera;
+      2. se non c'e', la prima lettera valida preceduta da un marcatore di
+         risposta ("Risposta: C", "answer is C");
+      3. se non c'e' nemmeno quella, nessuna estrazione -> istanza sbagliata.
+
+    Il caso 3 e' informativo di suo e viene contato: un parse-failure rate alto
+    significa che il modello non rispetta il formato, ed e' un risultato da
+    riportare, non da nascondere dentro un'accuracy bassa (stessa logica del
+    parse-failure rate dei metodi verbalized).
+
+    Range: 0.0 o 1.0 per istanza, quindi la media e' l'accuracy in [0, 1].
+    """
+
+    def __init__(self, valid_letters="ABCD"):
+        super().__init__(["greedy_texts"], "sequence")
+        self.valid_letters = valid_letters.upper()
+        # Lettera isolata: non attaccata ad altre lettere. Consente
+        # punteggiatura e delimitatori attorno.
+        self._standalone = re.compile(
+            rf"(?<![A-Za-z])([{self.valid_letters}])(?![A-Za-z])")
+        # Ripiego: dopo un marcatore esplicito di risposta.
+        self._after_marker = re.compile(
+            rf"(?:risposta|answer|opzione|option)\s*(?:corretta|is|:|e')?\s*"
+            rf"[:\-\)\s]*([{self.valid_letters}])",
+            re.IGNORECASE)
+        self.n_parse_failures = 0
+        self.n_seen = 0
+
+    def __str__(self):
+        # Stesso nome di AccuracyMetric: le chiavi in man.metrics e le colonne
+        # delle tabelle restano invariate rispetto ai run precedenti.
+        return "Accuracy"
+
+    def extract_letter(self, text):
+        """Ritorna la lettera scelta, o None se non estraibile."""
+        if text is None:
+            return None
+        candidate = str(text).strip()
+        match = self._standalone.search(candidate.upper())
+        if match:
+            return match.group(1)
+        match = self._after_marker.search(candidate)
+        if match:
+            return match.group(1).upper()
+        return None
+
+    def __call__(self, stats, target_texts):
+        preds = stats["greedy_texts"]
+        scores = []
+        for pred, ref in zip(preds, target_texts):
+            self.n_seen += 1
+            letter = self.extract_letter(pred)
+            if letter is None:
+                self.n_parse_failures += 1
+                scores.append(0.0)
+                continue
+            scores.append(1.0 if letter == str(ref).strip().upper() else 0.0)
+        return np.array(scores)
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +596,7 @@ DATASETS = {
         "n_test": 100,
         "max_new_tokens": 3,
         "plain_suffix": "\n\nRisposta:",
-        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
+        "generation_metric_factory": lambda: MCQAccuracyMetric(),
     },
     "GSM8k": {
         "loader": prepare_gsm8k,
@@ -538,7 +620,7 @@ SEVERITY_DATASETS = {
         "n_test": 100,
         "max_new_tokens": 3,
         "plain_suffix": "\n\nRisposta:",
-        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
+        "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "alta",
         "answer_format": "MCQ",
         "severity_label": "SEVERITA' ALTA -- un'azione errata puo' causare danno grave o morte",
@@ -548,7 +630,7 @@ SEVERITY_DATASETS = {
         "n_test": 100,
         "max_new_tokens": 3,
         "plain_suffix": "\n\nRisposta:",
-        "generation_metric_factory": lambda: AccuracyMetric(output_ignore_regex=_MCQ_IGNORE_REGEX),
+        "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "bassa",
         "answer_format": "MCQ",
         "severity_label": "SEVERITA' BASSA -- un'azione errata difficilmente causa danno serio",
