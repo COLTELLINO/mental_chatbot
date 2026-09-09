@@ -832,13 +832,20 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
+        # L'istanza della metrica va tenuta: le metriche MCQ contano quante
+        # risposte non sono estraibili, e quel numero distingue "il modello
+        # sbaglia" da "il modello non produce il formato". Senza, un'accuracy
+        # sotto il livello del caso resta ambigua -- e' il caso di MedGemma su
+        # MMLU, fermo a 0.06 anche dopo la correzione del parser.
+        generation_metric = cfg["generation_metric_factory"]()
+
         timing_dict = {}
         stat_timing_dict = {}
         estimators = [TimedEstimator(e, timing_dict) for e in base_estimators]
         phase_needs = {str(e): estimator_phase_needs(e) for e in base_estimators}
         man = build_manager(
             model, model_dataset, estimators, args.cache_dir, args.max_rejection,
-            max_new_tokens, cfg["generation_metric_factory"](),
+            max_new_tokens, generation_metric,
             stat_timing_dict=stat_timing_dict,
             deberta_batch_size=deberta_batch_size,
         )
@@ -850,11 +857,22 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             man, model_name, dataset_name, paper_label_by_str,
             args.max_rejection, args.n_bootstrap, SEED,
         )
+        # Parse-failure rate della metrica di qualita', quando la metrica lo
+        # espone (MCQAccuracyMetric). Va accanto all'accuracy, non nascosto
+        # dentro di essa.
+        n_parse_failures = getattr(generation_metric, "n_parse_failures", None)
+        n_seen = getattr(generation_metric, "n_seen", 0) or 0
+        answer_parse_failure_rate = (n_parse_failures / n_seen) if (n_parse_failures is not None and n_seen) else np.nan
         if stats_df is not None and not stats_df.empty:
+            stats_df["answer_parse_failure_rate"] = answer_parse_failure_rate
             acc = stats_df["mean_quality"].iloc[0]
             qname = stats_df["quality_metric"].iloc[0]
-            print(f"{model_name}/{dataset_name}: {qname} medio = {acc:.3f} "
-                  f"su {stats_df['n_instances'].iloc[0]} istanze.")
+            messaggio = (f"{model_name}/{dataset_name}: {qname} medio = {acc:.3f} "
+                         f"su {stats_df['n_instances'].iloc[0]} istanze.")
+            if np.isfinite(answer_parse_failure_rate):
+                messaggio += (f" Risposte non estraibili: "
+                              f"{answer_parse_failure_rate:.1%} ({n_parse_failures}/{n_seen}).")
+            print(messaggio)
 
         df = extract_prr_table(man, model_name)
         df["dataset"] = dataset_name
