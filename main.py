@@ -456,7 +456,37 @@ class TimedUEManager(UEManager):
         return batch_stats
 
 
-def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation="eager", use_quantization=True):
+# Implementazione dell'attenzione, per modello.
+#
+# Fino al 2026-09-09 era "eager" per TUTTI, ed era un errore costoso: eager
+# calcola l'attenzione materializzando la matrice completa, che cresce col
+# QUADRATO della lunghezza del contesto, mentre SDPA usa kernel fusi che non la
+# materializzano mai. Serve solo agli stimatori che leggono le mappe di
+# attenzione (RAUQ, AttentionScore), che non sono nella nostra lista: infatti
+# passiamo output_attentions=False. Era quindi costo puro, in tempo e in
+# memoria, senza alcun beneficio -- e il sospetto e' che sia la causa
+# principale sia delle run da 30 ore sia degli OOM su CoQA, il dataset con i
+# contesti piu' lunghi.
+#
+# Eccezione per la famiglia Gemma: le sue varianti usano il soft-capping dei
+# logit di attenzione, che le implementazioni fuse non applicano correttamente
+# in tutte le versioni di transformers, e la guida di HuggingFace raccomanda
+# eager per quei modelli. Preferisco pagare il costo dove la correttezza e' in
+# dubbio piuttosto che ottenere numeri veloci e sbagliati. DA VERIFICARE sulla
+# model card della versione di transformers in uso (4.57.3).
+ATTN_IMPLEMENTATION_DEFAULT = "sdpa"
+MODEL_ATTN_IMPLEMENTATION = {
+    "Gemma3-4B-it": "eager",
+    "MedGemma-4B-it": "eager",
+}
+
+
+def attn_implementation_for(model_name):
+    return MODEL_ATTN_IMPLEMENTATION.get(model_name, ATTN_IMPLEMENTATION_DEFAULT)
+
+
+def load_whitebox_model(model_id, cache_dir, hf_token=None,
+                        attn_implementation=ATTN_IMPLEMENTATION_DEFAULT, use_quantization=True):
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, cache_dir=cache_dir, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -477,6 +507,8 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None, attn_implementation=
     else:
         load_kwargs["torch_dtype"] = torch.bfloat16
 
+    print(f"  caricamento {model_id}: attenzione={attn_implementation}, "
+          f"{'4-bit nf4' if use_quantization else 'bf16'}")
     hf_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     hf_model.eval()
 
@@ -1179,7 +1211,8 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
             continue
         try:
             model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
-                                        use_quantization=uses_quantization(model_name))
+                                        use_quantization=uses_quantization(model_name),
+                                        attn_implementation=attn_implementation_for(model_name))
         except Exception:
             print(f"!!! Caricamento di {model_name} fallito, salto i suoi dataset.")
             traceback.print_exc()
@@ -1641,7 +1674,8 @@ def main():
 
         try:
             model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
-                                         use_quantization=uses_quantization(model_name))
+                                         use_quantization=uses_quantization(model_name),
+                                         attn_implementation=attn_implementation_for(model_name))
             log_gpu_mem(f"{model_name} loaded")
         except Exception:
             print(f"!!! Caricamento di {model_name} fallito, salto tutti i suoi dataset.")
@@ -2064,7 +2098,9 @@ def main():
                     if not pending:
                         continue
                     try:
-                        model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token, use_quantization=use_quant)
+                        model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
+                                                    use_quantization=use_quant,
+                                                    attn_implementation=attn_implementation_for(quant_model_name))
                     except Exception:
                         print(f"!!! Caricamento di {quant_model_name} ({variant_label}) fallito, salto questa variante.")
                         traceback.print_exc()
