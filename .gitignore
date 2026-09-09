@@ -6,3 +6,19 @@ hf_datasets_cache/
 # python3.11). Tenerlo tracciato produce un conflitto binario a ogni run.
 __pycache__/
 *.pyc
+
+# Credenziali: mai nel repository. Una chiave committata resta nella storia
+# anche dopo essere stata cancellata dal file, e va considerata compromessa.
+.env
+*.env
+.uq_env
+secrets*
+*_token*
+*_key.txt
+
+# Risultati: pesano e cambiano a ogni run. Vanno sincronizzati fra i nodi con
+# sync_results.sh, non versionati.
+results/
+results.prev/
+smoke_*/
+*.csv.bak
