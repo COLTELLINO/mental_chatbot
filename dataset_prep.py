@@ -199,6 +199,15 @@ class GSM8kAccuracyMetric(GenerationMetric):
 # la probabilita' di 1 successo su 100 con p=0.25 e' dell'ordine di 1e-11.
 _MCQ_IGNORE_REGEX_DEPRECATA = r"(?<=[ABCDabcd])[\s\S]*"
 
+# Token concessi ai task a scelta multipla. Il prompt chiede la sola lettera,
+# ma i modelli instruction-tuned premettono spesso qualcosa ("La risposta e'",
+# "Risposta:", "**"), e con un budget troppo stretto la lettera non entra
+# proprio nella generazione: nessun estrattore, per quanto robusto, puo'
+# recuperarla. 12 token bastano per il preambolo piu' la lettera restando
+# lontani dal costo dei task a risposta libera. Il parse-failure rate riportato
+# accanto all'accuracy dice se questo valore e' ancora sufficiente.
+MCQ_MAX_NEW_TOKENS = 12
+
 
 class MCQAccuracyMetric(GenerationMetric):
     """Accuracy per multiple-choice con estrazione robusta della lettera.
@@ -239,6 +248,13 @@ class MCQAccuracyMetric(GenerationMetric):
             re.IGNORECASE)
         self.n_parse_failures = 0
         self.n_seen = 0
+        # Campione di generazioni grezze, per poter GUARDARE cosa risponde il
+        # modello invece di dedurlo. Nella run 15293305 abbiamo passato giorni
+        # a ipotizzare perche' MedGemma facesse 0.06 su MMLU: la risposta
+        # (88 generazioni su 100 senza una lettera estraibile) sarebbe stata
+        # evidente in tre righe di testo.
+        self.esempi = []
+        self.max_esempi = 10
 
     def __str__(self):
         # Stesso nome di AccuracyMetric: le chiavi in man.metrics e le colonne
@@ -264,6 +280,12 @@ class MCQAccuracyMetric(GenerationMetric):
         for pred, ref in zip(preds, target_texts):
             self.n_seen += 1
             letter = self.extract_letter(pred)
+            if len(self.esempi) < self.max_esempi:
+                self.esempi.append({
+                    "generazione": str(pred)[:200],
+                    "lettera_estratta": letter if letter is not None else "",
+                    "attesa": str(ref).strip().upper(),
+                })
             if letter is None:
                 self.n_parse_failures += 1
                 scores.append(0.0)
@@ -628,7 +650,14 @@ DATASETS = {
     "MMLU": {
         "loader": prepare_mmlu,
         "n_test": 100,
-        "max_new_tokens": 3,
+        # Era 3, ed era troppo stretto. Con tre token un modello che premette
+        # anche una sola parola ("La", "The", "Risposta:") esaurisce il budget
+        # prima di arrivare alla lettera, e la risposta risulta non estraibile
+        # qualunque sia la robustezza dell'estrattore. Misurato nella run
+        # 15293305: MedGemma 88 risposte non estraibili su 100, Mistral 49,
+        # mentre Gemma3 (2) e LFM2 (0) emettono la lettera subito. Non era
+        # ignoranza dei modelli, era il nostro budget.
+        "max_new_tokens": MCQ_MAX_NEW_TOKENS,
         "plain_suffix": "\n\nRisposta:",
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
     },
@@ -652,7 +681,9 @@ SEVERITY_DATASETS = {
     "MedQAbstain-LT": {
         "loader": prepare_medqabstain_lt,
         "n_test": 100,
-        "max_new_tokens": 3,
+        # Stesso motivo di MMLU: con 3 token la lettera non entra nella
+        # generazione dei modelli che premettono testo. Vedi MCQ_MAX_NEW_TOKENS.
+        "max_new_tokens": MCQ_MAX_NEW_TOKENS,
         "plain_suffix": "\n\nRisposta:",
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "alta",
@@ -662,7 +693,10 @@ SEVERITY_DATASETS = {
     "MedQAbstain-Safe": {
         "loader": prepare_medqabstain_safe,
         "n_test": 100,
-        "max_new_tokens": 3,
+        # Deve restare identico a MedQAbstain-LT: le due celle si confrontano
+        # direttamente per isolare la severita', quindi ogni condizione tranne
+        # la severita' va tenuta uguale.
+        "max_new_tokens": MCQ_MAX_NEW_TOKENS,
         "plain_suffix": "\n\nRisposta:",
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "bassa",

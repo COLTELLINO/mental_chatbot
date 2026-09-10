@@ -874,6 +874,20 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
                               f"{answer_parse_failure_rate:.1%} ({n_parse_failures}/{n_seen}).")
             print(messaggio)
 
+        # Campione di generazioni grezze, accodato a un unico CSV. Non deve mai
+        # far fallire una combinazione: e' materiale diagnostico.
+        try:
+            esempi = getattr(generation_metric, "esempi", None)
+            if esempi:
+                righe = pd.DataFrame(esempi)
+                righe.insert(0, "dataset", dataset_name)
+                righe.insert(0, "model", model_name)
+                campioni_path = os.path.join(args.results_dir, "sample_generations.csv")
+                righe.to_csv(campioni_path, mode="a", index=False,
+                             header=not os.path.exists(campioni_path))
+        except Exception:
+            print("  (salvataggio del campione di generazioni fallito, ignoro)")
+
         df = extract_prr_table(man, model_name)
         df["dataset"] = dataset_name
         n_ok = df["value"].notna().sum() if "value" in df.columns else 0
@@ -1209,7 +1223,15 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
 
     metrics_dfs, stats_dfs, per_inst_dfs = [], [], []
     already_done = set()
-    if os.path.exists(final_path):
+    # --no_resume deve valere QUI come nella pipeline principale. Quando non lo
+    # faceva, un run lanciato con --no_resume ricalcolava i dataset principali e
+    # saltava in silenzio tutte le sezioni extra, che trovavano i propri
+    # checkpoint pieni: il risultato erano figure che mescolavano celle nuove e
+    # vecchie senza alcun avviso (osservato nella run 15293305, dove la griglia
+    # severita' non ha eseguito un solo modello).
+    if getattr(args, "no_resume", False):
+        print(f"--no_resume: {results_basename} ricalcolato da zero.")
+    elif os.path.exists(final_path):
         try:
             existing = pd.read_csv(final_path)
             already_done = set(zip(existing["dataset"], existing["model"]))
@@ -1217,7 +1239,7 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
             print(f"Combinazioni gia' completate in {results_basename}:", already_done)
         except Exception as e:
             print(f"{results_basename}.csv illeggibile ({e}) -- riparto senza skip.")
-    if os.path.exists(stats_path):
+    if not getattr(args, "no_resume", False) and os.path.exists(stats_path):
         try:
             stats_dfs.append(pd.read_csv(stats_path))
         except Exception as e:
@@ -2101,7 +2123,11 @@ def main():
                 quant_metrics_dfs = []
                 quant_stats_dfs = []
                 quant_already_done = set()
-                if os.path.exists(quant_final_path):
+                # Anche qui --no_resume deve valere: vedi il commento in
+                # run_dataset_section.
+                if args.no_resume:
+                    print("--no_resume: confronto quantizzazione ricalcolato da zero.")
+                elif os.path.exists(quant_final_path):
                     try:
                         existing = pd.read_csv(quant_final_path)
                         quant_already_done = set(zip(existing["dataset"], existing["model"]))
