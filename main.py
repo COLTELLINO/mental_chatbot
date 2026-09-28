@@ -1,6 +1,10 @@
 import argparse
+import copy
 import gc
+import math
 import os
+import re
+import shutil
 import sys
 import textwrap
 import time
@@ -24,7 +28,10 @@ from lm_polygraph.utils.processor import Logger
 from lm_polygraph.utils.builder_enviroment_stat_calculator import BuilderEnvironmentStatCalculator
 from lm_polygraph.defaults.register_default_stat_calculators import register_default_stat_calculators
 from lm_polygraph.ue_metrics import PredictionRejectionArea
+from lm_polygraph.ue_metrics.ue_metric import get_random_scores, normalize_metric
 from lm_polygraph.estimators import *
+
+from analysis_lib import silent_failure_rate as _silent_failure_rate
 
 SEED = 3407
 
@@ -180,6 +187,13 @@ from dataset_prep import (
     format_chat_prompt,
     self_test_mcq_metric,
 )
+
+# GSM8k e' escluso dai metodi verbalized: con --verbalized_max_new_tokens=40 il
+# ragionamento non finisce mai prima della riga di confidenza, e nella run del
+# 13/09 il parse-failure rate su GSM8k era 100% per TUTTI i modelli. Non e' un
+# risultato sui modelli ma un limite del budget di token; eseguirlo costava
+# ore di GPU per una cella vuota.
+VERBALIZED_DATASETS = {k: v for k, v in DATASETS.items() if k != "GSM8k"}
 
 
 FIGURE_A_MODELS_NOTE = (
@@ -511,6 +525,15 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None,
           f"{'4-bit nf4' if use_quantization else 'bf16'}")
     hf_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     hf_model.eval()
+    # Quando una sequenza di un batch si ferma prima delle altre (fine turno o
+    # stringa di arresto), generate() riempie le posizioni successive con
+    # pad_token_id. lm-polygraph taglia la generazione solo al primo EOS: se il
+    # riempitivo fosse un token <pad> diverso da EOS, finirebbe dentro il testo
+    # e dentro le log-probabilita' usate dagli stimatori. Con il riempitivo
+    # uguale a EOS il taglio avviene esattamente dove la sequenza e' finita.
+    # (Il padding a sinistra dei prompt usa tokenizer.pad_token e non cambia.)
+    if tokenizer.eos_token_id is not None:
+        hf_model.generation_config.pad_token_id = tokenizer.eos_token_id
 
     model = WhiteboxModel(hf_model, tokenizer, model_path=model_id)
     return model
@@ -524,7 +547,13 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
         language="en",
         hf_cache=cache_dir,
         output_attentions=False,
-        output_hidden_states=True,
+        # Nessuno dei 26 stimatori usa gli hidden state (servirebbero solo ai
+        # metodi density-based, esclusi per design): chiederli a generate()
+        # conservava gli stati di tutti i layer per ogni token, ed era la voce
+        # di memoria che portava i Gemma a ~24 GB di picco su MMLU, al limite
+        # della RTX 3090. Se uno stimatore ne avesse bisogno, UEManager
+        # fallirebbe subito all'avvio per statistica mancante, non in silenzio.
+        output_hidden_states=False,
         blackbox_supports_logprobs=False,
         deberta_batch_size=deberta_batch_size,
     )
@@ -539,7 +568,13 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
         generation_metrics=[generation_metric],
         ue_metrics=[PredictionRejectionArea(max_rejection=max_rejection)],
         processors=[Logger()],
-        ignore_exceptions=True,
+        # Con ignore_exceptions=True lm-polygraph, a un errore su un batch
+        # (tipicamente OOM su un prompt lungo), RIMUOVE lo stimatore coinvolto
+        # per tutto il resto della cella e continua: il metodo sparisce dai
+        # risultati senza che il job fallisca. Meglio fallire in modo visibile:
+        # l'OOM viene gestito da run_model_on_dataset (riprova con batch 1) e
+        # ogni altro errore dall'esecuzione a blocchi (run_cell_chunked).
+        ignore_exceptions=False,
         max_new_tokens=max_new_tokens,
         stat_timing_dict=stat_timing_dict,
     )
@@ -702,22 +737,12 @@ def bootstrap_paired_diff_ci(ue_a, ue_b, quality, max_rejection, n_resamples, se
 
 def silent_failure_rate(ue, quality, quantile=0.10):
     """Frazione delle risposte SBAGLIATE che finisce nel decile piu'
-    confidente del metodo.
-
-    E' la metrica che interessa davvero in ambito clinico: non "quanto bene
-    ordina in media" (il PRR) ma "quanti errori passano completamente
-    inosservati, presentati con la massima sicurezza". Tutti gli stimatori di
-    lm-polygraph restituiscono INCERTEZZA (valore alto = piu' incerto), quindi
-    il decile piu' confidente e' quello con i valori piu' bassi."""
-    keep = ~np.isnan(quality) & ~np.isnan(ue)
-    if keep.sum() == 0:
-        return np.nan
-    u, q = ue[keep], quality[keep]
-    wrong = q < CORRECTNESS_THRESHOLD
-    if wrong.sum() == 0:
-        return np.nan
-    cutoff = np.quantile(u, quantile)
-    return float((wrong & (u <= cutoff)).sum() / wrong.sum())
+    confidente del metodo: quanti errori passano inosservati, presentati con
+    la massima sicurezza. Implementazione in analysis_lib (condivisa con lo
+    script di ricalcolo offline), con gestione corretta dei pareggi."""
+    return _silent_failure_rate(ue, quality,
+                                correctness_threshold=CORRECTNESS_THRESHOLD,
+                                quantile=quantile)
 
 
 def compute_instance_level_stats(man, model_name, dataset_name, paper_label_by_str,
@@ -731,6 +756,15 @@ def compute_instance_level_stats(man, model_name, dataset_name, paper_label_by_s
     disco per poter rifare bootstrap e test appaiati in seguito senza
     rieseguire nulla sulla GPU."""
     quality, quality_name, scores = extract_instance_level(man)
+    return stats_from_arrays(quality, quality_name, scores, model_name, dataset_name,
+                             paper_label_by_str, max_rejection, n_bootstrap, seed)
+
+
+def stats_from_arrays(quality, quality_name, scores, model_name, dataset_name,
+                      paper_label_by_str, max_rejection, n_bootstrap, seed):
+    """Stesse statistiche di compute_instance_level_stats, ma a partire dagli
+    array per-istanza gia' estratti. Serve all'esecuzione a blocchi, che
+    ricalcola tutto sulle istanze di tutti i blocchi riunite."""
     if quality is None or len(quality) == 0:
         return None, None
 
@@ -775,7 +809,8 @@ def compute_instance_level_stats(man, model_name, dataset_name, paper_label_by_s
 
 def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, paper_label_by_str,
                          use_chat_template, estimators_factory=None, content_transform=None,
-                         max_new_tokens_override=None, quantized=None, weights_model_name=None):
+                         max_new_tokens_override=None, quantized=None, weights_model_name=None,
+                         stop_strings_key="stop_strings"):
     """Esegue gli stimatori UQ su un singolo modello gia' caricato contro un
     singolo dataset gia' preparato (prompt + reference).
 
@@ -821,35 +856,70 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
                   f"{'4-bit' if is_quantized else 'bf16'}): generazione={batch_size} "
                   f"(default {args.batch_size}), NLI={deberta_batch_size} "
                   f"(default {DEBERTA_BATCH_SIZE_DEFAULT}).")
-        model_dataset = PolygraphDataset(prompts, references, batch_size=batch_size)
-
         max_new_tokens = max_new_tokens_override or cfg["max_new_tokens"]
-        base_estimators = estimators_factory() if estimators_factory else build_estimators()
 
-        # Memoria di picco misurata per singola combinazione: su un telefono il
-        # vincolo stringente e' spesso la RAM prima del tempo, quindi entra
-        # nella tabella dei costi insieme ai tempi.
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+        # Stringhe di arresto della generazione per questo dataset (vedi il
+        # commento su STOP_FIRST_NEWLINE in dataset_prep.py). Valgono per la
+        # generazione greedy e per i campioni, come nel protocollo ufficiale.
+        stop_strings = cfg.get(stop_strings_key)
+        model.generation_parameters.stop_strings = list(stop_strings) if stop_strings else None
+        print(f"  stringhe di arresto ({stop_strings_key}): {stop_strings!r}")
 
-        # L'istanza della metrica va tenuta: le metriche MCQ contano quante
-        # risposte non sono estraibili, e quel numero distingue "il modello
-        # sbaglia" da "il modello non produce il formato". Senza, un'accuracy
-        # sotto il livello del caso resta ambigua -- e' il caso di MedGemma su
-        # MMLU, fermo a 0.06 anche dopo la correzione del parser.
-        generation_metric = cfg["generation_metric_factory"]()
+        # Un OOM non deve far perdere la cella: si riprova una volta con batch
+        # di generazione e di NLI a 1, che e' la configurazione di memoria
+        # minima. Se fallisce anche cosi', l'errore risale e lo gestisce
+        # l'esecuzione a blocchi.
+        attempts = [(batch_size, deberta_batch_size)]
+        if (batch_size, deberta_batch_size) != (1, 1):
+            attempts.append((1, 1))
+        for attempt_idx, (gen_bs, nli_bs) in enumerate(attempts):
+            model_dataset = PolygraphDataset(prompts, references, batch_size=gen_bs)
+            base_estimators = estimators_factory() if estimators_factory else build_estimators()
 
-        timing_dict = {}
-        stat_timing_dict = {}
-        estimators = [TimedEstimator(e, timing_dict) for e in base_estimators]
-        phase_needs = {str(e): estimator_phase_needs(e) for e in base_estimators}
-        man = build_manager(
-            model, model_dataset, estimators, args.cache_dir, args.max_rejection,
-            max_new_tokens, generation_metric,
-            stat_timing_dict=stat_timing_dict,
-            deberta_batch_size=deberta_batch_size,
-        )
-        man()
+            # Memoria di picco misurata per singola combinazione: su un telefono il
+            # vincolo stringente e' spesso la RAM prima del tempo, quindi entra
+            # nella tabella dei costi insieme ai tempi.
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
+            # L'istanza della metrica va tenuta: le metriche MCQ contano quante
+            # risposte non sono estraibili, e quel numero distingue "il modello
+            # sbaglia" da "il modello non produce il formato".
+            generation_metric = cfg["generation_metric_factory"]()
+
+            timing_dict = {}
+            stat_timing_dict = {}
+            estimators = [TimedEstimator(e, timing_dict) for e in base_estimators]
+            phase_needs = {str(e): estimator_phase_needs(e) for e in base_estimators}
+            man = build_manager(
+                model, model_dataset, estimators, args.cache_dir, args.max_rejection,
+                max_new_tokens, generation_metric,
+                stat_timing_dict=stat_timing_dict,
+                deberta_batch_size=nli_bs,
+            )
+            try:
+                man()
+                break
+            except torch.cuda.OutOfMemoryError:
+                if attempt_idx == len(attempts) - 1:
+                    raise
+                print(f"  OOM su {model_name}/{dataset_name} con batch generazione={gen_bs}, "
+                      f"NLI={nli_bs}: riprovo con batch 1/1.")
+                del man
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # Diagnostica: generazioni vuote. Con le stringhe di arresto un modello
+        # che iniziasse la risposta andando a capo produrrebbe una risposta
+        # vuota; va visto subito, non scoperto nelle figure.
+        try:
+            greedy_texts = man.stats.get("greedy_texts", [])
+            n_empty = sum(1 for t in greedy_texts if not str(t).strip())
+            if greedy_texts and n_empty / len(greedy_texts) > 0.05:
+                print(f"  ATTENZIONE {model_name}/{dataset_name}: {n_empty}/{len(greedy_texts)} "
+                      f"generazioni vuote.")
+        except Exception:
+            pass
         log_gpu_mem(f"{model_name}/{dataset_name} done")
         peak_mem_gb = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else np.nan
 
@@ -944,6 +1014,221 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
         torch.cuda.empty_cache()
         print(f"Tempo {model_name}/{dataset_name}: {time.time() - ds_start:.1f}s")
     return df, timing_df, stats_df, per_instance_df
+
+
+# ---------------------------------------------------------------------------
+# Esecuzione a blocchi con checkpoint.
+#
+# Con centinaia di istanze per dataset una singola cella modello x dataset puo'
+# durare molte ore (Gemma su GSM8k: ~3 minuti per istanza). Il checkpoint della
+# pipeline esiste solo a cella completata, quindi un job interrotto (limite di
+# tempo SLURM, nodo perso, OOM) ripartiva da zero su quella cella, e una cella
+# piu' lunga del limite di tempo non sarebbe mai finita.
+#
+# Qui ogni cella viene eseguita a blocchi di --chunk_size istanze, ciascuno
+# con la STESSA funzione run_model_on_dataset di sempre, e ogni blocco
+# completato viene salvato su disco. Alla fine i blocchi vengono riuniti e PRR,
+# intervalli bootstrap e silent failure rate vengono ricalcolati sulle istanze
+# di tutti i blocchi insieme: il PRR ricalcolato dagli array per-istanza
+# coincide esattamente con quello di UEManager (verificato sulle 520 celle
+# della run del 13/09, differenza massima 0.0), quindi il risultato e' identico
+# a quello di un'unica esecuzione sull'intera cella.
+#
+# Se un blocco fallisce anche dopo il tentativo con batch 1 (vedi
+# run_model_on_dataset), le sue istanze vengono rieseguite una alla volta e
+# quelle che falliscono ancora vengono saltate e registrate. Oltre una soglia
+# di istanze saltate la cella viene abbandonata in modo esplicito: un errore
+# sistematico (un bug) non deve diventare una cella con meta' dati.
+# ---------------------------------------------------------------------------
+
+def _safe_name(x):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(x))
+
+
+def _part_from_result(result, n_instances):
+    prr_df, timing_df, stats_df, per_inst_df = result
+    if prr_df is None or stats_df is None or per_inst_df is None:
+        return None
+    rate = (stats_df["answer_parse_failure_rate"].iloc[0]
+            if "answer_parse_failure_rate" in stats_df.columns else np.nan)
+    meta = pd.DataFrame([{
+        "n_instances": n_instances,
+        "parse_failure_sum": rate * n_instances if np.isfinite(rate) else np.nan,
+        "quality_metric": stats_df["quality_metric"].iloc[0],
+    }])
+    timing_df = timing_df if timing_df is not None else pd.DataFrame()
+    return {"prr": prr_df, "timing": timing_df, "per_instance": per_inst_df, "meta": meta}
+
+
+def _concat_parts(parts):
+    return {
+        "prr": parts[0]["prr"],
+        "timing": pd.concat([p["timing"] for p in parts], ignore_index=True),
+        "per_instance": pd.concat([p["per_instance"] for p in parts], ignore_index=True),
+        "meta": pd.concat([p["meta"] for p in parts], ignore_index=True),
+    }
+
+
+def _merge_timing(timing_all, model_name, dataset_name):
+    if timing_all is None or timing_all.empty:
+        return None
+    agg = timing_all.groupby("estimator", as_index=False, sort=False).agg(
+        paper_label=("paper_label", "first"),
+        seconds=("seconds", "sum"),
+        seconds_full_standalone=("seconds_full_standalone", "sum"),
+        needs_sampling=("needs_sampling", "first"),
+        needs_nli=("needs_nli", "first"),
+        peak_memory_gb=("peak_memory_gb", "max"),
+        n_instances=("n_instances", "sum"),
+    )
+    n = agg["n_instances"].clip(lower=1)
+    agg["seconds_marginal_per_instance"] = agg["seconds"] / n
+    agg["seconds_full_per_instance"] = agg["seconds_full_standalone"] / n
+    agg.insert(0, "dataset", dataset_name)
+    agg.insert(0, "model", model_name)
+    cols = ["model", "dataset", "estimator", "paper_label", "seconds",
+            "seconds_marginal_per_instance", "seconds_full_standalone",
+            "seconds_full_per_instance", "needs_sampling", "needs_nli",
+            "peak_memory_gb", "n_instances"]
+    return agg[cols]
+
+
+def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg, args,
+                     paper_label_by_str, **kwargs):
+    """Come run_model_on_dataset (stessi argomenti e stesso valore di ritorno),
+    ma a blocchi con checkpoint. Vedi il commento sopra."""
+    chunk_size = int(getattr(args, "chunk_size", 0) or 0)
+    n = len(examples)
+    if chunk_size <= 0 or n <= chunk_size:
+        return run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args,
+                                    paper_label_by_str, **kwargs)
+
+    chunk_dir = os.path.join(args.results_dir, "chunks", _safe_name(section_tag),
+                             f"{_safe_name(model_name)}__{_safe_name(dataset_name)}__n{n}_c{chunk_size}")
+    if getattr(args, "no_resume", False) and os.path.isdir(chunk_dir):
+        shutil.rmtree(chunk_dir)
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    # Il bootstrap dei singoli blocchi non serve (viene rifatto sull'insieme):
+    # se ne fa uno minimo per non sprecare tempo.
+    chunk_args = copy.copy(args)
+    chunk_args.n_bootstrap = min(int(args.n_bootstrap), 20)
+
+    n_chunks = math.ceil(n / chunk_size)
+    max_skipped = max(5, int(0.02 * n))
+    parts = []
+    skipped_total = 0
+    print(f"\n=== {model_name}/{dataset_name}: {n} istanze in {n_chunks} blocchi da {chunk_size} ===")
+    for ci in range(n_chunks):
+        lo, hi = ci * chunk_size, min(n, (ci + 1) * chunk_size)
+        paths = {k: os.path.join(chunk_dir, f"chunk{ci:04d}_{k}.csv")
+                 for k in ("prr", "timing", "per_instance", "meta")}
+        skipped_path = os.path.join(chunk_dir, f"chunk{ci:04d}_skipped.csv")
+        if all(os.path.exists(pth) for pth in paths.values()):
+            try:
+                part = {k: pd.read_csv(pth) for k, pth in paths.items()}
+                parts.append(part)
+                if os.path.exists(skipped_path):
+                    skipped_total += len(pd.read_csv(skipped_path))
+                print(f"  blocco {ci + 1}/{n_chunks} ripreso da checkpoint.")
+                continue
+            except Exception as e:
+                print(f"  blocco {ci + 1}/{n_chunks}: checkpoint illeggibile ({e}), lo ricalcolo.")
+
+        print(f"  blocco {ci + 1}/{n_chunks} (istanze {lo}-{hi - 1})")
+        part = _part_from_result(
+            run_model_on_dataset(model, model_name, dataset_name, examples[lo:hi], cfg,
+                                 chunk_args, paper_label_by_str, **kwargs),
+            hi - lo)
+        skipped_here = []
+        if part is None:
+            print(f"!!! blocco {ci + 1}/{n_chunks} di {model_name}/{dataset_name} fallito: "
+                  f"lo rieseguo un'istanza alla volta.")
+            sub_parts = []
+            for k in range(lo, hi):
+                sub = _part_from_result(
+                    run_model_on_dataset(model, model_name, dataset_name, examples[k:k + 1],
+                                         cfg, chunk_args, paper_label_by_str, **kwargs),
+                    1)
+                if sub is None:
+                    skipped_here.append(k)
+                    print(f"!!! istanza {k} di {model_name}/{dataset_name} fallita anche da sola: saltata.")
+                    if skipped_total + len(skipped_here) > max_skipped:
+                        print(f"!!! {model_name}/{dataset_name}: piu' di {max_skipped} istanze fallite. "
+                              f"Non e' un problema di singole istanze ma sistematico: "
+                              f"abbandono la cella (i blocchi completati restano su disco).")
+                        return None, None, None, None
+                    continue
+                sub_parts.append(sub)
+            if not sub_parts:
+                print(f"!!! blocco {ci + 1}/{n_chunks}: nessuna istanza riuscita, abbandono la cella.")
+                return None, None, None, None
+            part = _concat_parts(sub_parts)
+            pd.DataFrame({"instance_index": skipped_here}).to_csv(skipped_path, index=False)
+            skipped_total += len(skipped_here)
+
+        for k, pth in paths.items():
+            part[k].to_csv(pth, index=False)
+        parts.append(part)
+
+    # --- Riunione dei blocchi ---
+    per_inst = pd.concat([p["per_instance"] for p in parts], ignore_index=True)
+    common = set.intersection(*[set(p["per_instance"].columns) for p in parts])
+    est_cols = [c for c in per_inst.columns
+                if c not in ("model", "dataset", "quality") and c in common]
+    dropped = [c for c in per_inst.columns if c not in ("model", "dataset", "quality") and c not in common]
+    if dropped:
+        print(f"ATTENZIONE {model_name}/{dataset_name}: stimatori assenti in qualche blocco, "
+              f"esclusi dalla cella: {dropped}")
+    per_inst = per_inst[["model", "dataset", "quality"] + est_cols]
+    quality = per_inst["quality"].to_numpy(dtype=float)
+    scores = {c: per_inst[c].to_numpy(dtype=float) for c in est_cols}
+    meta = pd.concat([p["meta"] for p in parts], ignore_index=True)
+    quality_name = meta["quality_metric"].iloc[0]
+
+    stats_df, per_instance_df = stats_from_arrays(
+        quality, quality_name, scores, model_name, dataset_name, paper_label_by_str,
+        args.max_rejection, args.n_bootstrap, SEED)
+    if stats_df is None:
+        return None, None, None, None
+    n_done = meta["n_instances"].sum()
+    pf = meta["parse_failure_sum"]
+    stats_df["answer_parse_failure_rate"] = (pf.sum() / n_done) if pf.notna().any() else np.nan
+    stats_df["n_skipped_instances"] = skipped_total
+
+    prr_df_template = parts[0]["prr"].copy()
+    # Stessi valori che UEManager.eval_ue() scriverebbe in man.metrics su
+    # tutta la cella: il PRR e la sua versione normalizzata fra punteggio
+    # casuale e oracolo ("prr_0.5_normalized").
+    ue_metric = PredictionRejectionArea(max_rejection=args.max_rejection)
+    q_valid = quality[~np.isnan(quality)]
+    if len(q_valid) > 0:
+        oracle_score = ue_metric(-q_valid, q_valid)
+        random_score = get_random_scores(ue_metric, q_valid)
+    else:
+        oracle_score = random_score = np.nan
+    prr_by_est = {e: _prr_from_arrays(ue_metric, v, quality) for e, v in scores.items()}
+    values = []
+    for e, um in zip(prr_df_template["estimator"], prr_df_template["ue_metric"]):
+        if e not in prr_by_est:
+            values.append(np.nan)
+        elif um == str(ue_metric):
+            values.append(prr_by_est[e])
+        elif um == str(ue_metric) + "_normalized":
+            values.append(normalize_metric(prr_by_est[e], oracle_score, random_score))
+        else:
+            values.append(np.nan)
+    prr_df = prr_df_template
+    prr_df["model"] = model_name
+    prr_df["dataset"] = dataset_name
+    prr_df["value"] = values
+    timing_df = _merge_timing(pd.concat([p["timing"] for p in parts], ignore_index=True),
+                              model_name, dataset_name)
+
+    acc = stats_df["mean_quality"].iloc[0]
+    print(f"=== {model_name}/{dataset_name} riunita: {len(quality)} istanze, "
+          f"{quality_name} medio = {acc:.3f}, istanze saltate = {skipped_total} ===")
+    return prr_df, timing_df, stats_df, per_instance_df
 
 
 def _pivot_with_ci(df, labels, group_order, value_col="value"):
@@ -1187,7 +1472,7 @@ def plot_pareto_frontier(df, out_path,
 def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_by_str,
                         results_basename, models=None, estimators_factory=None,
                         content_transform=None, max_new_tokens_override=None,
-                        min_datasets=1):
+                        min_datasets=1, stop_strings_key="stop_strings"):
     """Esegue un insieme di dataset su un insieme di modelli, con checkpoint e
     ripresa, e ritorna (raw_df, stats_df) gia' mappati sulle etichette del
     paper.
@@ -1244,6 +1529,16 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
             stats_dfs.append(pd.read_csv(stats_path))
         except Exception as e:
             print(f"{results_basename}_instance_stats.csv illeggibile ({e}).")
+    # Anche i punteggi per-istanza vanno ricaricati in ripresa: prima venivano
+    # scritti solo a fine sezione e solo con le celle di QUESTO job, quindi un
+    # run spezzato in piu' job (es. --models diversi) sovrascriveva le celle
+    # dei job precedenti e rendeva impossibile ricalcolare offline bootstrap,
+    # test appaiati e silent failure rate per quei modelli.
+    if not getattr(args, "no_resume", False) and os.path.exists(per_inst_path):
+        try:
+            per_inst_dfs.append(pd.read_csv(per_inst_path))
+        except Exception as e:
+            print(f"{results_basename}_per_instance.csv illeggibile ({e}).")
 
     for model_name, model_id in models.items():
         pending = [d for d in examples_by_ds if (d, model_name) not in already_done]
@@ -1262,12 +1557,14 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
 
         for dataset_name in pending:
             cfg = datasets_cfg[dataset_name]
-            df, _, stats_df, per_inst_df = run_model_on_dataset(
-                model, model_name, dataset_name, examples_by_ds[dataset_name], cfg, args,
-                paper_label_by_str, use_chat_template=(model_name in CHAT_TEMPLATE_MODELS),
+            df, _, stats_df, per_inst_df = run_cell_chunked(
+                results_basename, model, model_name, dataset_name, examples_by_ds[dataset_name],
+                cfg, args, paper_label_by_str,
+                use_chat_template=(model_name in CHAT_TEMPLATE_MODELS),
                 estimators_factory=estimators_factory,
                 content_transform=content_transform,
                 max_new_tokens_override=max_new_tokens_override,
+                stop_strings_key=stop_strings_key,
             )
             if df is not None:
                 metrics_dfs.append(df)
@@ -1278,6 +1575,7 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
                 pd.concat(stats_dfs, ignore_index=True).to_csv(stats_path, index=False)
             if per_inst_df is not None:
                 per_inst_dfs.append(per_inst_df)
+                pd.concat(per_inst_dfs, ignore_index=True).to_csv(per_inst_path, index=False)
 
         del model
         gc.collect()
@@ -1529,7 +1827,13 @@ def main():
     )
     parser.add_argument("--n_test_samples", type=int, default=None,
                          help="Se specificato, sovrascrive n_test per TUTTI i dataset (utile per smoke test rapidi).")
-    parser.add_argument("--batch_size", type=int, default=4)
+    # Default 1: e' la configurazione del protocollo ufficiale di lm-polygraph
+    # su CoQA/GSM8k, usa la memoria minima e non introduce padding nei batch.
+    # Il tempo in piu' riguarda solo i modelli piccoli, che sono i piu' veloci.
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--chunk_size", type=int, default=100,
+                         help="Istanze per blocco con checkpoint dentro ogni cella modello x dataset "
+                              "(vedi run_cell_chunked). 0 = nessun blocco.")
     parser.add_argument("--max_rejection", type=float, default=0.5)
     parser.add_argument("--results_dir", type=str, default=os.environ.get("RESULTS_DIR", "/workspace/results"))
     parser.add_argument("--cache_dir", type=str, default=os.environ.get("HF_HOME", "/llms"))
@@ -1542,6 +1846,13 @@ def main():
     # qualunque conflitto di permessi sulla cache condivisa.
     parser.add_argument("--datasets_cache_dir", type=str,
                          default=os.environ.get("HF_DATASETS_CACHE", "/workspace/hf_datasets_cache"))
+    parser.add_argument("--datasets", nargs="+", default=None, choices=list(DATASETS.keys()),
+                         help="Esegue solo questi dataset della pipeline principale (e delle sezioni "
+                              "verbalized e quantizzazione, che usano gli stessi). Serve a dividere il "
+                              "lavoro in piu' run nella STESSA --results_dir: le celle gia' calcolate "
+                              "restano nei checkpoint e le figure finali le includono tutte. Es.: prima "
+                              "--datasets CoQA TriviaQA MMLU, poi --datasets GSM8k. La griglia di "
+                              "severita' non e' influenzata. Default: tutti.")
     parser.add_argument("--models", nargs="+", default=None, choices=list(MODELS.keys()),
                          help="Esegue solo i modelli indicati invece di tutti. Serve per i rerun "
                               "mirati (un modello fallito, un test su piu' istanze) e per isolare i "
@@ -1625,6 +1936,9 @@ def main():
     print("\n--- Caricamento dataset (Sezione 5.1: CoQA, TriviaQA, MMLU, GSM8k) ---")
     dataset_examples = {}
     for ds_name, cfg in DATASETS.items():
+        if args.datasets and ds_name not in args.datasets:
+            print(f"--datasets: salto {ds_name} (resta ai valori gia' presenti nei checkpoint).")
+            continue
         n_test = args.n_test_samples if args.n_test_samples is not None else cfg["n_test"]
         print(f"Caricamento {ds_name} (n_test={n_test})...")
         try:
@@ -1726,8 +2040,8 @@ def main():
 
         for dataset_name in pending_datasets:
             cfg = DATASETS[dataset_name]
-            df, timing_df, stats_df, per_inst_df = run_model_on_dataset(
-                model, model_name, dataset_name, dataset_examples[dataset_name], cfg, args,
+            df, timing_df, stats_df, per_inst_df = run_cell_chunked(
+                "main", model, model_name, dataset_name, dataset_examples[dataset_name], cfg, args,
                 paper_label_by_str, use_chat_template=(model_name in CHAT_TEMPLATE_MODELS),
             )
             if df is not None:
@@ -1751,6 +2065,13 @@ def main():
             if all_stats_dfs:
                 pd.concat(all_stats_dfs, ignore_index=True).to_csv(
                     os.path.join(args.results_dir, "instance_level_stats.csv"), index=False
+                )
+            # Checkpoint anche dei punteggi per-istanza: prima erano scritti
+            # solo a fine run, quindi un job interrotto (OOM, limite di tempo
+            # SLURM) perdeva quelli di tutte le celle gia' completate.
+            if all_per_instance_dfs:
+                pd.concat(all_per_instance_dfs, ignore_index=True).to_csv(
+                    os.path.join(args.results_dir, "per_instance_scores.csv"), index=False
                 )
 
         del model
@@ -2047,16 +2368,25 @@ def main():
     # quindi il parse-failure rate (quante volte il modello non produce
     # nemmeno il formato richiesto) e' esso stesso un risultato.
     # -------------------------------------------------------------------
-    if args.run_verbalized:
+    verbalized_datasets = {k: v for k, v in VERBALIZED_DATASETS.items()
+                           if not args.datasets or k in args.datasets}
+    if args.run_verbalized and not verbalized_datasets:
+        print("--run_verbalized: nessun dataset selezionato da --datasets e' previsto per i "
+              "metodi verbalized, salto la sezione.")
+    if args.run_verbalized and verbalized_datasets:
         for style in ("numeric", "linguistic"):
             try:
                 verb_raw, verb_stats = run_dataset_section(
-                    f"Metodi verbalized ({style})", DATASETS, args, hf_token,
+                    f"Metodi verbalized ({style})", verbalized_datasets, args, hf_token,
                     paper_label_by_str, f"results_verbalized_{style}",
                     models=selected_models,
                     estimators_factory=lambda s=style: build_verbalized_estimators(s),
                     content_transform=lambda c, s=style: build_verbalized_content(c, s),
                     max_new_tokens_override=args.verbalized_max_new_tokens,
+                    # La confidenza va scritta su una riga dopo la risposta:
+                    # fermarsi al primo a capo la taglierebbe sempre. Qui ci si
+                    # ferma solo quando il modello inizia un esempio inventato.
+                    stop_strings_key="continuation_stop_strings",
                 )
                 if verb_raw is None:
                     continue
@@ -2088,7 +2418,7 @@ def main():
                 verb_agg = verb_raw.groupby(["model", "paper_label"], as_index=False)["value"].mean()
                 plot_prr_bars(
                     verb_agg, verb_labels, verb_model_order,
-                    f"Mean PRR metodi verbalized ({style}), aggregato su CoQA/TriviaQA/MMLU/GSM8k",
+                    f"Mean PRR metodi verbalized ({style}), aggregato su CoQA/TriviaQA/MMLU",
                     "I metodi verbalized girano con un prompt e un max_new_tokens diversi dalla "
                     "pipeline principale, quindi questi valori NON sono confrontabili con quelli "
                     "delle Figure A/B. Da leggere sempre insieme al parse-failure rate: le istanze "
@@ -2120,8 +2450,11 @@ def main():
             try:
                 model_id = MODELS[quant_model_name]
                 quant_final_path = os.path.join(args.results_dir, "results_quant_comparison.csv")
+                quant_stats_path = os.path.join(args.results_dir, "results_quant_comparison_instance_stats.csv")
+                quant_per_inst_path = os.path.join(args.results_dir, "results_quant_comparison_per_instance.csv")
                 quant_metrics_dfs = []
                 quant_stats_dfs = []
+                quant_per_inst_dfs = []
                 quant_already_done = set()
                 # Anche qui --no_resume deve valere: vedi il commento in
                 # run_dataset_section.
@@ -2135,6 +2468,16 @@ def main():
                         print("Combinazioni quant gia' completate:", quant_already_done)
                     except Exception as e:
                         print(f"results_quant_comparison.csv illeggibile ({e}) -- riparto senza skip.")
+                    # Come in run_dataset_section: in ripresa vanno ricaricate
+                    # anche statistiche e punteggi per-istanza, altrimenti le
+                    # celle dei job precedenti spariscono dai file finali.
+                    for _path, _dfs in ((quant_stats_path, quant_stats_dfs),
+                                        (quant_per_inst_path, quant_per_inst_dfs)):
+                        if os.path.exists(_path):
+                            try:
+                                _dfs.append(pd.read_csv(_path))
+                            except Exception as e:
+                                print(f"{os.path.basename(_path)} illeggibile ({e}).")
 
                 variants = [("quantized (4-bit nf4)", True), ("full precision (bf16)", False)]
                 for variant_label, use_quant in variants:
@@ -2157,9 +2500,9 @@ def main():
                         # due serie da confrontare), ma il chat template va
                         # deciso sul modello VERO: --quant_compare_model puo'
                         # essere anche un instruction-tuned.
-                        df, _, quant_stats_df, _ = run_model_on_dataset(
-                            model, variant_label, dataset_name, dataset_examples[dataset_name], cfg, args,
-                            paper_label_by_str,
+                        df, _, quant_stats_df, quant_per_inst_df = run_cell_chunked(
+                            "quant", model, variant_label, dataset_name, dataset_examples[dataset_name],
+                            cfg, args, paper_label_by_str,
                             use_chat_template=(quant_model_name in CHAT_TEMPLATE_MODELS),
                             # La variante bf16 ha pesi 4 volte piu' grandi di
                             # quella 4-bit a parita' di modello: il batch va
@@ -2173,6 +2516,10 @@ def main():
                             print(f"Checkpoint quant salvato dopo {variant_label}/{dataset_name}.")
                         if quant_stats_df is not None:
                             quant_stats_dfs.append(quant_stats_df)
+                            pd.concat(quant_stats_dfs, ignore_index=True).to_csv(quant_stats_path, index=False)
+                        if quant_per_inst_df is not None:
+                            quant_per_inst_dfs.append(quant_per_inst_df)
+                            pd.concat(quant_per_inst_dfs, ignore_index=True).to_csv(quant_per_inst_path, index=False)
 
                     del model
                     gc.collect()
@@ -2191,10 +2538,7 @@ def main():
                     # e' piu' grande del rumore di campionamento.
                     if quant_stats_dfs:
                         quant_stats_all = pd.concat(quant_stats_dfs, ignore_index=True)
-                        quant_stats_all.to_csv(
-                            os.path.join(args.results_dir, "results_quant_comparison_instance_stats.csv"),
-                            index=False,
-                        )
+                        quant_stats_all.to_csv(quant_stats_path, index=False)
                         quant_raw = quant_raw.merge(
                             quant_stats_all[["model", "dataset", "estimator",
                                              "prr_ci_low", "prr_ci_high", "mean_quality"]],

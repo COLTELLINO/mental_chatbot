@@ -188,3 +188,44 @@ def find_main_py(results_dir):
         return accanto
     vicino = os.path.join(os.path.dirname(os.path.abspath(results_dir)), "main.py")
     return vicino if os.path.exists(vicino) else None
+
+
+def silent_failure_rate(ue, quality, correctness_threshold=0.5, quantile=0.10):
+    """Frazione delle risposte SBAGLIATE che finisce nel decile piu'
+    confidente del metodo (incertezza piu' bassa: tutti gli stimatori di
+    lm-polygraph restituiscono incertezza, valore alto = piu' incerto).
+
+    Il decile e' definito come le k = ceil(quantile * n) istanze piu'
+    confidenti, non come "tutte le istanze con incertezza <= 10mo percentile".
+    La differenza conta quando il metodo assegna lo stesso punteggio a molte
+    istanze (es. metodi basati sui campioni quando i K campioni sono identici):
+    con la soglia sul percentile finivano "nel decile" anche il 90-100% delle
+    istanze, e il silent failure rate saliva artificialmente verso 1.
+
+    I pareggi sul bordo del decile vengono risolti in valore atteso: se servono
+    m posti e ci sono t istanze a pari merito, ciascuna conta m/t. E'
+    equivalente alla media su tutti gli spareggi casuali possibili, quindi il
+    risultato e' deterministico e non dipende da un seed.
+
+    Ritorna NaN se il metodo e' costante su tutte le istanze (non ordina nulla,
+    quindi "il suo decile piu' confidente" non esiste) o se non ci sono errori."""
+    ue = np.asarray(ue, dtype=float)
+    quality = np.asarray(quality, dtype=float)
+    keep = ~np.isnan(quality) & ~np.isnan(ue)
+    if keep.sum() == 0:
+        return np.nan
+    u, q = ue[keep], quality[keep]
+    wrong = q < correctness_threshold
+    if wrong.sum() == 0:
+        return np.nan
+    if np.all(u == u[0]):
+        return np.nan
+    n = len(u)
+    k = int(np.ceil(quantile * n))
+    cutoff = np.sort(u)[k - 1]
+    below = u < cutoff
+    tied = u == cutoff
+    slots = k - below.sum()
+    weight = below.astype(float)
+    weight[tied] = slots / tied.sum()
+    return float((weight * wrong).sum() / wrong.sum())

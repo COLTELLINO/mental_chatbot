@@ -2,7 +2,10 @@
 # stage, after the pinned core stack. If lm-polygraph needs a newer
 # transformers/torch than pinned in requirements.txt, pip will fail loudly
 # here instead of silently swapping versions elsewhere in the image.
-lm-polygraph
+# Versione fissata: e' quella su cui sono state verificate le stringhe di
+# arresto (GenerationParameters.stop_strings) e la gestione degli errori di
+# UEManager. Senza versione, un rebuild installava l'ultima uscita.
+lm-polygraph==0.7.0
 pandas
 matplotlib
 seaborn

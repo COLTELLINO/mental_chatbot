@@ -26,11 +26,15 @@ from lm_polygraph.generation_metrics.generation_metric import GenerationMetric
 # SEZIONE 1 -- I quattro dataset di selective QA della Sezione 5.1 del paper
 # (Vashurin et al., arXiv:2406.15627).
 #
-# Dimensioni ridotte rispetto al paper (che usa 2000 istanze/dataset, 100 per
-# subject su MMLU) per contenere il tempo di calcolo sul cluster: n=100 per
-# CoQA/TriviaQA/MMLU, n=50 per GSM8k (le sue generazioni sono molto piu'
-# lunghe -- ~128 token medi di ragionamento contro i ~4 degli altri tre --
-# quindi pesano di piu' su tutti gli stimatori a campionamento).
+# Dimensioni (il paper usa 2000 istanze/dataset, 100 per subject su MMLU).
+# Le run fino al 13/09 usavano n=100 (n=50 su GSM8k): troppo poche, con
+# intervalli di confidenza del PRR larghi ~0.19 e la maggior parte dei metodi
+# statisticamente indistinguibili. Ora: CoQA tutte le 500, TriviaQA e MMLU
+# 1000, GSM8k 500. GSM8k e' l'unico limitato per il tempo: le sue generazioni
+# sono molto piu' lunghe (~128 token di ragionamento contro i ~4 degli altri)
+# e sui modelli Gemma costano ~3 minuti per istanza con il campionamento.
+# Per alzarlo basta cambiare il suo n_test: l'esecuzione a blocchi con
+# checkpoint (vedi --chunk_size in main.py) rende sicure anche celle lunghe.
 #
 # I prompt 5-shot (TriviaQA/MMLU/GSM8k) sono costruiti in uno stile coerente
 # col resto della pipeline, NON sono una replica byte-per-byte dei template di
@@ -72,15 +76,24 @@ def prepare_coqa(n_test, seed, cache_dir=None):
 def prepare_triviaqa(n_test, seed, cache_dir=None, n_fewshot=5):
     """TriviaQA (mandarjoshi/trivia_qa, config 'rc.nocontext' -- "without
     context" come nel paper). Split train/test hanno 138384/17210 righe,
-    identici ai numeri di Table 2. 5-shot da esempi del train set."""
+    identici ai numeri di Table 2. 5-shot da esempi del train set.
+
+    Le domande di valutazione vengono dallo split 'validation' (17944 righe),
+    NON da 'test': su Hugging Face il test di TriviaQA non ha le risposte
+    pubbliche e il campo answer vale "<unk>" per ogni riga. Le run fino al
+    13/09 usavano 'test', quindi AlignScore era calcolato contro "<unk>" e
+    tutti i risultati TriviaQA di quelle run non sono validi."""
     raw = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", cache_dir=cache_dir)
     fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
     fewshot_block = "\n\n".join(
         f"Domanda: {r['question'].strip()}\nRisposta: {r['answer']['value']}" for r in fewshot
     )
-    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
+    evaluation = raw["validation"]
+    test = evaluation.shuffle(seed=seed).select(range(min(n_test, len(evaluation))))
     examples = []
     for r in test:
+        if not r["answer"]["value"] or r["answer"]["value"] == "<unk>":
+            raise ValueError("TriviaQA: risposta di riferimento mancante -- split sbagliato?")
         content = (
             "Rispondi alla domanda in modo breve e diretto (poche parole), senza spiegazioni.\n\n"
             f"{fewshot_block}\n\nDomanda: {r['question'].strip()}"
@@ -159,6 +172,19 @@ class GSM8kAccuracyMetric(GenerationMetric):
     @staticmethod
     def _extract_number(text):
         cleaned = text.replace(",", "")
+        # Prima scelta: il numero dopo "Risposta finale:", cioe' esattamente
+        # il formato chiesto dal prompt. Serve perche' i modelli senza chat
+        # template, finita la soluzione, continuano a generare un nuovo
+        # "Problema: ..." inventato: prendendo l'ULTIMO numero del testo si
+        # finiva per leggere un numero di quel problema. Le stringhe di arresto
+        # (vedi DATASETS) tagliano gia' la continuazione; questo e' il secondo
+        # livello di difesa.
+        final = re.search(r"Risposta finale:\s*\$?\s*(-?\d+\.?\d*)", cleaned)
+        if final:
+            try:
+                return float(final.group(1))
+            except ValueError:
+                pass
         matches = re.findall(r"-?\d+\.?\d*", cleaned)
         if not matches:
             return None
@@ -207,6 +233,32 @@ _MCQ_IGNORE_REGEX_DEPRECATA = r"(?<=[ABCDabcd])[\s\S]*"
 # lontani dal costo dei task a risposta libera. Il parse-failure rate riportato
 # accanto all'accuracy dice se questo valore e' ancora sufficiente.
 MCQ_MAX_NEW_TOKENS = 12
+
+# Valore di n_test che significa "tutte le istanze disponibili dopo i filtri":
+# i loader fanno gia' min(n_test, len(dataset)).
+ALL_AVAILABLE = 10 ** 9
+
+# Stringhe di arresto della generazione.
+#
+# Fino alle run del 13/09 la generazione non si fermava mai prima di
+# max_new_tokens: i modelli senza chat template (LFM2), e a volte anche
+# Mistral, dopo la risposta continuavano inventando un nuovo esempio
+# ("A\n\nDomanda: ..."). Quella coda finiva nel testo valutato dalla metrica
+# (su GSM8k l'estrattore leggeva un numero del problema inventato) e nei
+# punteggi di incertezza calcolati sui token generati.
+#
+# Il protocollo ufficiale di lm-polygraph (examples/configs/polygraph_eval_*.yaml,
+# lo stesso del paper) ferma la generazione al primo a capo, stop_strings:
+# ["\n"], per CoQA, TriviaQA, MMLU e GSM8k. Lo adottiamo per tutti i task a
+# risposta breve. Due eccezioni, perche' la risposta attesa occupa piu' righe:
+#   - GSM8k: il nostro few-shot ha soluzioni su piu' righe (quello ufficiale
+#     le ha su una riga sola), quindi ci si ferma all'inizio del problema
+#     successivo inventato;
+#   - MedicationQA e MedQuAD: risposte libere lunghe, stesso criterio.
+# `continuation_stop_strings` contiene solo l'arresto sull'esempio inventato:
+# e' quello usato dalla sezione verbalized, dove la confidenza va scritta su
+# una riga successiva alla risposta e fermarsi al primo a capo la taglierebbe.
+STOP_FIRST_NEWLINE = ["\n"]
 
 
 class MCQAccuracyMetric(GenerationMetric):
@@ -434,13 +486,17 @@ def prepare_medqabstain(n_test, seed, cache_dir=None, split="LT", source="medqa_
     raw = load_dataset("disi-unibo-nlp/MedQAbstain", cache_dir=cache_dir)[split]
     raw = raw.filter(lambda ex: ex["modality"] == "text-only")
 
+    # Solo la fonte richiesta, sempre. Prima, se le istanze non bastavano, il
+    # loader passava in silenzio a TUTTE le fonti text-only (5 opzioni,
+    # MedMCQA, AfriMedQA, ...): con n grande la composizione della cella
+    # sarebbe cambiata senza che nessuna figura lo mostrasse. Ora n viene
+    # semplicemente limitato alle istanze disponibili (medqa_4opt: 717 in LT,
+    # 556 in Safe).
     filtered = raw.filter(lambda ex: ex["dataset"] == source)
-    if len(filtered) >= n_test:
-        raw = filtered
-    else:
+    if len(filtered) < n_test and n_test < ALL_AVAILABLE:
         print(f"ATTENZIONE MedQAbstain/{split}: solo {len(filtered)} istanze con "
-              f"dataset=={source} (ne servono {n_test}); uso tutte le fonti text-only "
-              f"({len(raw)} istanze). Il numero di opzioni puo' variare tra istanze.")
+              f"dataset=={source} (richieste {n_test}); uso tutte quelle disponibili.")
+    raw = filtered
 
     raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
     fewshot_block = _build_medqa_fewshot_block()
@@ -635,21 +691,25 @@ def format_chat_prompt(tokenizer, content):
 DATASETS = {
     "CoQA": {
         "loader": prepare_coqa,
-        "n_test": 100,
+        "n_test": ALL_AVAILABLE,
         "max_new_tokens": 30,
         "plain_suffix": "\nR:",
+        "stop_strings": STOP_FIRST_NEWLINE,
+        "continuation_stop_strings": ["\nD:"],
         "generation_metric_factory": lambda: AlignScore(),
     },
     "TriviaQA": {
         "loader": prepare_triviaqa,
-        "n_test": 100,
+        "n_test": 1000,
         "max_new_tokens": 20,
         "plain_suffix": "\nRisposta:",
+        "stop_strings": STOP_FIRST_NEWLINE,
+        "continuation_stop_strings": ["\nDomanda:"],
         "generation_metric_factory": lambda: AlignScore(),
     },
     "MMLU": {
         "loader": prepare_mmlu,
-        "n_test": 100,
+        "n_test": 1000,
         # Era 3, ed era troppo stretto. Con tre token un modello che premette
         # anche una sola parola ("La", "The", "Risposta:") esaurisce il budget
         # prima di arrivare alla lettera, e la risposta risulta non estraibile
@@ -659,16 +719,20 @@ DATASETS = {
         # ignoranza dei modelli, era il nostro budget.
         "max_new_tokens": MCQ_MAX_NEW_TOKENS,
         "plain_suffix": "\n\nRisposta:",
+        "stop_strings": STOP_FIRST_NEWLINE,
+        "continuation_stop_strings": ["\nDomanda:"],
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
     },
     "GSM8k": {
         "loader": prepare_gsm8k,
-        "n_test": 50,
+        "n_test": 500,
         # Target medio 128.6 token (Table 2, tokenizer Mistral 7B v0.2):
         # margine ampio per lasciare spazio al ragionamento completo prima del
         # numero finale.
         "max_new_tokens": 200,
         "plain_suffix": "\nSoluzione:",
+        "stop_strings": ["\nProblema:"],
+        "continuation_stop_strings": ["\nProblema:"],
         "generation_metric_factory": lambda: GSM8kAccuracyMetric(),
     },
 }
@@ -680,11 +744,13 @@ DATASETS = {
 SEVERITY_DATASETS = {
     "MedQAbstain-LT": {
         "loader": prepare_medqabstain_lt,
-        "n_test": 100,
+        "n_test": 556,
         # Stesso motivo di MMLU: con 3 token la lettera non entra nella
         # generazione dei modelli che premettono testo. Vedi MCQ_MAX_NEW_TOKENS.
         "max_new_tokens": MCQ_MAX_NEW_TOKENS,
         "plain_suffix": "\n\nRisposta:",
+        "stop_strings": STOP_FIRST_NEWLINE,
+        "continuation_stop_strings": ["\nDomanda:"],
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "alta",
         "answer_format": "MCQ",
@@ -692,12 +758,14 @@ SEVERITY_DATASETS = {
     },
     "MedQAbstain-Safe": {
         "loader": prepare_medqabstain_safe,
-        "n_test": 100,
+        "n_test": 556,
         # Deve restare identico a MedQAbstain-LT: le due celle si confrontano
         # direttamente per isolare la severita', quindi ogni condizione tranne
         # la severita' va tenuta uguale.
         "max_new_tokens": MCQ_MAX_NEW_TOKENS,
         "plain_suffix": "\n\nRisposta:",
+        "stop_strings": STOP_FIRST_NEWLINE,
+        "continuation_stop_strings": ["\nDomanda:"],
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "bassa",
         "answer_format": "MCQ",
@@ -705,9 +773,11 @@ SEVERITY_DATASETS = {
     },
     "MedicationQA": {
         "loader": prepare_medicationqa,
-        "n_test": 100,
+        "n_test": ALL_AVAILABLE,
         "max_new_tokens": 100,
         "plain_suffix": "\nRisposta:",
+        "stop_strings": ["\nDomanda:"],
+        "continuation_stop_strings": ["\nDomanda:"],
         "generation_metric_factory": lambda: AlignScore(),
         "severity": "alta",
         "answer_format": "libera",
@@ -715,9 +785,11 @@ SEVERITY_DATASETS = {
     },
     "MedQuAD": {
         "loader": prepare_medquad,
-        "n_test": 100,
+        "n_test": 1000,
         "max_new_tokens": 100,
         "plain_suffix": "\nRisposta:",
+        "stop_strings": ["\nDomanda:"],
+        "continuation_stop_strings": ["\nDomanda:"],
         "generation_metric_factory": lambda: AlignScore(),
         "severity": "bassa",
         "answer_format": "libera",

@@ -19,4 +19,9 @@ if [ -z "${HF_TOKEN:-}" ]; then
     echo "caricamento e il run produrra' risultati incompleti." >&2
 fi
 
-sbatch -N 1 --gpus=nvidia_geforce_rtx_3090:1 run_docker.sh
+# Gli argomenti di questo script vengono passati a main.py, es.:
+#   bash sbatch_script.sh --run_severity_grid --run_verbalized --run_quant_comparison
+# Per fissare il nodo (i checkpoint a blocchi stanno sul disco del nodo su cui
+# gira il job, e faretra/moro232 non condividono la home):
+#   SBATCH_NODE=faretra bash sbatch_script.sh ...
+sbatch -N 1 ${SBATCH_NODE:+-w "$SBATCH_NODE"} --gpus=nvidia_geforce_rtx_3090:1 run_docker.sh "$@"
