@@ -54,8 +54,13 @@ fi
 
 echo "== 3. Modelli gia' in cache ($LLM_CACHE)"
 for m in "${MODELS[@]}"; do
-    d="$LLM_CACHE/hub/models--${m//\//--}"
-    [ -d "$d" ] && ok "$m ($(du -sh "$d" 2>/dev/null | cut -f1))" || warn "$m non in cache: verra' scaricato all'avvio"
+    # main.py passa cache_dir=/llms a from_pretrained, che salva in
+    # /llms/models--...; la struttura standard di HF_HOME e' /llms/hub/models--...
+    d=""
+    for c in "$LLM_CACHE/models--${m//\//--}" "$LLM_CACHE/hub/models--${m//\//--}"; do
+        [ -d "$c" ] && d="$c" && break
+    done
+    [ -n "$d" ] && ok "$m ($(du -sh "$d" 2>/dev/null | cut -f1))" || warn "$m non in cache: verra' scaricato all'avvio"
 done
 
 echo "== 4. Immagine Docker"
@@ -65,7 +70,10 @@ if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     REQ_TS=$(git log -1 --format=%ct -- build/)
     [ "$CREATED_TS" -ge "$REQ_TS" ] && ok "immagine costruita dopo l'ultima modifica a build/ ($CREATED)" \
         || ko "immagine piu' vecchia dell'ultima modifica a build/: bash create_docker_image.sh"
-    VERS=$(docker run --rm "$IMAGE" python3.11 -c "import lm_polygraph, transformers, torch; from importlib.metadata import version; print(version('lm-polygraph'), transformers.__version__, torch.__version__)" 2>/dev/null)
+    # Versioni lette dai metadati, SENZA importare le librerie: importare torch
+    # o lm-polygraph in un container avviato senza GPU va in segmentation fault
+    # (vedi analysis_lib.py), e la riga risulterebbe vuota.
+    VERS=$(docker run --rm "$IMAGE" python -c "from importlib.metadata import version as v; print(v('lm-polygraph'), v('transformers'), v('torch'))" 2>/dev/null | tail -1)
     echo "        nell'immagine: lm-polygraph / transformers / torch = $VERS"
     [[ "$VERS" == 0.7.0* ]] && ok "lm-polygraph 0.7.0 nell'immagine" || ko "lm-polygraph nell'immagine non e' 0.7.0: ricostruire l'immagine"
 else
@@ -75,6 +83,9 @@ fi
 echo "== 5. GPU, disco, cluster"
 if command -v nvidia-smi >/dev/null; then
     nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader | sed 's/^/        /'
+    USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | head -1)
+    [ "${USED:-0}" -lt 1000 ] && ok "GPU libera" \
+        || warn "GPU gia' occupata per ${USED} MiB da un altro processo: con meno memoria i modelli da 4B/7B rischiano OOM"
 else warn "nvidia-smi non disponibile su questo nodo"; fi
 for p in "$REPO" "$LLM_CACHE"; do
     AV=$(df -Pk "$p" 2>/dev/null | awk 'NR==2{print int($4/1024/1024)}')
