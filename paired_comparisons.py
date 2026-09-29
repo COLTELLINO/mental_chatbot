@@ -1,218 +1,152 @@
-"""Test appaiati sulle differenze di PRR fra metodi UQ (TODO 5).
+"""Quali metodi UQ sono statisticamente indistinguibili dal migliore, per cella.
 
 Perche' serve. Le barre d'errore nelle figure dicono quanto balla il PRR di UN
 metodo, ma non bastano per scrivere "A batte B": A e B sono valutati sulle
-STESSE domande, quindi i loro punteggi sono correlati (entrambi faticano sulle
-domande difficili) e confrontare due intervalli separati e' troppo
-conservativo. Il modo corretto e' ricampionare le domande e calcolare la
-differenza PRR(A) - PRR(B) sullo stesso campione, mille volte: se l'intervallo
-delle differenze non contiene lo zero, il vantaggio e' reale.
+STESSE domande, quindi i loro punteggi sono correlati, e confrontare due
+intervalli separati e' troppo conservativo. Il modo corretto e' ricampionare le
+domande e ricalcolare i PRR di tutti i metodi sullo stesso campione.
 
-Con ~26 metodi x 5 modelli x 4 dataset la griglia contiene migliaia di
-confronti: per puro caso qualche "vincitore" e' garantito, come lanciare 26
-monete e stupirsi che una faccia otto teste di fila. Senza questo test, ogni
-classifica letta dalle figure e' aneddotica.
+Cosa fa (versione del 29/09). Per ogni cella (modello, dataset):
 
-Cosa fa. Per ogni coppia (modello, dataset) identifica il metodo con PRR piu'
-alto e confronta TUTTI gli altri contro quello. L'output non e' "chi vince" ma
-la domanda utile in tesi: **quali metodi sono statisticamente
-indistinguibili dal migliore**. Se dieci metodi lo sono, la frase da scrivere
-non e' "il metodo X e' il migliore" ma "un gruppo di metodi e' equivalente in
-testa, e fra questi X e' il piu' economico" -- che e' anche il modo in cui
-questo test si aggancia alla frontiera di Pareto del TODO 6.
+1. PRR del paper (normalizzato fra caso e oracolo) con i pareggi in valore
+   atteso, dagli stessi array per-istanza salvati da main.py (vedi
+   analysis_lib.prr_normalized). Prima si usava l'area grezza.
+2. Si ricampionano le domande B volte (default 1000) e su ogni ricampionamento
+   si ricalcolano i PRR di TUTTI i metodi e si guarda CHI E' IL MIGLIORE IN
+   QUEL RICAMPIONAMENTO. Prima il migliore veniva scelto una volta sui dati
+   completi e poi testato sugli stessi dati: chi vinceva "per fortuna"
+   sembrava sistematicamente migliore di quanto fosse (winner's curse).
+3. Un metodo e' dichiarato PEGGIORE del migliore solo se risulta il migliore in
+   meno di alpha/(m-1) dei ricampionamenti (m = metodi confrontati): con 26
+   metodi e alpha = 0.05, meno del 0.2%. E' la correzione di Bonferroni per i
+   m-1 confronti (prima: 25 confronti al 5% ciascuno, nessuna correzione, e
+   qualche differenza "significativa" saltava fuori per caso). Non e' un test
+   d'ipotesi formale ma una regola di selezione conservativa, nello spirito
+   del Model Confidence Set (Hansen, Lunde e Nason, 2011): un metodo resta nel
+   gruppo di testa finche' i dati non lo escludono chiaramente. Nella tesi va
+   descritta cosi'.
+4. Se il PRR non e' calcolabile in almeno meta' dei ricampionamenti, il
+   verdetto e' NON TESTABILE invece di "distinguibile" (prima veniva contato
+   come se fosse peggiore). Succede quando la qualita' e' costante (accuracy 0
+   o 1 nella cella o nella maggior parte dei ricampionamenti), e allora vale
+   per tutti i metodi della cella insieme. Un punteggio costante invece NON e'
+   non testabile: il suo PRR e' 0 (come scartare a caso) e viene confrontato
+   normalmente.
+
+Restano nel CSV, per confronto, la differenza dal migliore sui dati completi e
+il suo intervallo appaiato al 95% (non corretto) e con correzione di
+Bonferroni.
 
 Non tocca la GPU: rilegge i punteggi per-istanza gia' salvati da main.py.
 
-Uso (dentro il container, dove ci sono pandas e lm-polygraph):
+Uso:
     python3.11 paired_comparisons.py /workspace/results
-    python3.11 paired_comparisons.py /workspace/results --n_resamples 200
+    python3.11 paired_comparisons.py /workspace/results --per_instance_file results_severity_grid_per_instance.csv
 """
 import argparse
 import os
 import sys
+import zlib
 
 import numpy as np
 import pandas as pd
 
+import analysis_lib as AL
+
 SEED = 3407
 CORRECTNESS_COLUMN = "quality"
-NON_ESTIMATOR_COLUMNS = {"model", "dataset", CORRECTNESS_COLUMN}
+NON_ESTIMATOR_COLUMNS = {"model", "dataset", "instance_index", CORRECTNESS_COLUMN, "greedy_text"}
 
 
-def prr_fast(ue, quality, max_rejection=0.5):
-    """PRR vettorizzato, equivalente a main._prr_from_arrays.
-
-    La versione in main.py ricalcola la media del sottoinsieme trattenuto per
-    ogni soglia di rifiuto con un ciclo Python: va benissimo una volta sola per
-    cella, ma qui serve dentro un bootstrap appaiato (centinaia di migliaia di
-    valutazioni) e diventa il collo di bottiglia. Le stesse medie cumulate si
-    ottengono in un colpo con np.cumsum, in O(n log n) per il solo
-    ordinamento. L'equivalenza numerica con l'implementazione di riferimento e'
-    verificata da check_equivalence() prima di usare questa funzione.
-
-    Replica anche le due convenzioni di lm-polygraph: le istanze con qualita'
-    NaN vengono scartate, i NaN nel punteggio di incertezza diventano -1e7
-    (cioe' massima confidenza -- vedi il commento in main._prr_from_arrays sul
-    perche' questo penalizza la lettura dei metodi verbalized).
-    """
-    ue = np.nan_to_num(np.asarray(ue, dtype=float), nan=-1e7, neginf=-1e7, posinf=1e7)
-    quality = np.asarray(quality, dtype=float)
-    keep = ~np.isnan(quality)
-    ue, q = ue[keep], quality[keep]
-    n = len(q)
-    if n == 0:
-        return np.nan
-    qmin, qmax = np.min(q), np.max(q)
-    if qmax == qmin:
-        return np.nan  # normalizzazione min-max non definita
-    q = (q - qmin) / (qmax - qmin)
-
-    # np.argsort SENZA kind esplicito: deve essere lo stesso algoritmo del
-    # riferimento in lm-polygraph. Con "stable" i pareggi vengono ordinati
-    # diversamente, e i pareggi qui sono frequenti -- tutti i NaN diventano
-    # -1e7 e finiscono appaiati -- il che produce PRR diversi (misurato: fino a
-    # 8e-3 di scarto, cioe' abbastanza da cambiare una classifica).
-    order = np.argsort(ue)  # incertezza crescente
-    q_sorted = q[order]
-    csum = np.cumsum(q_sorted)
-    n_max = int(n * max_rejection)
-    kept_counts = n - np.arange(n_max + 1)
-    means = csum[kept_counts - 1] / kept_counts
-    return float(np.mean(means))
-
-
-def reference_prr(ue, quality, max_rejection=0.5):
-    """Implementazione di riferimento, riga per riga come
-    lm_polygraph.ue_metrics.PredictionRejectionArea piu' il preprocessing di
-    main._prr_from_arrays. Lenta e volutamente letterale: serve solo come
-    termine di paragone per prr_fast.
-
-    E' riprodotta qui invece di importare main.py perche' quell'import
-    trascina torch, torchao e lm-polygraph, che senza driver NVIDIA vanno in
-    segmentation fault (visto: exit 139) -- e un segfault non e' catturabile
-    con try/except, quindi non basterebbe un fallback. Questo script fa analisi
-    su CSV e non ha alcun bisogno della GPU: tenerlo indipendente da quella
-    catena di import lo rende eseguibile ovunque ci siano numpy e pandas.
-    """
-    ue = np.nan_to_num(np.asarray(ue, dtype=float), nan=-1e7, neginf=-1e7, posinf=1e7)
-    quality = np.asarray(quality, dtype=float)
-    keep = ~np.isnan(quality)
-    ue, target = ue[keep], quality[keep]
-    if len(target) == 0:
-        return np.nan
-    if np.nanmax(target) == np.nanmin(target):
-        return np.nan
-    target = (target - target.min()) / (target.max() - target.min())
-    sorted_target = target[np.argsort(ue)]
-    n = len(target)
-    n_max = int(n * max_rejection)
-    scores = [(sorted_target[: n - k] if k > 0 else sorted_target).mean()
-              for k in range(n_max + 1)]
-    return float(np.mean(scores))
-
-
-def check_equivalence(n_checks=200, seed=SEED):
-    """Verifica prr_fast contro reference_prr su dati casuali, inclusi i casi
-    scomodi: pareggi nei punteggi (frequenti, perche' tutti i NaN diventano
-    -1e7 e finiscono appaiati), qualita' con NaN, accuracy vicine agli estremi.
-
-    Non e' cerimoniale: la prima versione di prr_fast usava argsort stabile e
-    divergeva fino a 8e-3 proprio sui pareggi, abbastanza da riordinare una
-    classifica. Se questo controllo non passa, i risultati non vanno usati.
-    """
-    rng = np.random.default_rng(seed)
-    worst = 0.0
-    for t in range(n_checks):
-        n = int(rng.integers(20, 250))
-        quality = (rng.random(n) < rng.uniform(0.05, 0.95)).astype(float)
-        ue = rng.normal(0, 1, n)
-        if t % 4 == 0:
-            ue[rng.integers(0, n, size=max(1, n // 10))] = np.nan
-        if t % 5 == 0:
-            quality[rng.integers(0, n, size=3)] = np.nan
-        if t % 7 == 0:
-            ue = np.round(ue, 1)
-        mine, theirs = prr_fast(ue, quality), reference_prr(ue, quality)
-        if np.isnan(mine) and np.isnan(theirs):
-            continue
-        if np.isnan(mine) != np.isnan(theirs):
-            raise SystemExit(f"!!! prr_fast e riferimento non concordano sui NaN (caso {t}).")
-        worst = max(worst, abs(mine - theirs))
-    print(f"Equivalenza prr_fast vs riferimento: scarto massimo {worst:.2e} "
-          f"su {n_checks} casi casuali.")
-    if worst > 1e-9:
-        raise SystemExit("!!! prr_fast NON e' equivalente al riferimento: "
-                         "risultati non affidabili, mi fermo.")
+def check_equivalence():
+    """Controlli di sanita' sul PRR prima di usarlo (casuale -> 0, oracolo -> 1,
+    area identica a lm-polygraph senza pareggi, pareggi = media sugli
+    spareggi). Se non passano, i risultati non vanno usati."""
+    worst = AL.check_prr_implementation()
+    print(f"Controlli PRR superati (scarto massimo dall'area di lm-polygraph: {worst:.1e}).")
     return worst
 
 
-def paired_diff_ci(ue_a, ue_b, quality, n_resamples, rng, max_rejection=0.5, alpha=0.05):
-    """Intervallo bootstrap appaiato su PRR(A) - PRR(B).
-
-    Il ricampionamento e' sugli INDICI delle domande e viene applicato a
-    entrambi i metodi insieme: separarli distruggerebbe l'accoppiamento, che e'
-    esattamente cio' che rende il test piu' potente del confronto fra due
-    intervalli separati.
-    """
-    n = len(quality)
-    diffs = np.empty(n_resamples)
-    diffs[:] = np.nan
-    for i in range(n_resamples):
-        idx = rng.integers(0, n, size=n)
-        q = quality[idx]
-        va = prr_fast(ue_a[idx], q, max_rejection)
-        vb = prr_fast(ue_b[idx], q, max_rejection)
-        if np.isfinite(va) and np.isfinite(vb):
-            diffs[i] = va - vb
-    valid = diffs[np.isfinite(diffs)]
-    # Se piu' di meta' dei ricampionamenti e' degenere (tipicamente accuracy
-    # costante nel campione), l'intervallo non e' affidabile: meglio NaN che un
-    # numero falsamente preciso.
-    if len(valid) < n_resamples // 2:
-        return np.nan, np.nan, np.nan
-    return (float(np.mean(valid)),
-            float(np.percentile(valid, 100 * alpha / 2)),
-            float(np.percentile(valid, 100 * (1 - alpha / 2))))
-
-
-def compare_cell(df_cell, n_resamples, rng, max_rejection=0.5):
+def compare_cell(df_cell, n_resamples, rng, max_rejection=0.5, alpha=0.05):
     """Confronta ogni metodo contro il migliore, dentro una cella
     (modello, dataset). Ritorna una lista di righe."""
     quality = df_cell[CORRECTNESS_COLUMN].to_numpy(dtype=float)
     estimator_cols = [c for c in df_cell.columns if c not in NON_ESTIMATOR_COLUMNS]
-
-    scores = {}
-    for col in estimator_cols:
-        ue = df_cell[col].to_numpy(dtype=float)
-        prr = prr_fast(ue, quality, max_rejection)
-        if np.isfinite(prr):
-            scores[col] = (ue, prr)
-    if len(scores) < 2:
+    ue = {c: df_cell[c].to_numpy(dtype=float) for c in estimator_cols}
+    point = {c: AL.prr_normalized(ue[c], quality, max_rejection) for c in estimator_cols}
+    methods = [c for c in estimator_cols if np.isfinite(point[c])]
+    not_testable = [c for c in estimator_cols if c not in methods]
+    if len(methods) < 2:
         return []
 
-    best_name = max(scores, key=lambda k: scores[k][1])
-    best_ue, best_prr = scores[best_name]
+    n = len(quality)
+    boot = np.full((n_resamples, len(methods)), np.nan)
+    for b in range(n_resamples):
+        idx = rng.integers(0, n, size=n)
+        q = quality[idx]
+        for j, m in enumerate(methods):
+            boot[b, j] = AL.prr_normalized(ue[m][idx], q, max_rejection)
+
+    best_name = max(methods, key=lambda m: point[m])
+    jb = methods.index(best_name)
+    m_compared = len(methods) - 1
+    alpha_bonf = alpha / max(m_compared, 1)
+
+    # Migliore dentro ogni ricampionamento (fra i metodi calcolabili li').
+    valid_rows = np.isfinite(boot).any(axis=1)
+    boot_max = np.where(valid_rows, np.nanmax(np.where(np.isfinite(boot), boot, -np.inf), axis=1), np.nan)
 
     rows = []
-    for name, (ue, prr) in scores.items():
-        if name == best_name:
-            continue
-        mean_d, lo, hi = paired_diff_ci(best_ue, ue, quality, n_resamples, rng, max_rejection)
-        # "Indistinguibile dal migliore" = l'intervallo della differenza
-        # contiene lo zero.
-        indistinguishable = bool(np.isfinite(lo) and np.isfinite(hi) and lo <= 0 <= hi)
+    for j, m in enumerate(methods):
+        col = boot[:, j]
+        ok = np.isfinite(col) & valid_rows
+        testable = ok.sum() >= n_resamples / 2
+        p_best = float(np.mean(col[ok] >= boot_max[ok] - 1e-12)) if ok.any() else np.nan
+        both = ok & np.isfinite(boot[:, jb])
+        d = boot[both, jb] - col[both]
+        if both.sum() >= n_resamples / 2 and m != best_name:
+            ci = (float(np.percentile(d, 100 * alpha / 2)), float(np.percentile(d, 100 * (1 - alpha / 2))))
+            ci_b = (float(np.percentile(d, 100 * alpha_bonf / 2)),
+                    float(np.percentile(d, 100 * (1 - alpha_bonf / 2))))
+            mean_d = float(np.mean(d))
+        else:
+            ci = ci_b = (np.nan, np.nan)
+            mean_d = np.nan if m != best_name else 0.0
+        if m == best_name:
+            verdict = "migliore"
+        elif not testable:
+            verdict = "non testabile"
+        elif p_best < alpha_bonf:
+            verdict = "peggiore"
+        else:
+            verdict = "indistinguibile"
         rows.append({
             "model": df_cell["model"].iloc[0],
             "dataset": df_cell["dataset"].iloc[0],
             "best_method": best_name,
-            "best_prr": best_prr,
-            "method": name,
-            "prr": prr,
+            "best_prr": point[best_name],
+            "method": m,
+            "prr": point[m],
+            "p_best": p_best,
+            "alpha_bonferroni": alpha_bonf,
+            "verdict": verdict,
+            "indistinguishable_from_best": verdict in ("indistinguibile", "migliore"),
             "diff_best_minus_method": mean_d,
-            "diff_ci_low": lo,
-            "diff_ci_high": hi,
-            "indistinguishable_from_best": indistinguishable,
-            "n_instances": int(len(quality)),
+            "diff_ci_low": ci[0],
+            "diff_ci_high": ci[1],
+            "diff_ci_low_bonferroni": ci_b[0],
+            "diff_ci_high_bonferroni": ci_b[1],
+            "n_instances": int(n),
+        })
+    for m in not_testable:
+        rows.append({
+            "model": df_cell["model"].iloc[0], "dataset": df_cell["dataset"].iloc[0],
+            "best_method": best_name, "best_prr": point[best_name], "method": m,
+            "prr": point[m], "p_best": np.nan, "alpha_bonferroni": alpha_bonf,
+            "verdict": "non testabile", "indistinguishable_from_best": False,
+            "diff_best_minus_method": np.nan, "diff_ci_low": np.nan, "diff_ci_high": np.nan,
+            "diff_ci_low_bonferroni": np.nan, "diff_ci_high_bonferroni": np.nan,
+            "n_instances": int(n),
         })
     return rows
 
@@ -228,9 +162,10 @@ def main():
     parser.add_argument("--out", default=None,
                         help="Nome del CSV di output (default: derivato dal file di input).")
     parser.add_argument("--n_resamples", type=int, default=1000,
-                        help="Ricampionamenti bootstrap per confronto (default: %(default)s). "
+                        help="Ricampionamenti bootstrap per cella (default: %(default)s). "
                              "Abbassarlo accelera in modo proporzionale.")
     parser.add_argument("--max_rejection", type=float, default=0.5)
+    parser.add_argument("--alpha", type=float, default=0.05)
     args = parser.parse_args()
 
     check_equivalence()
@@ -244,16 +179,22 @@ def main():
     if missing:
         raise SystemExit(f"!!! {path} non ha le colonne {sorted(missing)}.")
 
-    rng = np.random.default_rng(SEED)
     all_rows = []
     for (model_name, dataset_name), cell in df.groupby(["model", "dataset"], sort=False):
-        rows = compare_cell(cell, args.n_resamples, rng, args.max_rejection)
+        cell = cell.dropna(axis=1, how="all")
+        # Un generatore per cella, con seme ricavato dalla cella: i risultati di
+        # una cella non dipendono dall'ordine delle righe nel CSV ne' da quali
+        # altre celle ci sono (prima il generatore era condiviso).
+        rng = np.random.default_rng([SEED, zlib.crc32(f"{model_name}|{dataset_name}".encode())])
+        rows = compare_cell(cell, args.n_resamples, rng, args.max_rejection, args.alpha)
         all_rows.extend(rows)
         if rows:
-            n_tied = sum(r["indistinguishable_from_best"] for r in rows)
+            r = pd.DataFrame(rows)
             print(f"{model_name}/{dataset_name}: migliore = {rows[0]['best_method']} "
-                  f"(PRR {rows[0]['best_prr']:.3f}); {n_tied} metodi su {len(rows)} "
-                  f"non distinguibili da esso.")
+                  f"(PRR {rows[0]['best_prr']:.3f}); indistinguibili "
+                  f"{(r['verdict'] == 'indistinguibile').sum()}, peggiori "
+                  f"{(r['verdict'] == 'peggiore').sum()}, non testabili "
+                  f"{(r['verdict'] == 'non testabile').sum()}.")
         else:
             print(f"{model_name}/{dataset_name}: meno di due metodi con PRR valido, salto.")
 
@@ -266,15 +207,18 @@ def main():
     out_path = os.path.join(args.results_dir, out_name)
     result = pd.DataFrame(all_rows)
     result.to_csv(out_path, index=False)
-    print(f"\nSalvato: {out_path} ({len(result)} confronti)")
+    print(f"\nSalvato: {out_path} ({len(result)} righe)")
 
     # Riepilogo leggibile: quanti metodi restano in testa per cella. E' il
     # numero da citare quando si scrive una classifica.
-    summary = (result.groupby(["model", "dataset"])
+    others = result[result["verdict"] != "migliore"]
+    summary = (others.groupby(["model", "dataset"])
                .agg(migliore=("best_method", "first"),
                     prr_migliore=("best_prr", "first"),
                     metodi_confrontati=("method", "count"),
-                    equivalenti_al_migliore=("indistinguishable_from_best", "sum"))
+                    equivalenti_al_migliore=("verdict", lambda v: int((v == "indistinguibile").sum())),
+                    peggiori=("verdict", lambda v: int((v == "peggiore").sum())),
+                    non_testabili=("verdict", lambda v: int((v == "non testabile").sum())))
                .reset_index())
     summary_path = os.path.join(args.results_dir,
                                 out_name.replace(".csv", "_summary.csv"))

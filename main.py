@@ -1,13 +1,14 @@
 import argparse
 import copy
 import gc
+import hashlib
+import json
 import math
 import os
 import re
 import shutil
 import subprocess
 import sys
-import textwrap
 import time
 import traceback
 
@@ -16,8 +17,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import kendalltau
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from lm_polygraph.utils.manager import UEManager
 from lm_polygraph.utils.dataset import Dataset as PolygraphDataset
@@ -26,9 +26,9 @@ from lm_polygraph.utils.processor import Logger
 from lm_polygraph.utils.builder_enviroment_stat_calculator import BuilderEnvironmentStatCalculator
 from lm_polygraph.defaults.register_default_stat_calculators import register_default_stat_calculators
 from lm_polygraph.ue_metrics import PredictionRejectionArea
-from lm_polygraph.ue_metrics.ue_metric import get_random_scores, normalize_metric
 from lm_polygraph.estimators import *
 
+import analysis_lib as AL
 from analysis_lib import silent_failure_rate as _silent_failure_rate
 
 SEED = 3407
@@ -68,21 +68,40 @@ REPLICATION_ANCHOR_MODEL = "Mistral-7B-it"
 GATED_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
 # Modelli instruction-tuned: si aspettano un chat template esplicito (marcatori
-# di turno tipo <start_of_turn>/<end_of_turn> o [INST]). Dando loro lo stesso
-# prompt a completamento usato per i modelli base LFM2 non generano
-# correttamente (chiudono subito il turno emettendo EOS). I loro prompt vengono
-# costruiti con tokenizer.apply_chat_template().
-CHAT_TEMPLATE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it", "Mistral-7B-it"}
+# di turno tipo <start_of_turn>/<end_of_turn>, [INST] o <|im_start|>). I loro
+# prompt vengono costruiti con tokenizer.apply_chat_template().
+#
+# Fino al 29/09 LFM2 non era in questo insieme: era trattato come un modello
+# "base" e riceveva un prompt a completamento di testo. Ma LFM2-350M e
+# LFM2-1.2B sono modelli chat (SFT + allineamento sulle preferenze, template
+# ChatML con <|im_start|>, dalla model card di LiquidAI). Tra modelli piccoli e
+# grandi cambiavano quindi due cose insieme, la dimensione e il formato del
+# prompt, e non si poteva dire quale delle due spiegasse le differenze; un
+# modello chat interrogato senza il suo formato tende anche a "continuare da
+# solo" inventando nuove domande, che e' proprio cio' che si vedeva nei log.
+# Ora TUTTI i modelli ricevono il proprio chat template. Se un tokenizer non ne
+# ha uno, run_model_on_dataset lo segnala e usa il prompt semplice.
+CHAT_TEMPLATE_MODELS = {"LFM2-350M", "LFM2-1.2B", "MedGemma-4B-it", "Gemma3-4B-it", "Mistral-7B-it"}
 
 # Modelli che NON possono essere quantizzati a 4-bit: la famiglia Gemma3
 # produce logit NaN sotto bitsandbytes nf4 (verificato escludendo prima
 # backend di attenzione, formato del prompt e quantizzazione del solo lm_head),
-# quindi vanno caricati in bf16. Nota: questo insieme e' volutamente distinto
-# da CHAT_TEMPLATE_MODELS, con cui coincideva prima dell'aggiunta di Mistral:
-# Mistral-7B ha bisogno del chat template ma DEVE restare quantizzato, perche'
-# in bf16 occuperebbe ~15GB e i modelli 4B in bf16 gia' toccavano 23.3GB dei
-# 23.6GB disponibili sulla 3090.
-NO_QUANT_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
+# quindi vanno caricati in bf16.
+CANNOT_QUANTIZE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
+
+# Precisione dell'ancora Mistral-7B (--anchor_precision, default bf16). Fino al
+# 29/09 era sempre 4-bit, con la motivazione che in bf16 (~15 GB di pesi) la
+# memoria non sarebbe bastata. Ma la memoria non la mangiavano i pesi: la
+# mangiava il campionamento dei K campioni, che in lm-polygraph conserva per
+# ogni campione gli stati di tutti gli strati e il log-softmax sull'intero
+# vocabolario a ogni token. Con il campionatore in batch (batched_sampling.py)
+# quella memoria non c'e' piu', e l'ancora puo' girare nella precisione del
+# paper. Il valore effettivo viene impostato in main() e scritto nella scheda
+# delle condizioni di esecuzione (run_conditions.csv).
+ANCHOR_PRECISION = "bf16"
+
+# Insieme dei modelli caricati in bf16 in questa esecuzione.
+NO_QUANT_MODELS = set(CANNOT_QUANTIZE_MODELS)
 
 
 # Riduzione automatica del batch per i modelli che stanno stretti nei 24GB
@@ -107,8 +126,16 @@ NO_QUANT_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 HEAVY_WEIGHTS_GB = 2.0
 BYTES_PER_PARAM = {True: 0.5, False: 2.0}  # nf4 ~4 bit, bf16 = 2 byte
 
-DEBERTA_BATCH_SIZE_DEFAULT = 10
-DEBERTA_BATCH_SIZE_HEAVY = 2
+# Batch del modello NLI (DeBERTa-large) e del cross-encoder. Per ogni domanda
+# le coppie di campioni da confrontare sono K*K = 100: con batch 2 erano 50
+# chiamate per domanda, ed era il motivo dei tempi NLI fino a 48 secondi per
+# domanda sui modelli grandi. Il batch 2 per i modelli "pesanti" era una difesa
+# contro gli OOM, che pero' venivano dal campionamento (vedi
+# batched_sampling.py), non dall'NLI: DeBERTa-large su coppie di frasi brevi
+# occupa poche centinaia di MB anche a batch 50. Se un OOM capita comunque,
+# run_model_on_dataset riprova con batch piu' piccoli.
+DEBERTA_BATCH_SIZE_DEFAULT = 50
+DEBERTA_BATCH_SIZE_HEAVY = 20
 
 # Override espliciti, per i casi che la regola sopra non prende. Ha la
 # precedenza su tutto.
@@ -116,9 +143,20 @@ MODEL_BATCH_SIZE = {}
 
 
 def uses_quantization(model_name):
-    """4-bit nf4 per default; bf16 solo per i modelli che sotto quantizzazione
-    producono NaN (vedi NO_QUANT_MODELS)."""
+    """4-bit nf4 per default; bf16 per i modelli che sotto quantizzazione
+    producono NaN (CANNOT_QUANTIZE_MODELS) e per l'ancora se
+    --anchor_precision bf16 (vedi NO_QUANT_MODELS)."""
     return model_name not in NO_QUANT_MODELS
+
+
+def set_anchor_precision(precision):
+    """Aggiorna NO_QUANT_MODELS secondo --anchor_precision."""
+    global ANCHOR_PRECISION
+    ANCHOR_PRECISION = precision
+    NO_QUANT_MODELS.clear()
+    NO_QUANT_MODELS.update(CANNOT_QUANTIZE_MODELS)
+    if precision == "bf16":
+        NO_QUANT_MODELS.add(REPLICATION_ANCHOR_MODEL)
 
 
 def weights_gb(model_name, quantized):
@@ -184,6 +222,7 @@ from dataset_prep import (
     format_prompt,
     format_chat_prompt,
     self_test_mcq_metric,
+    tokenizer_adds_bos,
 )
 
 # GSM8k e' escluso dai metodi verbalized: con --verbalized_max_new_tokens=40 il
@@ -201,8 +240,9 @@ FIGURE_A_MODELS_NOTE = (
     "Mistral v0.2 7b base), Mean PRR aggregato su CoQA/TriviaQA/MMLU/GSM8k -> sostituita da "
     "LFM2-350M / LFM2-1.2B / MedGemma-4B-it / Gemma3-4B-it, piu' Mistral-7B-Instruct-v0.2 come "
     "ancora di replica nel regime di scala del paper. Barre d'errore: intervalli bootstrap al 95%. "
-    "Da leggere insieme a accuracy_table.csv: un PRR basso su un modello con accuracy vicina al "
-    "caso non indica un metodo debole ma una misura presa in un regime degenere."
+    "PRR del paper (0 = casuale, 1 = oracolo). Da leggere insieme a accuracy_table.csv: con "
+    "un'accuracy vicina al caso il modello tira a indovinare, nessun segnale interno puo' "
+    "predire l'esito e il PRR e' vicino a 0 per tutti i metodi."
 )
 FIGURE_B_MODELS_NOTE = (
     "Figura B ~ Vashurin et al. Fig. 3 (black-box/reflexive: StableLM v2 12b Chat / "
@@ -409,36 +449,79 @@ class TimedEstimator:
 # davvero, in base alle sue stats_dependencies dichiarate.
 # ---------------------------------------------------------------------------
 
-# Statistiche che implicano il campionamento di K generazioni aggiuntive.
-_SAMPLING_STATS_PREFIXES = ("sample_", "blackbox_sample_")
-# Statistiche che implicano i forward del modello NLI (DeBERTa).
-_NLI_STATS_MARKERS = ("semantic_matrix", "semantic_classes")
+# Fase di costo di ogni calcolatore di statistiche, per NOME DI CLASSE ESATTO.
+#
+# Fino al 29/09 la fase veniva indovinata da sottostringhe del nome ("semantic"
+# -> NLI, "greedy" -> generazione greedy, ...), e il nome inganna: il
+# confronto NLI sulle alternative dei token usato da CCP
+# (GreedyAlternativesNLICalculator) finiva in "generazione greedy", i due
+# cross-encoder di SAR/SentenceSAR/TokenSAR e la chiamata extra al modello di
+# P(True) finivano in "altro". Qui ogni calcolatore ha la sua fase dichiarata;
+# un calcolatore che non compare nella tabella viene segnalato a stampa
+# invece di finire in silenzio in una voce generica.
+PHASE_OF_CALCULATOR = {
+    "GreedyProbsCalculator": "generazione_greedy",
+    "BatchedSamplingCalculator": "campionamento_K",
+    "SamplingGenerationCalculator": "campionamento_K",
+    "SemanticMatrixCalculator": "nli_campioni",
+    "SemanticClassesCalculator": "nli_campioni",          # solo raggruppamento, sulla matrice NLI
+    "GreedySemanticMatrixCalculator": "nli_campioni",
+    "ConcatGreedySemanticMatrixCalculator": "nli_campioni",
+    "GreedyAlternativesNLICalculator": "nli_alternative",   # CCP
+    # SAR, SentenceSAR e anche TokenSAR: in lm-polygraph 0.7.0 la statistica
+    # "token_similarity" di TokenSAR e' prodotta da questo stesso calcolatore,
+    # che dipende dai K campioni. Il costo pieno di TokenSAR include quindi il
+    # campionamento: e' come la libreria lo calcola, anche se un'implementazione
+    # minima di TokenSAR potrebbe farne a meno (va detto in tesi).
+    "CrossEncoderSimilarityMatrixCalculator": "cross_encoder_campioni",
+    "GreedyCrossEncoderSimilarityMatrixCalculator": "cross_encoder_greedy",  # non usato dai 26 metodi
+    "GreedyLMProbsCalculator": "forward_senza_contesto",    # PMI, CPMI
+    "PromptCalculator": "forward_ptrue",                    # P(True)
+    "EntropyCalculator": "aritmetica",
+    "RawInputCalculator": "aritmetica",
+    "InitialStateCalculator": "aritmetica",
+}
+
+# Calcolo della metrica di qualita' (AlignScore, un modello da 355M
+# parametri, o l'estrazione della lettera): non e' un costo dei metodi UQ ma
+# pesa sul tempo totale, quindi viene cronometrato come fase a parte.
+QUALITY_PHASE = "metrica_qualita"
+
+# Stimatori che fanno lavoro costoso DENTRO la propria chiamata, senza
+# dichiararlo come statistica: BB P(True) (PTrueEmpirical) genera da se' le
+# proprie risposte. Il suo tempo di stima e' quindi generazione, non
+# aritmetica.
+ESTIMATOR_OWN_PHASE = {"PTrueEmpirical": "generazione_interna_stimatore"}
 
 
 def classify_stat_calculator(name):
-    """Assegna un calcolatore di statistiche a una fase di costo, in base al
-    suo nome di classe."""
-    lowered = name.lower()
-    if "sampling" in lowered:
-        return "campionamento_K_generazioni"
-    if "semantic" in lowered or "deberta" in lowered or "nli" in lowered:
-        return "forward_NLI"
-    if "greedy" in lowered:
-        return "generazione_greedy"
-    return "altro"
+    """Fase di costo di un calcolatore (vedi PHASE_OF_CALCULATOR)."""
+    phase = PHASE_OF_CALCULATOR.get(name)
+    if phase is None:
+        print(f"  ATTENZIONE: calcolatore {name} senza fase dichiarata in PHASE_OF_CALCULATOR, "
+              f"conteggiato come 'non_classificato'.")
+        return "non_classificato"
+    return phase
 
 
-# Calcolatori che caricano un modello ausiliario, per la tabella dei costi.
-_NLI_CALCULATORS = {"SemanticMatrixCalculator", "SemanticClassesCalculator",
-                    "GreedyAlternativesNLICalculator"}
-_CROSS_ENCODER_CALCULATORS = {"CrossEncoderSimilarityMatrixCalculator"}
-_EXTRA_FORWARD_CALCULATORS = {"GreedyLMProbsCalculator", "PromptCalculator"}
+# Calcolatori che caricano un modello ausiliario o fanno un forward in piu',
+# per le colonne della tabella dei costi.
+_SAMPLING_CALCULATORS = {c for c, f in PHASE_OF_CALCULATOR.items() if f == "campionamento_K"}
+_NLI_CALCULATORS = {c for c, f in PHASE_OF_CALCULATOR.items() if f.startswith("nli_")}
+_CROSS_ENCODER_CALCULATORS = {c for c, f in PHASE_OF_CALCULATOR.items() if f.startswith("cross_encoder")}
+_EXTRA_FORWARD_CALCULATORS = {c for c, f in PHASE_OF_CALCULATOR.items() if f.startswith("forward_")}
+
+# Campionatore dei K campioni: "batched" (batched_sampling.py, una chiamata a
+# generate per tutti i campioni, senza stati nascosti) oppure "library"
+# (SamplingGenerationCalculator di lm-polygraph, per confronto). Impostato da
+# --sampler in main().
+SAMPLER = "batched"
 
 
 def default_stat_calculators(cache_dir, deberta_batch_size=None):
     """Descrizioni dei calcolatori di statistiche usate da UEManager (vedi
     build_manager). Servono anche a ricostruire le dipendenze di ogni metodo."""
-    return register_default_stat_calculators(
+    containers = register_default_stat_calculators(
         model_type="Whitebox",
         language="en",
         hf_cache=cache_dir,
@@ -453,6 +536,24 @@ def default_stat_calculators(cache_dir, deberta_batch_size=None):
         blackbox_supports_logprobs=False,
         deberta_batch_size=deberta_batch_size or DEBERTA_BATCH_SIZE_DEFAULT,
     )
+    if SAMPLER == "batched":
+        from omegaconf import OmegaConf
+        from lm_polygraph.utils.factory_stat_calculator import StatCalculatorContainer
+        from batched_sampling import BatchedSamplingCalculator
+        replaced = []
+        for c in containers:
+            if c.name == "SamplingGenerationCalculator":
+                c = StatCalculatorContainer(
+                    name="BatchedSamplingCalculator",
+                    obj=BatchedSamplingCalculator,
+                    builder="batched_sampling",
+                    cfg=OmegaConf.create({"obj": "BatchedSamplingCalculator", "samples_n": 10}),
+                    dependencies=BatchedSamplingCalculator.meta_info()[1],
+                    stats=BatchedSamplingCalculator.meta_info()[0],
+                )
+            replaced.append(c)
+        containers = replaced
+    return containers
 
 
 def estimator_calculator_closure(estimator, containers):
@@ -481,18 +582,6 @@ def estimator_calculator_closure(estimator, containers):
         closure.add(c.name)
         todo.extend(c.dependencies)
     return closure
-
-
-def estimator_phase_needs(estimator):
-    """Quali fasi costose servono davvero a uno stimatore, dedotte dalle
-    statistiche che dichiara di volere. La generazione greedy serve sempre,
-    perche' e' la risposta di cui si stima l'incertezza."""
-    deps = [str(d) for d in getattr(estimator, "stats_dependencies", [])]
-    needs_sampling = any(d.startswith(_SAMPLING_STATS_PREFIXES) for d in deps)
-    needs_nli = any(any(m in d for m in _NLI_STATS_MARKERS) for d in deps)
-    return {"generazione_greedy": True,
-            "campionamento_K_generazioni": needs_sampling,
-            "forward_NLI": needs_nli}
 
 
 class TimedUEManager(UEManager):
@@ -537,21 +626,43 @@ class TimedUEManager(UEManager):
 # principale sia delle run da 30 ore sia degli OOM su CoQA, il dataset con i
 # contesti piu' lunghi.
 #
-# Eccezione per la famiglia Gemma: le sue varianti usano il soft-capping dei
-# logit di attenzione, che le implementazioni fuse non applicano correttamente
-# in tutte le versioni di transformers, e la guida di HuggingFace raccomanda
-# eager per quei modelli. Preferisco pagare il costo dove la correttezza e' in
-# dubbio piuttosto che ottenere numeri veloci e sbagliati. DA VERIFICARE sulla
-# model card della versione di transformers in uso (4.57.3).
+# Eccezione storica per la famiglia Gemma: Gemma 2 usa il soft-capping dei
+# logit di attenzione (config.attn_logit_softcapping), che i kernel fusi di
+# SDPA non applicano, e per quel modello HuggingFace raccomanda eager. Fino al
+# 29/09 eager era imposto a tutti i Gemma "per prudenza" (commento: "DA
+# VERIFICARE"). Gemma 3 pero' ha tolto il soft-capping dell'attenzione (lo ha
+# sostituito con la normalizzazione QK), quindi per Gemma 3 e MedGemma eager
+# era costo puro, quadratico nella lunghezza del contesto (GSM8k con 8 esempi
+# few-shot: il blocco da 3 ore della run di settembre). Ora la scelta e'
+# automatica: si legge la configurazione del modello e si usa eager SOLO se
+# attn_logit_softcapping e' impostato. Le forzature esplicite restano
+# possibili in MODEL_ATTN_IMPLEMENTATION.
 ATTN_IMPLEMENTATION_DEFAULT = "sdpa"
-MODEL_ATTN_IMPLEMENTATION = {
-    "Gemma3-4B-it": "eager",
-    "MedGemma-4B-it": "eager",
-}
+MODEL_ATTN_IMPLEMENTATION = {}
 
 
-def attn_implementation_for(model_name):
-    return MODEL_ATTN_IMPLEMENTATION.get(model_name, ATTN_IMPLEMENTATION_DEFAULT)
+def attn_logit_softcapping(model_id, cache_dir=None, hf_token=None):
+    """Valore di attn_logit_softcapping nella configurazione del modello (anche
+    dentro text_config per i modelli multimodali come Gemma 3), o None."""
+    try:
+        cfg = AutoConfig.from_pretrained(model_id, cache_dir=cache_dir, token=hf_token)
+    except Exception as e:
+        print(f"  (configurazione di {model_id} non leggibile: {e}; assumo nessun soft-capping)")
+        return None
+    for c in (cfg, getattr(cfg, "text_config", None)):
+        v = getattr(c, "attn_logit_softcapping", None) if c is not None else None
+        if v is not None:
+            return v
+    return None
+
+
+def attn_implementation_for(model_name, model_id=None, cache_dir=None, hf_token=None):
+    if model_name in MODEL_ATTN_IMPLEMENTATION:
+        return MODEL_ATTN_IMPLEMENTATION[model_name]
+    if model_id is not None and attn_logit_softcapping(model_id, cache_dir, hf_token) is not None:
+        print(f"  {model_name}: attn_logit_softcapping impostato -> attenzione eager.")
+        return "eager"
+    return ATTN_IMPLEMENTATION_DEFAULT
 
 
 def load_whitebox_model(model_id, cache_dir, hf_token=None,
@@ -594,6 +705,35 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None,
     return model
 
 
+class TimedGenerationMetric:
+    """Involucro trasparente attorno alla metrica di qualita' che ne cronometra
+    il calcolo (fase QUALITY_PHASE). Prima non era misurato e finiva dentro la
+    voce "altro" (~20% del tempo totale). Gli attributi non ridefiniti qui
+    (n_parse_failures, esempi, ...) vengono letti dalla metrica originale."""
+
+    def __init__(self, metric, timing_dict):
+        self._metric = metric
+        self._timing = timing_dict
+        self.level = metric.level
+        self.stats_dependencies = metric.stats_dependencies
+
+    def __str__(self):
+        return str(self._metric)
+
+    def __getattr__(self, name):
+        return getattr(self._metric, name)
+
+    def __call__(self, stats, target_texts):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        out = self._metric(stats, target_texts)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._timing[QUALITY_PHASE] = self._timing.get(QUALITY_PHASE, 0.0) + (time.perf_counter() - start)
+        return out
+
+
 def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens,
                   generation_metric, stat_timing_dict=None,
                   deberta_batch_size=DEBERTA_BATCH_SIZE_DEFAULT):
@@ -606,7 +746,8 @@ def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_
         estimators=estimators,
         builder_env_stat_calc=builder_env_stat_calc,
         available_stat_calculators=available_stat_calculators,
-        generation_metrics=[generation_metric],
+        generation_metrics=[TimedGenerationMetric(generation_metric, stat_timing_dict)
+                            if stat_timing_dict is not None else generation_metric],
         ue_metrics=[PredictionRejectionArea(max_rejection=max_rejection)],
         processors=[Logger()],
         # Con ignore_exceptions=True lm-polygraph, a un errore su un batch
@@ -679,108 +820,36 @@ def extract_instance_level(man):
     return quality, quality_name, scores
 
 
-def _prr_from_arrays(ue_metric, ue, quality):
-    """Riproduce esattamente il calcolo che UEManager.eval_ue() fa per il PRR,
-    cosi' che i valori bootstrap siano confrontabili con quello aggregato:
-    le istanze con qualita' NaN vengono scartate, e i NaN nel punteggio di
-    incertezza vengono sostituiti con -1e7 (vedi _delete_nans nel sorgente di
-    lm-polygraph).
-
-    ATTENZIONE, questo e' un dettaglio con conseguenze reali sui metodi
-    verbalized: un punteggio NaN significa "confidenza non estraibile dal
-    testo", ma -1e7 e' il valore piu' BASSO possibile di incertezza, quindi
-    quelle istanze vengono trattate come le piu' confidenti in assoluto e non
-    vengono mai scartate dal PRR. Un modello che non riesce a produrre il
-    formato richiesto viene cosi' premiato invece che penalizzato: e' il
-    motivo per cui il parse-failure rate va sempre riportato accanto al PRR
-    dei metodi verbalized."""
-    clipped = np.nan_to_num(ue, nan=-1e7, neginf=-1e7, posinf=1e7)
-    keep = ~np.isnan(quality)
-    clipped, q = clipped[keep], quality[keep]
-    if len(q) == 0:
-        return np.nan
-    # PredictionRejectionArea normalizza la qualita' min-max: se tutte le
-    # istanze hanno lo stesso valore il denominatore e' zero e il risultato
-    # non e' definito (tipicamente accade quando il modello sbaglia tutto o
-    # indovina tutto in un ricampionamento bootstrap sfortunato).
-    if np.nanmax(q) == np.nanmin(q):
-        return np.nan
-    try:
-        return float(ue_metric(clipped, q))
-    except Exception:
-        return np.nan
+def prr_metric_name(max_rejection):
+    """Nome della colonna ue_metric con il PRR del paper (normalizzato fra
+    caso e oracolo), come la scrive lm-polygraph: "prr_0.5_normalized"."""
+    return f"{PredictionRejectionArea(max_rejection=max_rejection)}_normalized"
 
 
-def bootstrap_prr_ci(ue, quality, max_rejection, n_resamples, seed, alpha=0.05):
-    """Intervallo di confidenza bootstrap percentile sul PRR.
+def _prr_from_arrays(ue, quality, max_rejection):
+    """PRR del paper, (AUC_unc - AUC_rnd) / (AUC_oracle - AUC_rnd), dagli array
+    per-istanza, con i pareggi risolti in valore atteso: vedi
+    analysis_lib.prr_normalized e il commento che la precede.
 
-    Il benchmark e' calcolato su un campione di domande, non sul dataset
-    intero: ripetendolo con altre domande ogni PRR verrebbe leggermente
-    diverso. Il bootstrap stima quanto, senza bisogno di nuove run GPU:
-    ricampiona con reimmissione le stesse istanze gia' calcolate, ricalcola il
-    PRR su ogni ricampionamento e usa i percentili dei valori ottenuti come
-    barre d'errore.
+    Fino al 29/09 le figure usavano solo AUC_unc (la colonna "prr_0.5"): un
+    numero che parte dall'accuracy del modello e sale di poco se il metodo e'
+    utile. Resta calcolato come "prr_raw" per confronto.
 
-    Il ricampionamento e' fatto sugli INDICI delle istanze e applicato insieme
-    a punteggio e qualita', perche' l'unita' che varia tra un esperimento e
-    l'altro e' la domanda: separare i due array distruggerebbe
-    l'accoppiamento e sottostimerebbe l'incertezza."""
-    rng = np.random.default_rng(seed)
-    ue_metric = PredictionRejectionArea(max_rejection=max_rejection)
-    n = len(quality)
-    if n == 0:
-        return np.nan, np.nan
-    values = []
-    for _ in range(n_resamples):
-        idx = rng.integers(0, n, size=n)
-        v = _prr_from_arrays(ue_metric, ue[idx], quality[idx])
-        if np.isfinite(v):
-            values.append(v)
-    # Se piu' della meta' dei ricampionamenti e' degenere (es. accuracy
-    # costante), l'intervallo non e' affidabile e viene riportato come NaN
-    # invece di un numero falsamente preciso.
-    if len(values) < n_resamples // 2:
-        return np.nan, np.nan
-    return (float(np.percentile(values, 100 * alpha / 2)),
-            float(np.percentile(values, 100 * (1 - alpha / 2))))
-
-
-def bootstrap_paired_diff_ci(ue_a, ue_b, quality, max_rejection, n_resamples, seed, alpha=0.05):
-    """Intervallo di confidenza bootstrap APPAIATO sulla differenza
-    PRR(A) - PRR(B).
-
-    Serve per poter scrivere "A batte B" in modo difendibile. Guardare se due
-    barre d'errore separate si sovrappongono e' troppo conservativo: A e B
-    sono valutati sulle STESSE domande, quindi i loro punteggi sono correlati
-    (entrambi faticano sulle domande difficili). Qui, a ogni ricampionamento,
-    si ricalcola la differenza sullo stesso campione, e alla fine si guarda
-    l'intervallo delle differenze: se non contiene zero, il vantaggio e'
-    reale."""
-    rng = np.random.default_rng(seed)
-    ue_metric = PredictionRejectionArea(max_rejection=max_rejection)
-    n = len(quality)
-    if n == 0:
-        return np.nan, np.nan, np.nan
-    diffs = []
-    for _ in range(n_resamples):
-        idx = rng.integers(0, n, size=n)
-        q = quality[idx]
-        va = _prr_from_arrays(ue_metric, ue_a[idx], q)
-        vb = _prr_from_arrays(ue_metric, ue_b[idx], q)
-        if np.isfinite(va) and np.isfinite(vb):
-            diffs.append(va - vb)
-    if len(diffs) < n_resamples // 2:
-        return np.nan, np.nan, np.nan
-    return (float(np.mean(diffs)),
-            float(np.percentile(diffs, 100 * alpha / 2)),
-            float(np.percentile(diffs, 100 * (1 - alpha / 2))))
+    ATTENZIONE, un dettaglio con conseguenze reali sui metodi verbalized: un
+    punteggio NaN significa "confidenza non estraibile dal testo", ma
+    lm-polygraph lo sostituisce con -1e7, il valore piu' BASSO possibile di
+    incertezza, quindi quelle istanze vengono trattate come le piu' confidenti
+    in assoluto e non vengono mai scartate. Un modello che non produce il
+    formato richiesto viene cosi' premiato invece che penalizzato: e' il motivo
+    per cui il parse-failure rate va sempre riportato accanto al PRR dei metodi
+    verbalized. La convenzione e' mantenuta per restare confrontabili con la
+    libreria e con il paper."""
+    return AL.prr_normalized(ue, quality, max_rejection)
 
 
 def silent_failure_rate(ue, quality, quantile=0.10):
-    """Frazione delle risposte SBAGLIATE che finisce nel decile piu'
-    confidente del metodo: quanti errori passano inosservati, presentati con
-    la massima sicurezza. Implementazione in analysis_lib (condivisa con lo
-    script di ricalcolo offline), con gestione corretta dei pareggi."""
+    """Vecchia metrica (vedi analysis_lib.silent_failure_rate), conservata
+    solo per confronto con le run precedenti."""
     return _silent_failure_rate(ue, quality,
                                 correctness_threshold=CORRECTNESS_THRESHOLD,
                                 quantile=quantile)
@@ -809,9 +878,9 @@ def stats_from_arrays(quality, quality_name, scores, model_name, dataset_name,
     if quality is None or len(quality) == 0:
         return None, None
 
-    ue_metric = PredictionRejectionArea(max_rejection=max_rejection)
     mean_quality = float(np.nanmean(quality))
     n_instances = int(len(quality))
+    err_overall = AL.error_rate_overall(quality, CORRECTNESS_THRESHOLD)
 
     rows = []
     per_instance = {"quality": quality}
@@ -821,15 +890,19 @@ def stats_from_arrays(quality, quality_name, scores, model_name, dataset_name,
                   f"{len(quality)}; salto le statistiche per-istanza di questo stimatore.")
             continue
         per_instance[est_name] = ue
-        ci_low, ci_high = bootstrap_prr_ci(ue, quality, max_rejection, n_bootstrap, seed)
+        ci_low, ci_high = AL.bootstrap_prr_ci(ue, quality, max_rejection, n_bootstrap, seed)
         rows.append({
             "model": model_name,
             "dataset": dataset_name,
             "estimator": est_name,
             "paper_label": paper_label_by_str.get(est_name, est_name),
-            "prr": _prr_from_arrays(ue_metric, ue, quality),
+            # PRR del paper (normalizzato: 0 = caso, 1 = oracolo), con
+            # intervallo bootstrap al 95%.
+            "prr": _prr_from_arrays(ue, quality, max_rejection),
             "prr_ci_low": ci_low,
             "prr_ci_high": ci_high,
+            # Solo l'area, la colonna riportata fino al 29/09: per confronto.
+            "prr_raw": AL.prr_raw(ue, quality, max_rejection),
             "quality_metric": quality_name,
             "mean_quality": mean_quality,
             "n_instances": n_instances,
@@ -838,6 +911,15 @@ def stats_from_arrays(quality, quality_name, scores, model_name, dataset_name,
             # (confidenza non estraibile dal testo generato); per gli altri
             # metodi dovrebbe essere zero.
             "nan_rate": float(np.isnan(ue).mean()),
+            # Frazione di punteggi distinti: vicina a 0 = il metodo non ordina
+            # quasi nulla (NumSet, o campioni tutti uguali).
+            "distinct_fraction": AL.distinct_fraction(ue),
+            # Errori fra le risposte date con piu' fiducia (10% piu'
+            # confidente), da leggere accanto all'error rate complessivo.
+            "error_rate_top10": AL.error_rate_most_confident(
+                ue, quality, CORRECTNESS_THRESHOLD, 0.10),
+            "error_rate_overall": err_overall,
+            # Vecchia metrica, con un tetto quando gli errori sono tanti.
             "silent_failure_rate": silent_failure_rate(ue, quality),
         })
 
@@ -848,10 +930,44 @@ def stats_from_arrays(quality, quality_name, scores, model_name, dataset_name,
     return stats_df, per_instance_df
 
 
+# Colonne dei file per-istanza che non sono punteggi di uno stimatore.
+PER_INSTANCE_META_COLUMNS = ("model", "dataset", "instance_index", "quality", "greedy_text")
+
+
+def _library_versions():
+    import importlib.metadata as md
+    out = {}
+    for pkg in ("torch", "transformers", "lm-polygraph", "bitsandbytes", "accelerate"):
+        try:
+            out[pkg] = md.version(pkg)
+        except Exception:
+            out[pkg] = "?"
+    return out
+
+
+def record_run_conditions(results_dir, row):
+    """Scheda delle condizioni di esecuzione: una riga per cella (modello x
+    dataset x sezione) con precisione, attenzione, formato del prompt, budget di
+    token, arresti, batch, campionatore e versioni delle librerie. Serve a
+    poter scrivere in tesi, per ogni numero, in che condizioni e' stato
+    ottenuto, senza ricostruirlo dai log."""
+    path = os.path.join(results_dir, "run_conditions.csv")
+    try:
+        df = pd.DataFrame([row])
+        if os.path.exists(path):
+            old = pd.read_csv(path)
+            df = pd.concat([old, df], ignore_index=True).drop_duplicates(
+                subset=["section", "model", "dataset", "instance_offset"], keep="last")
+        df.to_csv(path, index=False)
+    except Exception:
+        print("  (scrittura di run_conditions.csv fallita, ignoro)")
+
+
 def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, paper_label_by_str,
                          use_chat_template, estimators_factory=None, content_transform=None,
                          max_new_tokens_override=None, quantized=None, weights_model_name=None,
-                         stop_strings_key="stop_strings"):
+                         stop_strings_key="stop_strings", section_tag="main", instance_offset=0,
+                         log_label=None):
     """Esegue gli stimatori UQ su un singolo modello gia' caricato contro un
     singolo dataset gia' preparato (prompt + reference).
 
@@ -868,8 +984,11 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
       usare al posto di build_estimators().
     - `content_transform`: callable applicata al testo del prompt prima di
       formattarlo.
-    - `max_new_tokens_override`: sostituisce il max_new_tokens del dataset."""
-    print(f"\n--- {model_name} su {dataset_name} ---")
+    - `max_new_tokens_override`: sostituisce il max_new_tokens del dataset.
+    `instance_offset` e' la posizione della prima istanza nella cella (per i
+    blocchi), `log_label` l'etichetta messa davanti alle righe di log."""
+    label = log_label or f"{model_name}/{dataset_name}"
+    print(f"\n--- {label} ---")
     ds_start = time.time()
     df, timing_df, stats_df, per_instance_df = None, None, None, None
     try:
@@ -877,11 +996,25 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
         if content_transform is not None:
             contents = [content_transform(c) for c in contents]
 
+        if use_chat_template and getattr(model.tokenizer, "chat_template", None) is None:
+            print(f"  ATTENZIONE {label}: il tokenizer non ha un chat template, uso il prompt "
+                  f"semplice (risultato NON confrontabile con gli altri modelli).")
+            use_chat_template = False
         if use_chat_template:
             prompts = [format_chat_prompt(model.tokenizer, c) for c in contents]
         else:
             prompts = [format_prompt(c, cfg["plain_suffix"]) for c in contents]
         references = [ex["reference"] for ex in examples]
+        # Controllo del doppio BOS sul tokenizer VERO (vedi format_chat_prompt):
+        # la sequenza che il modello riceve deve iniziare con al massimo un BOS.
+        bos_id = getattr(model.tokenizer, "bos_token_id", None)
+        if bos_id is not None and prompts:
+            first_ids = model.tokenizer(prompts[0])["input_ids"]
+            n_bos = 0
+            while n_bos < len(first_ids) and first_ids[n_bos] == bos_id:
+                n_bos += 1
+            if n_bos > 1:
+                raise RuntimeError(f"{label}: il prompt tokenizzato inizia con {n_bos} token BOS.")
 
         # `model_name` puo' essere un'etichetta di variante ("full precision
         # (bf16)") invece di un nome in MODELS: in quel caso il conteggio dei
@@ -892,7 +1025,7 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
         batch_size = batch_size_for(weights_name, args.batch_size, is_quantized)
         deberta_batch_size = deberta_batch_size_for(weights_name, is_quantized)
         if batch_size != args.batch_size or deberta_batch_size != DEBERTA_BATCH_SIZE_DEFAULT:
-            print(f"  batch ridotto per {model_name} "
+            print(f"  [{label}] batch ridotto "
                   f"({weights_gb(weights_name, is_quantized):.1f}GB di pesi, "
                   f"{'4-bit' if is_quantized else 'bf16'}): generazione={batch_size} "
                   f"(default {args.batch_size}), NLI={deberta_batch_size} "
@@ -904,15 +1037,19 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
         # generazione greedy e per i campioni, come nel protocollo ufficiale.
         stop_strings = cfg.get(stop_strings_key)
         model.generation_parameters.stop_strings = list(stop_strings) if stop_strings else None
-        print(f"  stringhe di arresto ({stop_strings_key}): {stop_strings!r}")
+        print(f"  [{label}] stringhe di arresto ({stop_strings_key}): {stop_strings!r}")
 
-        # Un OOM non deve far perdere la cella: si riprova una volta con batch
-        # di generazione e di NLI a 1, che e' la configurazione di memoria
-        # minima. Se fallisce anche cosi', l'errore risale e lo gestisce
-        # l'esecuzione a blocchi.
-        attempts = [(batch_size, deberta_batch_size)]
-        if (batch_size, deberta_batch_size) != (1, 1):
-            attempts.append((1, 1))
+        # Un OOM non deve far perdere la cella: si riprova con batch via via
+        # piu' piccoli (prima si passava subito a 1/1, che con l'NLI a batch 1
+        # significa 100 chiamate a DeBERTa per domanda). Se fallisce anche
+        # l'ultimo tentativo, l'errore risale e lo gestisce l'esecuzione a
+        # blocchi.
+        attempts = []
+        for att in ((batch_size, deberta_batch_size),
+                    (1, max(1, deberta_batch_size // 4)),
+                    (1, 1)):
+            if att not in attempts:
+                attempts.append(att)
         for attempt_idx, (gen_bs, nli_bs) in enumerate(attempts):
             model_dataset = PolygraphDataset(prompts, references, batch_size=gen_bs)
             base_estimators = estimators_factory() if estimators_factory else build_estimators()
@@ -933,6 +1070,7 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             estimators = [TimedEstimator(e, timing_dict) for e in base_estimators]
             containers = default_stat_calculators(args.cache_dir, nli_bs)
             closures = {str(e): estimator_calculator_closure(e, containers) for e in base_estimators}
+            own_phase = {str(e): ESTIMATOR_OWN_PHASE.get(type(e).__name__) for e in base_estimators}
             man = build_manager(
                 model, model_dataset, estimators, args.cache_dir, args.max_rejection,
                 max_new_tokens, generation_metric,
@@ -945,30 +1083,35 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             except torch.cuda.OutOfMemoryError:
                 if attempt_idx == len(attempts) - 1:
                     raise
-                print(f"  OOM su {model_name}/{dataset_name} con batch generazione={gen_bs}, "
-                      f"NLI={nli_bs}: riprovo con batch 1/1.")
+                nxt = attempts[attempt_idx + 1]
+                print(f"  OOM su {label} con batch generazione={gen_bs}, NLI={nli_bs}: "
+                      f"riprovo con {nxt[0]}/{nxt[1]}.")
                 del man
                 gc.collect()
                 torch.cuda.empty_cache()
 
+        greedy_texts = [str(t) for t in man.stats.get("greedy_texts", [])]
         # Diagnostica: generazioni vuote. Con le stringhe di arresto un modello
         # che iniziasse la risposta andando a capo produrrebbe una risposta
         # vuota; va visto subito, non scoperto nelle figure.
-        try:
-            greedy_texts = man.stats.get("greedy_texts", [])
-            n_empty = sum(1 for t in greedy_texts if not str(t).strip())
-            if greedy_texts and n_empty / len(greedy_texts) > 0.05:
-                print(f"  ATTENZIONE {model_name}/{dataset_name}: {n_empty}/{len(greedy_texts)} "
-                      f"generazioni vuote.")
-        except Exception:
-            pass
-        log_gpu_mem(f"{model_name}/{dataset_name} done")
+        n_empty = sum(1 for t in greedy_texts if not t.strip())
+        if greedy_texts and n_empty / len(greedy_texts) > 0.05:
+            print(f"  ATTENZIONE {label}: {n_empty}/{len(greedy_texts)} generazioni vuote.")
+        log_gpu_mem(f"{label} done")
         peak_mem_gb = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else np.nan
 
         stats_df, per_instance_df = compute_instance_level_stats(
             man, model_name, dataset_name, paper_label_by_str,
             args.max_rejection, args.n_bootstrap, SEED,
         )
+        if per_instance_df is not None:
+            # Indice dell'istanza nella cella (serve ad appaiare modelli diversi
+            # sulle stesse domande) e testo generato, per poter rileggere le
+            # risposte e ricalcolare la metrica di qualita' senza GPU.
+            per_instance_df.insert(2, "instance_index",
+                                   np.arange(instance_offset, instance_offset + len(per_instance_df)))
+            if len(greedy_texts) == len(per_instance_df):
+                per_instance_df.insert(4, "greedy_text", greedy_texts)
         # Parse-failure rate della metrica di qualita', quando la metrica lo
         # espone (MCQAccuracyMetric). Va accanto all'accuracy, non nascosto
         # dentro di essa.
@@ -979,7 +1122,7 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             stats_df["answer_parse_failure_rate"] = answer_parse_failure_rate
             acc = stats_df["mean_quality"].iloc[0]
             qname = stats_df["quality_metric"].iloc[0]
-            messaggio = (f"{model_name}/{dataset_name}: {qname} medio = {acc:.3f} "
+            messaggio = (f"{label}: {qname} medio = {acc:.3f} "
                          f"su {stats_df['n_instances'].iloc[0]} istanze.")
             if np.isfinite(answer_parse_failure_rate):
                 messaggio += (f" Risposte non estraibili: "
@@ -1002,16 +1145,34 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
 
         df = extract_prr_table(man, model_name)
         df["dataset"] = dataset_name
+        # I valori di man.metrics vengono sostituiti con quelli ricalcolati
+        # dagli array per-istanza (pareggi in valore atteso, AUC casuale
+        # esatta): cosi' una cella eseguita in un colpo e una eseguita a blocchi
+        # danno esattamente gli stessi numeri. Il valore della libreria resta
+        # in value_lmpolygraph per tracciabilita'.
+        df["value_lmpolygraph"] = df["value"]
+        q_arr, _, s_arr = extract_instance_level(man)
+        raw_name = str(PredictionRejectionArea(max_rejection=args.max_rejection))
+        new_vals = []
+        for e, um, v in zip(df["estimator"], df["ue_metric"], df["value"]):
+            if e in s_arr and um == raw_name:
+                new_vals.append(AL.prr_raw(s_arr[e], q_arr, args.max_rejection))
+            elif e in s_arr and um == raw_name + "_normalized":
+                new_vals.append(AL.prr_normalized(s_arr[e], q_arr, args.max_rejection))
+            else:
+                new_vals.append(v)
+        df["value"] = new_vals
         n_ok = df["value"].notna().sum() if "value" in df.columns else 0
-        print(f"{model_name}/{dataset_name}: {n_ok}/{len(df)} righe metrica con valore.")
+        print(f"{label}: {n_ok}/{len(df)} righe metrica con valore.")
 
-        # Tempo per fase, sommando i calcolatori di statistiche che ricadono
-        # nella stessa fase di costo.
+        # Tempo per fase (vedi PHASE_OF_CALCULATOR).
         phase_seconds = {}
         for calc_name, seconds in stat_timing_dict.items():
-            phase_seconds[classify_stat_calculator(calc_name)] = (
-                phase_seconds.get(classify_stat_calculator(calc_name), 0.0) + seconds
-            )
+            phase = QUALITY_PHASE if calc_name == QUALITY_PHASE else classify_stat_calculator(calc_name)
+            phase_seconds[phase] = phase_seconds.get(phase, 0.0) + seconds
+        for est_str, seconds in timing_dict.items():
+            phase = own_phase.get(est_str) or "aritmetica_stimatori"
+            phase_seconds[phase] = phase_seconds.get(phase, 0.0) + seconds
         n_inst = max(len(examples), 1)
 
         timing_rows = []
@@ -1020,43 +1181,73 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             # Costo pieno standalone: se questa fosse l'unica tecnica in
             # esecuzione, dovrebbe pagarsi da sola ogni calcolatore della sua
             # catena di dipendenze (generazione greedy, campioni, modelli
-            # ausiliari, forward extra), oltre alla propria aritmetica. I
-            # tempi sono quelli misurati calcolatore per calcolatore.
+            # ausiliari, forward extra), oltre alla propria chiamata. I tempi
+            # sono quelli misurati calcolatore per calcolatore. La metrica di
+            # qualita' NON entra: sul telefono non c'e' una risposta di
+            # riferimento con cui confrontarsi.
             full = seconds + sum(stat_timing_dict.get(c, 0.0) for c in closure)
+            phases = sorted({PHASE_OF_CALCULATOR.get(c, "non_classificato") for c in closure}
+                            | ({own_phase[est_str]} if own_phase.get(est_str) else set()))
             timing_rows.append({
                 "model": model_name,
                 "dataset": dataset_name,
                 "estimator": est_str,
                 "paper_label": paper_label_by_str.get(est_str, est_str),
-                # Costo marginale: solo l'aritmetica dello stimatore su
+                # Costo marginale: solo la chiamata dello stimatore su
                 # statistiche gia' pronte (utile a chi ne calcola molti insieme).
                 "seconds": seconds,
                 "seconds_marginal_per_instance": seconds / n_inst,
                 # Costo pieno: quello che conta per la scelta on-device.
                 "seconds_full_standalone": full,
                 "seconds_full_per_instance": full / n_inst,
-                "needs_sampling": "SamplingGenerationCalculator" in closure,
+                "needs_sampling": bool(closure & _SAMPLING_CALCULATORS) or bool(own_phase.get(est_str)),
                 "needs_nli": bool(closure & _NLI_CALCULATORS),
                 "needs_cross_encoder": bool(closure & _CROSS_ENCODER_CALCULATORS),
                 "needs_extra_forward": bool(closure & _EXTRA_FORWARD_CALCULATORS),
                 "calculators": ";".join(sorted(closure)),
+                "phases": ";".join(phases),
                 "peak_memory_gb": peak_mem_gb,
                 "n_instances": n_inst,
             })
         timing_df = pd.DataFrame(timing_rows)
+        # Tempi per fase della cella (somma su tutti i calcolatori), anche
+        # nel CSV dei tempi: una riga per fase con estimator = "__fase__:<nome>".
+        for phase, seconds in phase_seconds.items():
+            timing_df = pd.concat([timing_df, pd.DataFrame([{
+                "model": model_name, "dataset": dataset_name,
+                "estimator": f"__fase__:{phase}", "paper_label": f"__fase__:{phase}",
+                "seconds": seconds, "seconds_marginal_per_instance": seconds / n_inst,
+                "seconds_full_standalone": seconds, "seconds_full_per_instance": seconds / n_inst,
+                "peak_memory_gb": peak_mem_gb, "n_instances": n_inst,
+            }])], ignore_index=True)
 
         for phase, seconds in sorted(phase_seconds.items(), key=lambda kv: -kv[1]):
-            print(f"  [fase] {phase}: {seconds:.1f}s totali "
+            print(f"  [fase {label}] {phase}: {seconds:.1f}s totali "
                   f"({seconds / n_inst:.3f}s per istanza)")
+
+        record_run_conditions(args.results_dir, {
+            "section": section_tag, "model": model_name, "dataset": dataset_name,
+            "instance_offset": instance_offset, "n_instances": len(examples),
+            "weights_model": weights_name,
+            "precision": "4-bit nf4" if is_quantized else "bf16",
+            "attention": getattr(model.model.config, "_attn_implementation", "?"),
+            "prompt_format": "chat_template" if use_chat_template else "plain",
+            "bos_in_prompt_stripped": bool(use_chat_template and tokenizer_adds_bos(model.tokenizer)),
+            "max_new_tokens": max_new_tokens, "stop_strings": json.dumps(stop_strings),
+            "generation_batch": gen_bs, "nli_batch": nli_bs, "sampler": SAMPLER,
+            "quality_metric": str(generation_metric),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            **{f"version_{k}": v for k, v in _library_versions().items()},
+        })
         del man
     except Exception:
-        print(f"!!! {model_name}/{dataset_name} fallito, salto alla prossima combinazione.")
+        print(f"!!! {label} fallito, salto alla prossima combinazione.")
         traceback.print_exc()
         df, timing_df, stats_df, per_instance_df = None, None, None, None
     finally:
         gc.collect()
         torch.cuda.empty_cache()
-        print(f"Tempo {model_name}/{dataset_name}: {time.time() - ds_start:.1f}s")
+        print(f"Tempo {label}: {time.time() - ds_start:.1f}s")
     return df, timing_df, stats_df, per_instance_df
 
 
@@ -1124,7 +1315,8 @@ def _merge_timing(timing_all, model_name, dataset_name):
         needs_nli=("needs_nli", "first"),
         peak_memory_gb=("peak_memory_gb", "max"),
         n_instances=("n_instances", "sum"),
-        **{c: (c, "first") for c in ("needs_cross_encoder", "needs_extra_forward", "calculators")
+        **{c: (c, "first") for c in ("needs_cross_encoder", "needs_extra_forward", "calculators",
+                                     "phases")
            if c in timing_all.columns},
     )
     n = agg["n_instances"].clip(lower=1)
@@ -1135,9 +1327,58 @@ def _merge_timing(timing_all, model_name, dataset_name):
     cols = ["model", "dataset", "estimator", "paper_label", "seconds",
             "seconds_marginal_per_instance", "seconds_full_standalone",
             "seconds_full_per_instance", "needs_sampling", "needs_nli",
-            "needs_cross_encoder", "needs_extra_forward", "calculators",
+            "needs_cross_encoder", "needs_extra_forward", "calculators", "phases",
             "peak_memory_gb", "n_instances"]
     return agg[[c for c in cols if c in agg.columns]]
+
+
+def _move_aside(results_dir, path):
+    """Sposta un file o una cartella di risultati superati in
+    results_dir/_superati/<data-ora>/, mantenendo il percorso relativo. Non
+    cancella niente: i risultati vecchi restano consultabili."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    rel = os.path.relpath(path, results_dir)
+    dest = os.path.join(results_dir, "_superati", stamp, rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    k = 1
+    while os.path.exists(dest):
+        dest = f"{os.path.join(results_dir, '_superati', stamp, rel)}.{k}"
+        k += 1
+    shutil.move(path, dest)
+    return os.path.relpath(dest, results_dir)
+
+
+def prepare_chunk_dir(args, chunk_dir):
+    """Crea la cartella dei blocchi di una cella e la marca con l'impronta del
+    run. I blocchi gia' presenti vengono ripresi solo se l'impronta coincide:
+    senza questo controllo, i blocchi lasciati da una versione precedente del
+    codice (con gli stessi nomi di cartella) venivano ripresi come validi. Con
+    --force_resume l'utente dichiara che la modifica non tocca generazioni e
+    metriche, e i blocchi vengono tenuti."""
+    stamp_path = os.path.join(chunk_dir, "run_fingerprint.txt")
+    current_fp = getattr(args, "run_fingerprint", None)
+    if current_fp and os.path.isdir(chunk_dir) and os.listdir(chunk_dir):
+        saved_fp = None
+        if os.path.exists(stamp_path):
+            with open(stamp_path) as f:
+                saved_fp = f.read().strip()
+        if saved_fp != current_fp and not getattr(args, "force_resume", False):
+            dest = _move_aside(args.results_dir, chunk_dir)
+            print(f"  blocchi in {os.path.basename(chunk_dir)} prodotti da un'altra versione del codice "
+                  f"(impronta {saved_fp or 'assente'}), spostati in {dest}: la cella riparte da zero.")
+    os.makedirs(chunk_dir, exist_ok=True)
+    if current_fp:
+        with open(stamp_path, "w") as f:
+            f.write(current_fp + "\n")
+
+
+def quant_variants(model_name):
+    """Le due serie del confronto quantizzazione. L'etichetta contiene il nome
+    del modello: la ripresa, le cartelle dei blocchi e le figure sono
+    indicizzate da essa, e prima (solo "quantized (4-bit nf4)" / "full
+    precision (bf16)") un rilancio con un altro --quant_compare_model nella
+    stessa cartella riusava in silenzio le celle del modello precedente."""
+    return [(f"{model_name} 4-bit nf4", True), (f"{model_name} bf16", False)]
 
 
 def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg, args,
@@ -1148,13 +1389,13 @@ def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg
     n = len(examples)
     if chunk_size <= 0 or n <= chunk_size:
         return run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args,
-                                    paper_label_by_str, **kwargs)
+                                    paper_label_by_str, section_tag=section_tag, **kwargs)
 
     chunk_dir = os.path.join(args.results_dir, "chunks", _safe_name(section_tag),
                              f"{_safe_name(model_name)}__{_safe_name(dataset_name)}__n{n}_c{chunk_size}")
     if getattr(args, "no_resume", False) and os.path.isdir(chunk_dir):
         shutil.rmtree(chunk_dir)
-    os.makedirs(chunk_dir, exist_ok=True)
+    prepare_chunk_dir(args, chunk_dir)
 
     # Il bootstrap dei singoli blocchi non serve (viene rifatto sull'insieme):
     # se ne fa uno minimo per non sprecare tempo.
@@ -1185,7 +1426,10 @@ def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg
         print(f"  blocco {ci + 1}/{n_chunks} (istanze {lo}-{hi - 1})")
         part = _part_from_result(
             run_model_on_dataset(model, model_name, dataset_name, examples[lo:hi], cfg,
-                                 chunk_args, paper_label_by_str, **kwargs),
+                                 chunk_args, paper_label_by_str, section_tag=section_tag,
+                                 instance_offset=lo,
+                                 log_label=f"{model_name}/{dataset_name} blocco {ci + 1}/{n_chunks}",
+                                 **kwargs),
             hi - lo)
         skipped_here = []
         if part is None:
@@ -1195,7 +1439,10 @@ def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg
             for k in range(lo, hi):
                 sub = _part_from_result(
                     run_model_on_dataset(model, model_name, dataset_name, examples[k:k + 1],
-                                         cfg, chunk_args, paper_label_by_str, **kwargs),
+                                         cfg, chunk_args, paper_label_by_str,
+                                         section_tag=section_tag, instance_offset=k,
+                                         log_label=f"{model_name}/{dataset_name} istanza {k}",
+                                         **kwargs),
                     1)
                 if sub is None:
                     skipped_here.append(k)
@@ -1222,12 +1469,13 @@ def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg
     per_inst = pd.concat([p["per_instance"] for p in parts], ignore_index=True)
     common = set.intersection(*[set(p["per_instance"].columns) for p in parts])
     est_cols = [c for c in per_inst.columns
-                if c not in ("model", "dataset", "quality") and c in common]
-    dropped = [c for c in per_inst.columns if c not in ("model", "dataset", "quality") and c not in common]
+                if c not in PER_INSTANCE_META_COLUMNS and c in common]
+    dropped = [c for c in per_inst.columns if c not in PER_INSTANCE_META_COLUMNS and c not in common]
     if dropped:
         print(f"ATTENZIONE {model_name}/{dataset_name}: stimatori assenti in qualche blocco, "
               f"esclusi dalla cella: {dropped}")
-    per_inst = per_inst[["model", "dataset", "quality"] + est_cols]
+    meta_cols = [c for c in PER_INSTANCE_META_COLUMNS if c in common]
+    per_inst = per_inst[meta_cols + est_cols]
     quality = per_inst["quality"].to_numpy(dtype=float)
     scores = {c: per_inst[c].to_numpy(dtype=float) for c in est_cols}
     meta = pd.concat([p["meta"] for p in parts], ignore_index=True)
@@ -1238,34 +1486,34 @@ def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg
         args.max_rejection, args.n_bootstrap, SEED)
     if stats_df is None:
         return None, None, None, None
+    # Indice dell'istanza e testo generato, dai blocchi.
+    for pos, c in ((2, "instance_index"), (4, "greedy_text")):
+        if c in per_inst.columns and c not in per_instance_df.columns:
+            per_instance_df.insert(min(pos, per_instance_df.shape[1]), c, per_inst[c].to_numpy())
     n_done = meta["n_instances"].sum()
     pf = meta["parse_failure_sum"]
     stats_df["answer_parse_failure_rate"] = (pf.sum() / n_done) if pf.notna().any() else np.nan
     stats_df["n_skipped_instances"] = skipped_total
 
     prr_df_template = parts[0]["prr"].copy()
-    # Stessi valori che UEManager.eval_ue() scriverebbe in man.metrics su
-    # tutta la cella: il PRR e la sua versione normalizzata fra punteggio
-    # casuale e oracolo ("prr_0.5_normalized").
-    ue_metric = PredictionRejectionArea(max_rejection=args.max_rejection)
-    q_valid = quality[~np.isnan(quality)]
-    if len(q_valid) > 0:
-        oracle_score = ue_metric(-q_valid, q_valid)
-        random_score = get_random_scores(ue_metric, q_valid)
-    else:
-        oracle_score = random_score = np.nan
-    prr_by_est = {e: _prr_from_arrays(ue_metric, v, quality) for e, v in scores.items()}
+    # Gli stessi due valori che UEManager.eval_ue() scriverebbe in man.metrics
+    # su tutta la cella -- l'area ("prr_0.5") e il PRR del paper
+    # ("prr_0.5_normalized") -- ricalcolati sulle istanze riunite, con i
+    # pareggi in valore atteso (vedi analysis_lib).
+    raw_name = str(PredictionRejectionArea(max_rejection=args.max_rejection))
     values = []
     for e, um in zip(prr_df_template["estimator"], prr_df_template["ue_metric"]):
-        if e not in prr_by_est:
+        if e not in scores:
             values.append(np.nan)
-        elif um == str(ue_metric):
-            values.append(prr_by_est[e])
-        elif um == str(ue_metric) + "_normalized":
-            values.append(normalize_metric(prr_by_est[e], oracle_score, random_score))
+        elif um == raw_name:
+            values.append(AL.prr_raw(scores[e], quality, args.max_rejection))
+        elif um == raw_name + "_normalized":
+            values.append(AL.prr_normalized(scores[e], quality, args.max_rejection))
         else:
             values.append(np.nan)
     prr_df = prr_df_template
+    if "value_lmpolygraph" in prr_df.columns:
+        prr_df["value_lmpolygraph"] = np.nan  # valore di un solo blocco: non ha senso sulla cella
     prr_df["model"] = model_name
     prr_df["dataset"] = dataset_name
     prr_df["value"] = values
@@ -1356,7 +1604,8 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
         try:
             model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
                                         use_quantization=uses_quantization(model_name),
-                                        attn_implementation=attn_implementation_for(model_name))
+                                        attn_implementation=attn_implementation_for(
+                                            model_name, model_id, args.cache_dir, hf_token))
         except Exception:
             print(f"!!! Caricamento di {model_name} fallito, salto i suoi dataset.")
             traceback.print_exc()
@@ -1395,7 +1644,7 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
         return None, None
 
     combined = pd.concat(metrics_dfs, ignore_index=True)
-    raw_df = (combined[combined["ue_metric"] == "prr_0.5"].copy()
+    raw_df = (combined[combined["ue_metric"] == prr_metric_name(args.max_rejection)].copy()
               if "ue_metric" in combined.columns else combined.copy())
     raw_df["paper_label"] = raw_df["estimator"].map(paper_label_by_str).fillna(raw_df["estimator"])
 
@@ -1404,8 +1653,7 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
         # Porta gli intervalli di confidenza accanto ai valori PRR, cosi' che
         # le funzioni di plotting possano disegnare le barre d'errore.
         raw_df = raw_df.merge(
-            stats_all[["model", "dataset", "estimator", "prr_ci_low", "prr_ci_high",
-                       "mean_quality", "quality_metric", "nan_rate", "silent_failure_rate"]],
+            stats_all[[c for c in MAPPED_STATS_COLUMNS if c in stats_all.columns]],
             on=["model", "dataset", "estimator"], how="left",
         )
     raw_df.to_csv(os.path.join(args.results_dir, f"{results_basename}_mapped.csv"), index=False)
@@ -1425,9 +1673,10 @@ def build_accuracy_table(stats_df, results_dir, filename="accuracy_table.csv"):
     modello sta tirando a indovinare e nessun segnale interno puo' predire
     l'esito, quindi il PRR crolla per TUTTI i metodi insieme e un valore basso
     non dice nulla sulla qualita' del metodo; con accuracy vicina al 100% ci
-    sono pochissimi errori da trovare e la stima e' dominata dal rumore. Senza
-    questa tabella accanto, un confronto di PRR tra modelli con accuracy molto
-    diverse confronta misure prese in regimi diversi."""
+    sono pochissimi errori da trovare e la stima e' rumorosa (intervalli di
+    confidenza larghi). Il PRR del paper non dipende meccanicamente
+    dall'accuracy come l'area grezza usata fino al 29/09, ma va comunque letto
+    accanto a questa tabella."""
     if stats_df is None or stats_df.empty:
         return None
     table = stats_df.pivot_table(index="model", columns="dataset",
@@ -1441,55 +1690,84 @@ def build_accuracy_table(stats_df, results_dir, filename="accuracy_table.csv"):
     return table
 
 
-def compute_rank_transfer(stats_df, results_dir, anchor=REPLICATION_ANCHOR_MODEL):
-    """Kendall tau tra il ranking dei metodi UQ del modello-ancora a 7B e
-    quello di ogni altro modello, piu' la figura tau vs numero di parametri.
+def compute_rank_transfer(stats_df, results_dir, per_instance_df=None,
+                          anchor=REPLICATION_ANCHOR_MODEL, max_rejection=0.5, n_resamples=200):
+    """Kendall tau fra la classifica dei metodi UQ del modello-ancora a 7B e
+    quella di ogni altro modello, DATASET PER DATASET, con intervallo bootstrap
+    appaiato sulle domande (vedi analysis_lib.kendall_tau_with_ci per il
+    perche' non si usa piu' il p-value di scipy ne' la media fra dataset).
 
     Risponde alla domanda "le conclusioni del benchmark, costruite su modelli
     da 7-12B, sopravvivono scendendo a 0.35-4B?". Tau vale 1 se i due ranking
-    coincidono, 0 se sono scorrelati, -1 se sono invertiti: un tau che cala al
-    calare della scala significa che la classifica dei metodi non trasferisce,
-    ed e' esattamente il risultato che giustifica un benchmark dedicato ai
-    modelli piccoli."""
+    coincidono, 0 se sono scorrelati, -1 se sono invertiti."""
     if stats_df is None or stats_df.empty:
         return None
     if anchor not in stats_df["model"].unique():
         print(f"!!! Modello-ancora {anchor} assente dai risultati, salto Kendall tau.")
         return None
 
-    # Media del PRR su tutti i dataset: un solo ranking per modello.
-    agg = stats_df.groupby(["model", "paper_label"], as_index=False)["prr"].mean()
-    pivot = agg.pivot_table(index="paper_label", columns="model", values="prr")
-    if anchor not in pivot.columns:
-        return None
-
     rows = []
-    for model_name in pivot.columns:
-        if model_name == anchor:
+    for dataset_name, st_d in stats_df.groupby("dataset"):
+        piv = st_d.pivot_table(index="estimator", columns="model", values="prr", aggfunc="first")
+        if anchor not in piv.columns:
             continue
-        pair = pivot[[anchor, model_name]].dropna()
-        if len(pair) < 3:
-            print(f"Solo {len(pair)} metodi in comune tra {anchor} e {model_name}, salto.")
-            continue
-        tau, p_value = kendalltau(pair[anchor].rank(ascending=False),
-                                  pair[model_name].rank(ascending=False))
-        rows.append({
-            "model": model_name,
-            "params_B": MODEL_PARAMS_B.get(model_name, np.nan),
-            "kendall_tau_vs_anchor": tau,
-            "p_value": p_value,
-            "n_methods_compared": len(pair),
-        })
+        for model_name in piv.columns:
+            if model_name == anchor:
+                continue
+            pair = piv[[anchor, model_name]].dropna()
+            if len(pair) < 3:
+                continue
+            methods = list(pair.index)
+            # Stima puntuale dalle celle intere; se ci sono i punteggi
+            # per-istanza viene sostituita da quella sulle sole domande comuni
+            # ai due modelli, cioe' le stesse su cui e' calcolato l'intervallo
+            # (altrimenti stima e intervallo verrebbero da insiemi diversi).
+            tau = AL._kendall(pair[anchor].to_numpy(), pair[model_name].to_numpy())
+            lo = hi = np.nan
+            n_inst = np.nan
+            if per_instance_df is not None:
+                ca = per_instance_df[(per_instance_df["model"] == anchor)
+                                     & (per_instance_df["dataset"] == dataset_name)]
+                cb = per_instance_df[(per_instance_df["model"] == model_name)
+                                     & (per_instance_df["dataset"] == dataset_name)]
+                if (len(ca) and len(cb) and all(m in ca.columns and m in cb.columns for m in methods)):
+                    tau_paired, lo, hi, n_inst = AL.kendall_tau_with_ci(
+                        ca, cb, methods, max_rejection, n_resamples, SEED)
+                    if np.isfinite(tau_paired):
+                        tau = tau_paired
+            rows.append({
+                "model": model_name,
+                "dataset": dataset_name,
+                "params_B": MODEL_PARAMS_B.get(model_name, np.nan),
+                "kendall_tau_vs_anchor": tau,
+                "tau_ci_low": lo,
+                "tau_ci_high": hi,
+                "n_methods_compared": len(pair),
+                "n_instances_paired": n_inst,
+            })
 
     if not rows:
         return None
-    tau_df = pd.DataFrame(rows).sort_values("params_B")
+    tau_df = pd.DataFrame(rows).sort_values(["params_B", "model", "dataset"])
     path = os.path.join(results_dir, "rank_transfer_kendall_tau.csv")
     tau_df.to_csv(path, index=False)
     print(f"Salvato: {path}")
     print(tau_df.round(3).to_string(index=False))
-
     return tau_df
+
+
+# Modello scelto per il confronto quantizzato vs non-quantizzato (vedi
+# --run_quant_comparison in main()). MedGemma-4B-it e Gemma3-4B-it sono
+# esclusi a priori: producono logit NaN sotto bitsandbytes 4-bit (vedi
+# CANNOT_QUANTIZE_MODELS), quindi un confronto quantizzato/non-quantizzato su
+# di loro non e' fattibile. Tra i modelli rimasti scegliamo LFM2-1.2B: la
+# quantizzazione comprime maggiormente un modello con piu' parametri, quindi un
+# eventuale effetto sulla qualita' delle stime di incertezza e' piu'
+# probabilmente misurabile rispetto al modello da 350M. Con
+# --quant_compare_model Mistral-7B-it si confronta invece l'ancora.
+# (Questa costante era stata cancellata per errore nel commit f447892 insieme
+# al codice delle figure: main.py in quella versione non partiva.)
+QUANT_COMPARE_MODEL_DEFAULT = "LFM2-1.2B"
 
 
 def build_verbalized_estimators(style):
@@ -1528,6 +1806,11 @@ def build_verbalized_estimators(style):
 # checkpoint, e dire a voce alta cosa viene saltato e da dove viene.
 # ---------------------------------------------------------------------------
 RESULTS_REQUIRED_COLUMNS = {"model", "dataset", "estimator", "ue_metric", "value"}
+# Colonne delle statistiche per-istanza portate accanto ai valori PRR nei file
+# *_mapped.csv (che make_figures.py legge).
+MAPPED_STATS_COLUMNS = ["model", "dataset", "estimator", "prr_ci_low", "prr_ci_high", "prr_raw",
+                        "mean_quality", "quality_metric", "nan_rate", "distinct_fraction",
+                        "error_rate_top10", "error_rate_overall", "silent_failure_rate"]
 TIMINGS_REQUIRED_COLUMNS = {
     "model", "dataset", "estimator", "paper_label", "seconds",
     "seconds_marginal_per_instance", "seconds_full_per_instance",
@@ -1538,10 +1821,99 @@ TIMINGS_REQUIRED_COLUMNS = {
 # confidenza e Kendall tau calcolati sui soli modelli rieseguiti.
 STATS_REQUIRED_COLUMNS = {
     "model", "dataset", "estimator", "paper_label", "prr",
-    "prr_ci_low", "prr_ci_high", "quality_metric", "mean_quality",
-    "n_instances", "nan_rate", "silent_failure_rate",
+    "prr_ci_low", "prr_ci_high", "prr_raw", "quality_metric", "mean_quality",
+    "n_instances", "nan_rate", "distinct_fraction", "error_rate_top10",
+    "error_rate_overall", "silent_failure_rate",
 }
 PER_INSTANCE_REQUIRED_COLUMNS = {"model", "dataset", "quality"}
+
+
+# Impronta del codice e delle impostazioni che determinano generazioni e
+# metriche. Viene scritta in results_dir/run_fingerprint.json al primo lancio;
+# una ripresa con un'impronta diversa viene RIFIUTATA (salvo --force_resume):
+# prima un rilancio senza --no_resume dopo una modifica al codice mescolava in
+# silenzio celle vecchie e nuove nello stesso file (il codice avvertiva solo a
+# stampa, e i blocchi in chunks/ venivano ripresi senza alcun controllo).
+FINGERPRINT_FILES = ("main.py", "dataset_prep.py", "batched_sampling.py", "analysis_lib.py")
+
+
+def compute_run_fingerprint(args):
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = {}
+    for name in FINGERPRINT_FILES:
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                files[name] = hashlib.sha256(f.read()).hexdigest()[:16]
+    settings = {
+        "max_rejection": args.max_rejection,
+        "n_test_samples": args.n_test_samples,
+        "sampler": args.sampler,
+        "anchor_precision": args.anchor_precision,
+        "verbalized_max_new_tokens": args.verbalized_max_new_tokens,
+    }
+    digest = hashlib.sha256(json.dumps({"files": files, "settings": settings},
+                                       sort_keys=True).encode()).hexdigest()[:16]
+    return {"fingerprint": digest, "files": files, "settings": settings}
+
+
+def check_run_fingerprint(args):
+    """Confronta l'impronta attuale con quella salvata. Esce con errore se la
+    ripresa mescolerebbe versioni diverse."""
+    path = os.path.join(args.results_dir, "run_fingerprint.json")
+    current = compute_run_fingerprint(args)
+    os.makedirs(args.results_dir, exist_ok=True)
+    # Qualunque risultato di qualunque sezione (non solo la pipeline principale:
+    # prima un cartella con solo la griglia clinica o il verbalized contava come
+    # vuota e l'impronta veniva riscritta senza controllo).
+    existing = [e for e in os.listdir(args.results_dir)
+                if e == "chunks" or (e.endswith(".csv") and not e.startswith("."))]
+    has_results = bool(existing)
+    if args.no_resume and has_results:
+        # anche le figure: altrimenti quelle delle sezioni non rilanciate
+        # resterebbero accanto ai CSV nuovi senza piu' i dati da cui vengono
+        existing += [e for e in os.listdir(args.results_dir)
+                     if e.endswith((".png", ".md")) and not e.startswith(".")]
+    if args.no_resume and has_results:
+        # --no_resume = si riparte da zero in TUTTE le sezioni. I risultati
+        # presenti vengono spostati da parte subito, non quando il run
+        # raggiunge la loro cella: prima un run --no_resume interrotto (o
+        # limitato con --models) riscriveva l'impronta, e il rilancio
+        # successivo riprendeva come validi i checkpoint vecchi delle celle e
+        # delle sezioni che quel run non aveva toccato.
+        moved = [_move_aside(args.results_dir, os.path.join(args.results_dir, e))
+                 for e in sorted(existing)]
+        print(f"--no_resume: {len(moved)} file/cartelle di risultati precedenti spostati in "
+              f"{os.path.dirname(moved[0])}/ (non cancellati).")
+    if args.no_resume or not has_results:
+        with open(path, "w") as f:
+            json.dump(current, f, indent=2)
+        return current
+    saved = None
+    if os.path.exists(path):
+        with open(path) as f:
+            saved = json.load(f)
+    if saved is not None and saved.get("fingerprint") == current["fingerprint"]:
+        print(f"Impronta del run invariata ({current['fingerprint']}): ripresa sicura.")
+        return current
+    if saved is None:
+        motivo = ("la cartella contiene risultati di una versione del codice precedente "
+                  "all'impronta (prima del 29/09)")
+    else:
+        diff_files = sorted(k for k in set(saved.get("files", {})) | set(current["files"])
+                            if saved.get("files", {}).get(k) != current["files"].get(k))
+        diff_set = sorted(k for k in current["settings"]
+                          if saved.get("settings", {}).get(k) != current["settings"][k])
+        motivo = f"file cambiati: {diff_files or '-'}; impostazioni cambiate: {diff_set or '-'}"
+    if args.force_resume:
+        print(f"ATTENZIONE --force_resume: riprendo nonostante {motivo}.")
+        with open(path, "w") as f:
+            json.dump(current, f, indent=2)
+        return current
+    raise SystemExit(
+        f"!!! Ripresa rifiutata in {args.results_dir}: {motivo}. Riprendere mescolerebbe risultati "
+        f"di due versioni nelle stesse figure. Usa una --results_dir nuova, oppure --no_resume "
+        f"(ricalcola tutto), oppure --force_resume se la modifica non tocca generazioni e metriche.")
 
 
 def load_checkpoint_csv(path, required_columns, label):
@@ -1636,9 +2008,28 @@ def main():
                          help="Modello su cui eseguire --run_quant_comparison (default: %(default)s). "
                               "MedGemma-4B-it/Gemma3-4B-it non sono utilizzabili: producono NaN sotto "
                               "quantizzazione 4-bit (vedi NO_QUANT_MODELS).")
+    parser.add_argument("--anchor_precision", choices=["bf16", "4bit"], default="bf16",
+                         help="Precisione dell'ancora Mistral-7B nella pipeline principale e nelle "
+                              "sezioni extra (default: %(default)s, come nel paper). '4bit' riproduce "
+                              "le run fino al 29/09.")
+    parser.add_argument("--sampler", choices=["batched", "library"], default="batched",
+                         help="Generatore dei K campioni: 'batched' (batched_sampling.py, una chiamata "
+                              "per tutti i campioni, memoria costante) o 'library' "
+                              "(SamplingGenerationCalculator di lm-polygraph, per confronto). "
+                              "Default: %(default)s.")
+    parser.add_argument("--force_resume", action="store_true",
+                         help="Riprende dai checkpoint anche se l'impronta del codice e delle "
+                              "impostazioni e' cambiata (vedi run_fingerprint.json). Da usare solo "
+                              "se la modifica non tocca generazioni ne' metriche (es. un commento).")
     args = parser.parse_args()
 
+    global SAMPLER
+    SAMPLER = args.sampler
+    set_anchor_precision(args.anchor_precision)
+
     print_banner()
+    print(f"Ancora {REPLICATION_ANCHOR_MODEL}: {ANCHOR_PRECISION}. Campionatore: {SAMPLER}. "
+          f"Modelli in bf16: {sorted(NO_QUANT_MODELS)}.")
 
     # Controlli che devono fallire SUBITO se qualcosa non va, invece di
     # produrre celle vuote dopo ore di GPU.
@@ -1665,6 +2056,9 @@ def main():
     os.makedirs(args.results_dir, exist_ok=True)
     os.makedirs(args.cache_dir, exist_ok=True)
     os.makedirs(args.datasets_cache_dir, exist_ok=True)
+    fp = check_run_fingerprint(args)
+    args.run_fingerprint = fp["fingerprint"]
+    print(f"Impronta del run: {fp['fingerprint']} (salvata in run_fingerprint.json)")
 
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -1775,7 +2169,8 @@ def main():
         try:
             model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
                                          use_quantization=uses_quantization(model_name),
-                                         attn_implementation=attn_implementation_for(model_name))
+                                         attn_implementation=attn_implementation_for(
+                                            model_name, model_id, args.cache_dir, hf_token))
             log_gpu_mem(f"{model_name} loaded")
         except Exception:
             print(f"!!! Caricamento di {model_name} fallito, salto tutti i suoi dataset.")
@@ -1851,13 +2246,13 @@ def main():
             os.path.join(args.results_dir, "per_instance_scores.csv"), index=False
         )
 
-    raw_df = results_df[results_df["ue_metric"] == "prr_0.5"].copy() if "ue_metric" in results_df.columns else results_df.copy()
+    raw_df = (results_df[results_df["ue_metric"] == prr_metric_name(args.max_rejection)].copy()
+              if "ue_metric" in results_df.columns else results_df.copy())
     raw_df["paper_label"] = raw_df["estimator"].map(paper_label_by_str).fillna(raw_df["estimator"])
 
     if stats_all is not None:
         raw_df = raw_df.merge(
-            stats_all[["model", "dataset", "estimator", "prr_ci_low", "prr_ci_high",
-                       "mean_quality", "quality_metric", "silent_failure_rate"]],
+            stats_all[[c for c in MAPPED_STATS_COLUMNS if c in stats_all.columns]],
             on=["model", "dataset", "estimator"], how="left",
         )
 
@@ -1900,7 +2295,13 @@ def main():
             stats_labeled["estimator"].map(paper_label_by_str).fillna(stats_labeled["estimator"])
         )
         try:
-            compute_rank_transfer(stats_labeled, args.results_dir)
+            per_inst_all = (pd.concat(all_per_instance_dfs, ignore_index=True)
+                            if all_per_instance_dfs else None)
+            if per_inst_all is not None and "instance_index" in per_inst_all.columns:
+                per_inst_all = per_inst_all.drop_duplicates(
+                    subset=["model", "dataset", "instance_index"], keep="last")
+            compute_rank_transfer(stats_labeled, args.results_dir, per_inst_all,
+                                  max_rejection=args.max_rejection)
         except Exception:
             print("!!! calcolo Kendall tau fallito:")
             traceback.print_exc()
@@ -1942,6 +2343,19 @@ def main():
                 subset=["model", "dataset", "estimator"], keep="last"
             )
             timing_all.to_csv(os.path.join(args.results_dir, "estimator_timings.csv"), index=False)
+            # Righe "__fase__:<nome>": tempo totale di ogni fase per cella
+            # (generazione greedy, campionamento, NLI, cross-encoder, metrica
+            # di qualita', ...). Vanno in un file a parte; le tabelle per
+            # metodo le escludono.
+            is_phase = timing_all["estimator"].astype(str).str.startswith("__fase__:")
+            phases = timing_all[is_phase].copy()
+            if not phases.empty:
+                phases["phase"] = phases["estimator"].str.replace("__fase__:", "", regex=False)
+                phases[["model", "dataset", "phase", "seconds", "seconds_marginal_per_instance",
+                        "n_instances"]].rename(
+                    columns={"seconds_marginal_per_instance": "seconds_per_instance"}).to_csv(
+                    os.path.join(args.results_dir, "phase_timings.csv"), index=False)
+            timing_all = timing_all[~is_phase]
 
             # Tabella 1 -- costo marginale (aritmetica sola), il numero utile a
             # chi calcola molte tecniche insieme sulla stessa generazione.
@@ -1998,17 +2412,21 @@ def main():
                 build_accuracy_table(
                     severity_stats, args.results_dir, "accuracy_table_severity_grid.csv"
                 )
-                # Silent failure rate: quanti degli errori finiscono nel decile
-                # piu' confidente. E' il numero che conta davvero in clinica e
-                # che il PRR medio non mostra.
-                if severity_stats is not None:
-                    sfr = severity_stats.pivot_table(
+                # Si salva la metrica nuova (error rate fra le risposte piu'
+                # confidenti, accanto a quello complessivo); il vecchio silent
+                # failure rate ha un tetto e non distingue nulla quando gli
+                # errori sono molti (vedi analysis_lib.error_rate_most_confident).
+                if severity_stats is not None and "error_rate_top10" in severity_stats.columns:
+                    err = severity_stats.pivot_table(
                         index="paper_label", columns=["dataset", "model"],
-                        values="silent_failure_rate", aggfunc="first",
+                        values="error_rate_top10", aggfunc="first",
                     )
-                    sfr_path = os.path.join(args.results_dir, "silent_failure_rate.csv")
-                    sfr.to_csv(sfr_path)
-                    print(f"Salvato: {sfr_path}")
+                    overall = (severity_stats.groupby(["dataset", "model"])["error_rate_overall"]
+                               .first())
+                    err.loc["(error rate complessivo)"] = [overall.get(c, np.nan) for c in err.columns]
+                    err_path = os.path.join(args.results_dir, "error_rate_most_confident.csv")
+                    err.to_csv(err_path)
+                    print(f"Salvato: {err_path}")
                 print("Griglia severita' completata.")
         except Exception:
             print("!!! Griglia severita' fallita:")
@@ -2091,9 +2509,12 @@ def main():
     if args.run_quant_comparison:
         quant_model_name = args.quant_compare_model
         print(f"\n--- Confronto extra: quantizzato vs non-quantizzato ({quant_model_name}) ---")
-        if quant_model_name in CHAT_TEMPLATE_MODELS:
-            print(f"!!! {quant_model_name} produce NaN sotto quantizzazione 4-bit (vedi CHAT_TEMPLATE_MODELS), "
-                  "confronto non eseguibile su questo modello -- salto.")
+        # BUG CORRETTO il 29/09: il controllo guardava CHAT_TEMPLATE_MODELS
+        # (che include anche Mistral) invece dei modelli che non tollerano la
+        # quantizzazione, e cosi' impediva il confronto proprio sull'ancora.
+        if quant_model_name in CANNOT_QUANTIZE_MODELS:
+            print(f"!!! {quant_model_name} produce NaN sotto quantizzazione 4-bit (vedi "
+                  "CANNOT_QUANTIZE_MODELS), confronto non eseguibile su questo modello -- salto.")
         else:
             try:
                 model_id = MODELS[quant_model_name]
@@ -2127,7 +2548,7 @@ def main():
                             except Exception as e:
                                 print(f"{os.path.basename(_path)} illeggibile ({e}).")
 
-                variants = [("quantized (4-bit nf4)", True), ("full precision (bf16)", False)]
+                variants = quant_variants(quant_model_name)
                 for variant_label, use_quant in variants:
                     pending = [d for d in dataset_examples if (d, variant_label) not in quant_already_done]
                     if not pending:
@@ -2135,7 +2556,8 @@ def main():
                     try:
                         model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
                                                     use_quantization=use_quant,
-                                                    attn_implementation=attn_implementation_for(quant_model_name))
+                                                    attn_implementation=attn_implementation_for(
+                                                        quant_model_name, model_id, args.cache_dir, hf_token))
                     except Exception:
                         print(f"!!! Caricamento di {quant_model_name} ({variant_label}) fallito, salto questa variante.")
                         traceback.print_exc()
@@ -2176,7 +2598,7 @@ def main():
                 if quant_metrics_dfs:
                     quant_df = pd.concat(quant_metrics_dfs, ignore_index=True)
                     quant_raw = (
-                        quant_df[quant_df["ue_metric"] == "prr_0.5"].copy()
+                        quant_df[quant_df["ue_metric"] == prr_metric_name(args.max_rejection)].copy()
                         if "ue_metric" in quant_df.columns else quant_df.copy()
                     )
                     quant_raw["paper_label"] = quant_raw["estimator"].map(paper_label_by_str).fillna(quant_raw["estimator"])

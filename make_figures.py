@@ -5,14 +5,8 @@ richiedono un job GPU da ore per essere rigenerate, anche quando si vuole solo
 cambiare un asse o aggiungere un pannello. Questo legge i CSV e disegna in
 pochi secondi, quante volte serve.
 
-Figure prodotte (le sole per cui esistono i dati necessari):
-  fig_accuracy.png              accuracy per modello e dataset, con la soglia
-                                del caso sui task a scelta multipla
-  fig_accuracy_vs_prr.png       la relazione che conta davvero: il PRR e'
-                                interpretabile solo a certe accuracy
-  fig_anchor_replication.png    Mistral-7B contro i valori attesi dal paper
-  fig_ties_vs_scale.png         quanti metodi restano indistinguibili dal
-                                migliore, al variare della scala
+Tutti i PRR sono quelli del paper (normalizzati: 0 = punteggio casuale,
+1 = oracolo), dal 29/09. L'elenco completo delle figure e' in generate_all().
 
 Uso:
     python3.11 make_figures.py /workspace/results
@@ -36,6 +30,7 @@ from analysis_lib import (
     find_main_py,
     labels_for_figure,
     load_paper_methods,
+    severity_matched,
 )
 
 # Soglia del caso per i task a scelta multipla: sotto questa un'accuracy non
@@ -47,14 +42,35 @@ MODEL_PARAMS_B = {"LFM2-350M": 0.35, "LFM2-1.2B": 1.2,
                   "MedGemma-4B-it": 4.0, "Gemma3-4B-it": 4.0,
                   "Mistral-7B-it": 7.0}
 
-# Valori riportati da Vashurin et al. per il regime di scala del paper, usati
-# come termine di paragone per l'ancora di replica (TODO 1).
-PAPER_REFERENCE_PRR = {"TriviaQA": 0.60, "MMLU": 0.50}
 ANCHOR_MODEL = "Mistral-7B-it"
 
-# Zona in cui il PRR non e' interpretabile: troppo poche risposte corrette o
-# troppo poche sbagliate da ordinare (vedi build_accuracy_table in main.py).
-INTERPRETABLE_ACCURACY = (0.30, 0.85)
+# Etichetta dell'asse per il PRR.
+PRR_AXIS = "PRR (0 = casuale, 1 = oracolo; max_rejection=0.5)"
+
+# Valori di riferimento del paper per l'ancora. Fino al 29/09 erano due numeri
+# letti a occhio da una figura (TriviaQA 0.60, MMLU 0.50). Ora si leggono da
+# paper_reference_prr.csv (colonne: dataset, paper_label, prr), da riempire con
+# i valori delle Tabelle 6-7 di Vashurin et al. per Mistral 7B v0.2: il file
+# viene cercato nella cartella dei risultati e poi accanto a questo script.
+PAPER_REFERENCE_FILE = "paper_reference_prr.csv"
+
+
+def load_paper_reference(results_dir):
+    for base in (results_dir, os.path.dirname(os.path.abspath(__file__))):
+        path = os.path.join(base, PAPER_REFERENCE_FILE)
+        if os.path.exists(path):
+            ref = pd.read_csv(path).dropna(subset=["prr"])
+            if not ref.empty:
+                return ref
+    return None
+
+
+def _drop_phase_rows(t):
+    """Toglie da estimator_timings.csv le righe con i tempi per fase
+    ("__fase__:<nome>"), che non sono metodi."""
+    if "estimator" in t.columns:
+        t = t[~t["estimator"].astype(str).str.startswith("__fase__:")]
+    return t
 
 
 def _ordina_modelli(nomi):
@@ -128,86 +144,100 @@ def fig_accuracy(stats, results_dir):
     add_note(fig,
              "Un'accuracy sotto la linea rossa su un MCQ non e' ignoranza del modello: tirando a "
              "indovinare ne prenderebbe di piu'.\nIndica che la risposta non viene estratta "
-             "correttamente, e il PRR misurato su quelle etichette non e' interpretabile.",)
+             "correttamente (vedi il parse-failure rate in instance_level_stats.csv).",)
     save(fig, results_dir, "fig_accuracy.png")
 
 
 def fig_accuracy_vs_prr(stats, results_dir):
-    """Accuracy contro PRR: la relazione che decide se una barra e' leggibile.
+    """Accuracy contro PRR, prima e dopo la correzione del 29/09.
 
-    Ogni punto e' una coppia modello-dataset. Il PRR e' la mediana fra i
-    metodi, perche' la domanda qui non e' quale metodo vince ma quanto segnale
-    ci sia in quella cella."""
+    Ogni punto e' una coppia modello-dataset, con il PRR mediano fra i metodi.
+    A sinistra l'area grezza riportata fino al 29/09: sta quasi esattamente
+    sulla diagonale, cioe' misura l'accuracy del modello e non i metodi UQ. A
+    destra il PRR del paper, normalizzato fra caso e oracolo: la dipendenza
+    meccanica dall'accuracy sparisce."""
     cell = stats.groupby(["model", "dataset"], as_index=False).agg(
         accuracy=("mean_quality", "first"),
         prr_mediano=("prr", "median"),
-        prr_massimo=("prr", "max"),
+        **({"raw_mediano": ("prr_raw", "median")} if "prr_raw" in stats.columns else {}),
     ).dropna(subset=["accuracy", "prr_mediano"])
     if cell.empty:
         return
-
-    fig, ax = plt.subplots(figsize=(10, 7))
-    lo, hi = INTERPRETABLE_ACCURACY
-    ax.axvspan(0, lo, color="tab:red", alpha=0.07)
-    ax.axvspan(hi, 1.0, color="tab:red", alpha=0.07)
-    ax.text(lo / 2, 0.97, "troppo pochi\nsuccessi", ha="center", va="top",
-            fontsize=7, color="tab:red", transform=ax.get_xaxis_transform())
-    ax.text((hi + 1) / 2, 0.97, "troppi pochi\nerrori", ha="center", va="top",
-            fontsize=7, color="tab:red", transform=ax.get_xaxis_transform())
-
-    for model_name, group in cell.groupby("model"):
-        ax.scatter(group["accuracy"], group["prr_mediano"], s=70, label=model_name, zorder=3)
-        for _, row in group.iterrows():
-            ax.annotate(row["dataset"], (row["accuracy"], row["prr_mediano"]),
-                        textcoords="offset points", xytext=(6, 4), fontsize=6.5)
-
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_xlim(0, 1)
-    ax.set_xlabel("Accuracy di base del modello sul dataset")
-    ax.set_ylabel("PRR mediano fra i metodi UQ")
-    ax.set_title("Il PRR e' interpretabile solo in un intervallo di accuracy")
-    ax.legend(fontsize=8)
+    pannelli = ([("raw_mediano", "Area grezza (riportata fino al 29/09)")]
+                if "raw_mediano" in cell.columns else []) + \
+               [("prr_mediano", "PRR del paper (normalizzato)")]
+    fig, axes = plt.subplots(1, len(pannelli), figsize=(8 * len(pannelli), 7), squeeze=False)
+    for ax, (col, titolo) in zip(axes[0], pannelli):
+        for model_name, group in cell.groupby("model"):
+            ax.scatter(group["accuracy"], group[col], s=60, label=model_name, zorder=3)
+            for _, row in group.iterrows():
+                ax.annotate(row["dataset"], (row["accuracy"], row[col]),
+                            textcoords="offset points", xytext=(5, 3), fontsize=6)
+        r = cell["accuracy"].corr(cell[col])
+        ax.axhline(0, color="black", linewidth=0.8)
+        if col == "raw_mediano":
+            ax.plot([0, 1], [0, 1], color="0.6", linestyle=":", linewidth=1)
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("Accuracy di base del modello sul dataset")
+        ax.set_ylabel("Valore mediano fra i metodi UQ")
+        ax.set_title(f"{titolo}\ncorrelazione con l'accuracy: r = {r:.2f}", fontsize=10)
+        ax.grid(linewidth=0.3, alpha=0.5)
+    axes[0][-1].legend(fontsize=7)
     add_note(fig,
-             "Fuori dalle bande rosse il PRR misura la tecnica. Dentro, misura il regime: con "
-             "quasi nessuna risposta corretta non c'e' nulla\nda ordinare, con quasi nessun errore "
-             "la stima e' dominata dal rumore. Un PRR basso a sinistra non e' un metodo debole.",)
+             "A sinistra l'area sotto la curva prediction-rejection: parte dal livello dell'accuracy "
+             "e ci aggiunge poco, quindi confronta i modelli per accuracy.\nA destra il PRR del paper, "
+             "(area - area casuale) / (area oracolo - area casuale): misura quanto il metodo UQ "
+             "migliora rispetto a scartare a caso.\nCon pochissime risposte giuste o sbagliate il "
+             "PRR normalizzato resta calcolabile ma rumoroso: guardare gli intervalli di confidenza.")
     save(fig, results_dir, "fig_accuracy_vs_prr.png")
 
 
 def fig_anchor_replication(stats, results_dir):
-    """Ancora di replica: i PRR di Mistral-7B contro i valori del paper."""
+    """Ancora di replica: i PRR di Mistral-7B contro i valori del paper
+    (paper_reference_prr.csv), metodo per metodo."""
     anchor = stats[stats["model"] == ANCHOR_MODEL]
     if anchor.empty:
         print(f"  {ANCHOR_MODEL} assente dai risultati, salto la figura dell'ancora.")
         return
-    agg = anchor.groupby("dataset").agg(prr_massimo=("prr", "max"),
-                                        prr_mediano=("prr", "median"),
-                                        accuracy=("mean_quality", "first"))
-    datasets = [d for d in agg.index if d in PAPER_REFERENCE_PRR] + \
-               [d for d in agg.index if d not in PAPER_REFERENCE_PRR]
-    agg = agg.loc[datasets]
-
-    y = np.arange(len(agg))
-    fig, ax = plt.subplots(figsize=(10, max(4, len(agg) * 0.85)))
-    ax.barh(y + 0.2, agg["prr_massimo"], height=0.35, label="miglior metodo (ottenuto)")
-    ax.barh(y - 0.2, agg["prr_mediano"], height=0.35, label="metodo mediano (ottenuto)")
-    for i, ds in enumerate(agg.index):
-        if ds in PAPER_REFERENCE_PRR:
-            ax.plot([PAPER_REFERENCE_PRR[ds]] * 2, [i - 0.45, i + 0.45],
-                    color="tab:red", linewidth=2, zorder=5)
-    ax.plot([], [], color="tab:red", linewidth=2, label="atteso dal paper")
-
-    ax.set_yticks(y)
-    ax.set_yticklabels([f"{d}\n(accuracy {agg.loc[d, 'accuracy']:.2f})" for d in agg.index],
-                       fontsize=8)
-    ax.set_xlabel("PRR (raw, max_rejection=0.5)")
-    ax.set_title(f"Ancora di replica: {ANCHOR_MODEL} contro i valori attesi da Vashurin et al.")
-    ax.legend(loc="lower right", fontsize=8)
-    add_note(fig,
-             "L'ancora serve a distinguere gli effetti di scala dagli artefatti della nostra pipeline: "
-             "ha valore solo se riproduce i pattern\ndel paper nel suo stesso regime. Nota che qui e' "
-             "caricata in 4-bit e non in bf16 (vincolo dei 24GB della 3090), quindi uno scostamento\n"
-             "e' attribuibile anche alla quantizzazione.",)
+    ref = load_paper_reference(results_dir)
+    datasets = sorted(anchor["dataset"].unique())
+    fig, axes = plt.subplots(1, len(datasets), figsize=(4.2 * len(datasets), 8), sharey=True,
+                             squeeze=False)
+    ordine = (anchor.groupby("paper_label")["prr"].mean().sort_values().index.tolist())
+    y = np.arange(len(ordine))
+    for ax, ds in zip(axes[0], datasets):
+        sub = anchor[anchor["dataset"] == ds].set_index("paper_label").reindex(ordine)
+        err = np.vstack([(sub["prr"] - sub["prr_ci_low"]).clip(lower=0).fillna(0),
+                         (sub["prr_ci_high"] - sub["prr"]).clip(lower=0).fillna(0)])
+        ax.barh(y, sub["prr"], xerr=err, color="tab:blue", alpha=0.8,
+                error_kw={"elinewidth": 0.6, "ecolor": "0.35"}, label="ottenuto (IC 95%)")
+        if ref is not None:
+            r = ref[ref["dataset"] == ds].set_index("paper_label")["prr"].reindex(ordine)
+            ax.scatter(r, y, color="tab:red", marker="D", s=22, zorder=4, label="paper")
+        acc = sub["mean_quality"].dropna()
+        ax.set_title(f"{ds}\n(accuracy {acc.iloc[0]:.2f})" if len(acc) else ds, fontsize=9)
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("PRR", fontsize=8)
+    axes[0][0].set_yticks(y)
+    axes[0][0].set_yticklabels(ordine, fontsize=7)
+    axes[0][-1].legend(fontsize=7, loc="lower right")
+    precisione = "?"
+    cond = os.path.join(results_dir, "run_conditions.csv")
+    if os.path.exists(cond):
+        c = pd.read_csv(cond)
+        c = c[c["model"] == ANCHOR_MODEL]
+        if len(c):
+            precisione = ", ".join(sorted(c["precision"].astype(str).unique()))
+    fig.suptitle(f"Ancora di replica: {ANCHOR_MODEL} ({precisione}) contro Vashurin et al.")
+    nota = ("L'ancora serve a distinguere gli effetti di scala dagli artefatti della nostra "
+            "pipeline: ha valore se riproduce i valori del paper nel suo stesso regime.\n")
+    if ref is None:
+        nota += ("Valori del paper NON disponibili: riempire paper_reference_prr.csv (dataset, "
+                 "paper_label, prr) con le Tabelle 6-7 di Vashurin et al. per Mistral 7B v0.2.")
+    else:
+        nota += ("Rombi rossi: valori delle Tabelle 6-7 del paper (paper_reference_prr.csv). "
+                 "Criterio di successo da fissare PRIMA di guardare i risultati.")
+    add_note(fig, nota, left=0.2, top=0.9)
     save(fig, results_dir, "fig_anchor_replication.png")
 
 
@@ -233,6 +263,7 @@ def fig_ties_vs_scale(results_dir):
         ties=("equivalenti_al_migliore", "mean"),
         confrontati=("metodi_confrontati", "mean"),
         celle=("dataset", "count"),
+        **({"non_testabili": ("non_testabili", "mean")} if "non_testabili" in summary.columns else {}),
     ).reset_index()
     agg["params_B"] = agg["model"].map(MODEL_PARAMS_B)
     agg = agg.dropna(subset=["params_B"]).sort_values("params_B")
@@ -240,9 +271,15 @@ def fig_ties_vs_scale(results_dir):
         return
 
     fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(agg["params_B"], agg["ties"], "o-", color="tab:blue")
+    # Solo punti: modelli di famiglie diverse (LFM2, Gemma, Mistral) non
+    # stanno su una stessa curva, e una linea che li unisce suggerirebbe
+    # un andamento che il disegno sperimentale non puo' mostrare.
+    for i, (_, r) in enumerate(agg.iterrows()):
+        ax.scatter([r["params_B"]], [r["ties"]], s=60, color=f"C{i}", zorder=3)
     for _, r in agg.iterrows():
-        ax.annotate(f"{r['model']}\n({int(r['celle'])} dataset)",
+        extra = (f", {r['non_testabili']:.1f} non testabili" if "non_testabili" in agg.columns
+                 and pd.notna(r.get("non_testabili")) else "")
+        ax.annotate(f"{r['model']}\n({int(r['celle'])} dataset{extra})",
                     (r["params_B"], r["ties"]),
                     textcoords="offset points", xytext=(8, 4), fontsize=7.5)
     ax.set_xscale("log")
@@ -253,7 +290,9 @@ def fig_ties_vs_scale(results_dir):
     add_note(fig,
              "Un valore alto significa che il benchmark, a quella scala, non separa i metodi: la loro "
              "classifica e' rumore.\nVa letto insieme al Kendall tau, perche' un ranking indistinguibile "
-             "produce tau vicino a zero per costruzione.",)
+             "produce tau vicino a zero per costruzione.\nMetodo 'peggiore' solo se risulta il "
+             "migliore in meno di 0.05/(m-1) dei ricampionamenti (migliore scelto dentro ogni "
+             "ricampionamento, Bonferroni).",)
     save(fig, results_dir, "fig_ties_vs_scale.png")
 
 
@@ -263,7 +302,7 @@ def fig_timing_marginal(results_dir):
     path = os.path.join(results_dir, "estimator_timings.csv")
     if not os.path.exists(path):
         return
-    t = pd.read_csv(path)
+    t = _drop_phase_rows(pd.read_csv(path))
     if "seconds" not in t.columns:
         return
     piv = t.pivot_table(index="paper_label", columns="model", values="seconds", aggfunc="sum")
@@ -311,7 +350,7 @@ def fig_verbalized_by_style(results_dir):
         ax.barh(etichette, agg["value"], xerr=xerr, color="tab:purple", alpha=0.8,
                 error_kw={"elinewidth": 0.6, "ecolor": "0.35"})
         ax.invert_yaxis()
-        ax.set_xlabel(f"Mean PRR (raw, max_rejection=0.5, aggregato su {datasets})")
+        ax.set_xlabel(f"Mean PRR (0 = casuale, 1 = oracolo; media su {datasets})")
         titolo = "numerica" if style == "numeric" else "verbale"
         ax.set_title(f"Metodi verbalized: confidenza {titolo} dichiarata dal modello")
         add_note(fig,
@@ -552,7 +591,7 @@ def fig_paper_figure(results_dir, figure_letter, out_name, titolo):
             tick.set_color("0.55")
     ax.set_ylim(-0.7, len(etichette) - 0.3)
     ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("Mean PRR (raw, max_rejection=0.5, aggregato sui dataset di selective QA)")
+    ax.set_xlabel("Mean PRR (0 = casuale, 1 = oracolo; media sui dataset di selective QA)")
     ax.set_title(titolo, fontsize=11)
     ax.legend(loc="lower right", fontsize=8)
     add_note(fig,
@@ -596,7 +635,7 @@ def fig_severity_grid(results_dir):
                                                      for m in modelli if m in acc.index)
             ax.set_title(titolo, fontsize=7.5)
             ax.axvline(0, color="black", linewidth=0.8)
-            ax.set_xlabel("Mean PRR (raw, max_rejection=0.5)", fontsize=8)
+            ax.set_xlabel(PRR_AXIS, fontsize=8)
             ax.tick_params(labelsize=7)
 
     # Asse x condiviso per colonna: dentro una colonna il formato e' lo stesso,
@@ -617,8 +656,9 @@ def fig_severity_grid(results_dir):
     add_note(fig,
              "Il confronto che isola la severita' e' VERTICALE dentro una colonna: stesso formato, "
              "stessa metrica di correttezza.\nFra colonne no, perche' accuracy binaria e AlignScore "
-             "continuo non sono commensurabili. Leggere sempre insieme alle accuracy\nin titolo: dove "
-             "sono molto basse, il PRR misura il regime e non la tecnica.",
+             "continuo non sono commensurabili. Le domande dei due strati sono DIVERSE: se quelle "
+             "pericolose sono anche piu' difficili,\nuna differenza di PRR non e' attribuibile alla "
+             "severita' (vedi fig_severity_matched.png, stesso confronto a parita' di difficolta').",
              top=0.9, wspace=0.05, hspace=0.25, left=0.2)
     save(fig, results_dir, "fig_severity_grid.png")
 
@@ -643,7 +683,7 @@ def fig_quant_comparison(results_dir):
 
     fig, ax = plt.subplots(figsize=(11, max(7, len(pivot) * 0.42)))
     _barh_con_ci(ax, pivot, (pivot - lo).clip(lower=0), (hi - pivot).clip(lower=0))
-    ax.set_xlabel("Mean PRR (raw, max_rejection=0.5, aggregato sui dataset)")
+    ax.set_xlabel("Mean PRR (0 = casuale, 1 = oracolo; media sui dataset)")
     ax.set_title("Effetto della quantizzazione sulla qualita' delle stime di incertezza")
     ax.axvline(0, color="black", linewidth=0.8)
     ax.legend(fontsize=8, loc="lower right")
@@ -670,7 +710,7 @@ def fig_timing_full_cost(results_dir):
     if not os.path.exists(path):
         print("  estimator_timings.csv assente, salto la figura dei costi.")
         return
-    t = pd.read_csv(path)
+    t = _drop_phase_rows(pd.read_csv(path))
     attese = {"seconds_full_per_instance", "seconds_marginal_per_instance", "paper_label"}
     if not attese.issubset(t.columns):
         print(f"  estimator_timings.csv ha uno schema vecchio (mancano "
@@ -687,7 +727,7 @@ def fig_timing_full_cost(results_dir):
     y = np.arange(len(costo))
     fig, ax = plt.subplots(figsize=(11, max(6, len(costo) * 0.4)))
     ax.barh(y + 0.2, costo["pieno"], height=0.38, color="tab:blue",
-            label="costo pieno standalone (greedy + campioni + NLI + aritmetica)")
+            label="costo pieno standalone (greedy + tutti i calcolatori da cui dipende)")
     ax.barh(y - 0.2, costo["marginale"], height=0.38, color="tab:orange",
             label="costo marginale (sola aritmetica)")
     ax.set_yticks(y)
@@ -757,29 +797,48 @@ def table_accuracy(stats, results_dir):
              "Su MCQ a quattro opzioni il livello del caso e' 0.25: un valore sotto non indica "
              "ignoranza del modello ma un problema\ndi estrazione della risposta. AlignScore e' "
              "continuo e severo sul testo libero medico: valori bassi li' significano che\nquasi ogni "
-             "risposta conta come sbagliata, e il PRR misurato in quel regime non e' interpretabile.")
+             "risposta conta come sbagliata, e il PRR di quelle celle ha intervalli di confidenza "
+             "larghi.")
     save(fig, results_dir, "fig_tabella_accuracy.png")
 
 
 def table_prr_vs_accuracy(stats, results_dir):
-    """PRR affiancato all'accuracy della stessa cella."""
+    """PRR affiancato all'accuracy della stessa cella, con l'intervallo di
+    confidenza del metodo migliore al posto delle vecchie "bande di regime".
+
+    Le bande (accuracy fra 0.30 e 0.85 = interpretabile) erano una conseguenza
+    dell'area grezza, che dipende meccanicamente dall'accuracy, e le soglie non
+    avevano una giustificazione. Con il PRR normalizzato quello che resta vero
+    e' che con pochissime risposte giuste o sbagliate la stima e' rumorosa: lo
+    dice l'ampiezza dell'intervallo, e la tabella riporta il numero di
+    risposte della classe minoritaria."""
     cell = stats.groupby(["model", "dataset"], as_index=False).agg(
         accuracy=("mean_quality", "first"),
         metrica=("quality_metric", "first"),
+        n=("n_instances", "first"),
         prr_mediano=("prr", "median"),
-        prr_migliore=("prr", "max"),
-        n=("prr", "count"),
     ).dropna(subset=["accuracy"])
     if cell.empty:
         return
     idx = stats.dropna(subset=["prr"]).groupby(["model", "dataset"])["prr"].idxmax()
-    migliori = stats.loc[idx, ["model", "dataset", "paper_label"]].rename(
-        columns={"paper_label": "metodo_migliore"})
+    migliori = stats.loc[idx, ["model", "dataset", "paper_label", "prr", "prr_ci_low",
+                               "prr_ci_high"]].rename(columns={"paper_label": "metodo_migliore",
+                                                               "prr": "prr_migliore"})
     cell = cell.merge(migliori, on=["model", "dataset"], how="left")
-    cell["interpretabile"] = np.where(
-        (cell["accuracy"] >= INTERPRETABLE_ACCURACY[0])
-        & (cell["accuracy"] <= INTERPRETABLE_ACCURACY[1]), "si", "NO")
+    err_col = stats.groupby(["model", "dataset"])["error_rate_overall"].first() \
+        if "error_rate_overall" in stats.columns else None
+    if err_col is not None:
+        cell["minoritaria"] = [int(round(min(e, 1 - e) * n)) if pd.notna(e) and pd.notna(n) else -1
+                               for e, n in zip(err_col.reindex(list(zip(cell["model"], cell["dataset"]))).values,
+                                               cell["n"])]
+    else:
+        cell["minoritaria"] = -1
     cell = cell.sort_values(["model", "dataset"])
+
+    def _ci(r):
+        if pd.isna(r["prr_ci_low"]):
+            return "-"
+        return f"[{r['prr_ci_low']:.2f}, {r['prr_ci_high']:.2f}]"
 
     df = pd.DataFrame({
         "modello": cell["model"],
@@ -788,27 +847,20 @@ def table_prr_vs_accuracy(stats, results_dir):
         "metrica": cell["metrica"],
         "PRR mediano": cell["prr_mediano"].map("{:.3f}".format),
         "PRR migliore": cell["prr_migliore"].map("{:.3f}".format),
+        "IC 95% migliore": cell.apply(_ci, axis=1),
         "metodo migliore": cell["metodo_migliore"].fillna("-"),
-        "regime": cell["interpretabile"],
+        "classe minoritaria": cell["minoritaria"].map(lambda v: "-" if v < 0 else str(v)),
     })
-
-    # Larghezze esplicite: "metodo migliore" contiene nomi lunghi come
-    # "EigValLaplacian NLI Score Entail." che con le colonne uniformi vengono
-    # troncati a meta'.
-    larghezze = [0.13, 0.12, 0.09, 0.11, 0.10, 0.10, 0.28, 0.07]
-    fig, ax = plt.subplots(figsize=(15, 0.6 + 0.30 * len(df)))
-    tab = _tabella_immagine(fig, ax, df, col_widths=larghezze, fontsize=7.5)
-    for r in range(len(df)):
-        if df["regime"].iloc[r] == "NO":
-            for c in range(len(df.columns)):
-                tab[(r + 1, c)].set_facecolor("#fbe9e7")
+    larghezze = [0.12, 0.11, 0.07, 0.10, 0.08, 0.08, 0.11, 0.24, 0.09]
+    fig, ax = plt.subplots(figsize=(16, 0.6 + 0.30 * len(df)))
+    _tabella_immagine(fig, ax, df, col_widths=larghezze, fontsize=7.5)
     ax.set_title("PRR affiancato all'accuracy della stessa cella", fontsize=11, pad=16)
     add_note(fig,
-             "Le righe evidenziate sono fuori dall'intervallo di accuracy in cui il PRR e' "
-             "interpretabile: troppo pochi successi o troppo\npochi errori da ordinare. Su queste "
-             "celle un PRR basso non significa che i metodi UQ siano deboli. Misurato sul complesso "
-             "delle\ncelle, l'accuracy da sola spiega circa il 97% della varianza del PRR: leggere "
-             "sempre le due colonne insieme.")
+             "PRR del paper: 0 = come scartare a caso, 1 = come un oracolo. 'Classe minoritaria' = "
+             "numero di risposte giuste o sbagliate, quale delle due e' piu' rara:\ncon poche "
+             "decine di casi il PRR e' rumoroso, come mostra l'intervallo di confidenza. Il "
+             "metodo migliore e' quello con il PRR piu' alto sui dati completi,\nche non vuol dire "
+             "distinguibile dagli altri: per quello vedi paired_comparisons e fig_ties_vs_scale.png.")
     save(fig, results_dir, "fig_tabella_prr_accuracy.png")
 
 
@@ -842,7 +894,7 @@ def fig_prr_vs_scale_by_family(results_dir):
         if sub.empty:
             continue
         ax.errorbar(sub["params_B"], sub["prr"], yerr=sub["sd"].fillna(0),
-                    marker="o", capsize=3, linewidth=1.6, label=famiglia)
+                    marker="o", capsize=3, linestyle="none", label=famiglia)
     ax.set_xscale("log")
     ax.set_xlabel("Parametri del modello (miliardi, scala log)")
     ax.set_ylabel("Mean PRR (media sui metodi della famiglia e sui dataset)")
@@ -853,61 +905,51 @@ def fig_prr_vs_scale_by_family(results_dir):
              "Le barre verticali sono la dispersione fra i metodi della stessa famiglia, non un "
              "intervallo di confidenza.\nLe famiglie seguono la ripartizione standard della "
              "letteratura, da confrontare con la Sezione 3 del paper: vedi\nMETHOD_FAMILIES in "
-             "analysis_lib.py. Da leggere insieme alla tabella PRR-accuracy: dove l'accuracy e' fuori "
-             "regime,\nil PRR non misura la tecnica.")
+             "analysis_lib.py. Solo punti, niente linee: i modelli appartengono a famiglie diverse "
+             "(LFM2, Gemma, Mistral)\ne non stanno su una stessa curva di scala.")
     save(fig, results_dir, "fig_prr_vs_scale_by_family.png")
 
 
 def fig_rank_transfer(stats, results_dir):
-    """Kendall tau del ranking dei metodi contro il modello-ancora a 7B."""
-    if ANCHOR_MODEL not in set(stats["model"]):
-        print(f"  {ANCHOR_MODEL} assente, salto il rank transfer.")
+    """Kendall tau della classifica dei metodi contro il modello-ancora, un
+    punto per dataset, con intervallo bootstrap appaiato sulle domande (da
+    rank_transfer_kendall_tau.csv, scritto da main.py o da recompute_stats.py)."""
+    path = os.path.join(results_dir, "rank_transfer_kendall_tau.csv")
+    if not os.path.exists(path):
+        print("  rank_transfer_kendall_tau.csv assente, salto il rank transfer.")
         return
-    try:
-        from scipy.stats import kendalltau
-    except ImportError:
-        print("  scipy non disponibile, salto il rank transfer.")
+    tau = pd.read_csv(path)
+    if "dataset" not in tau.columns:
+        print("  rank_transfer_kendall_tau.csv ha lo schema vecchio (tau sulla media fra dataset): "
+              "rilanciare recompute_stats.py.")
         return
-
-    agg = stats.groupby(["model", "paper_label"], as_index=False)["prr"].mean()
-    pivot = agg.pivot_table(index="paper_label", columns="model", values="prr")
-    if ANCHOR_MODEL not in pivot.columns:
-        return
-    righe = []
-    for model_name in pivot.columns:
-        if model_name == ANCHOR_MODEL:
-            continue
-        pair = pivot[[ANCHOR_MODEL, model_name]].dropna()
-        if len(pair) < 3:
-            continue
-        tau, p = kendalltau(pair[ANCHOR_MODEL].rank(ascending=False),
-                            pair[model_name].rank(ascending=False))
-        righe.append({"model": model_name, "params_B": MODEL_PARAMS_B.get(model_name, np.nan),
-                      "tau": tau, "p": p, "n": len(pair)})
-    if not righe:
-        return
-    tau_df = pd.DataFrame(righe).dropna(subset=["params_B"]).sort_values("params_B")
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.plot(tau_df["params_B"], tau_df["tau"], "o-", color="tab:blue")
-    for _, r in tau_df.iterrows():
-        significativo = "significativo" if r["p"] < 0.05 else f"p={r['p']:.2f}"
-        ax.annotate(f"{r['model']}\n{significativo}, {int(r['n'])} metodi",
-                    (r["params_B"], r["tau"]), textcoords="offset points",
-                    xytext=(8, 4), fontsize=7.5)
+    modelli = _ordina_modelli(tau["model"])
+    datasets = sorted(tau["dataset"].unique())
+    fig, ax = plt.subplots(figsize=(10, 6))
+    larghezza = 0.8 / max(len(datasets), 1)
+    for j, ds in enumerate(datasets):
+        sub = tau[tau["dataset"] == ds].set_index("model").reindex(modelli)
+        x = np.arange(len(modelli)) + (j - (len(datasets) - 1) / 2) * larghezza
+        err = None
+        if {"tau_ci_low", "tau_ci_high"}.issubset(sub.columns):
+            err = np.vstack([(sub["kendall_tau_vs_anchor"] - sub["tau_ci_low"]).clip(lower=0).fillna(0),
+                             (sub["tau_ci_high"] - sub["kendall_tau_vs_anchor"]).clip(lower=0).fillna(0)])
+        ax.errorbar(x, sub["kendall_tau_vs_anchor"], yerr=err, fmt="o", capsize=3,
+                    color=f"C{j}", label=ds)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.axhline(1, color="0.7", linewidth=0.8, linestyle=":")
-    ax.set_xscale("log")
+    ax.set_xticks(np.arange(len(modelli)))
+    ax.set_xticklabels([f"{m}\n({MODEL_PARAMS_B.get(m, '?')}B)" for m in modelli], fontsize=8)
     ax.set_ylim(-1.05, 1.05)
-    ax.set_xlabel("Parametri del modello (miliardi, scala log)")
-    ax.set_ylabel(f"Kendall tau del ranking dei metodi vs {ANCHOR_MODEL}")
-    ax.set_title("Trasferimento del ranking dei metodi UQ al calare della scala")
+    ax.set_ylabel(f"Kendall tau della classifica dei metodi vs {ANCHOR_MODEL}")
+    ax.set_title("Trasferimento della classifica dei metodi UQ, dataset per dataset")
+    ax.legend(fontsize=8, title="dataset")
     add_note(fig,
-             "tau = 1: stesso ordine di preferenza dei metodi del modello a 7B; tau = 0: ranking "
-             "scorrelato.\nAttenzione: se a una certa scala i metodi sono statisticamente "
-             "indistinguibili fra loro (vedi fig_ties_vs_scale.png),\nil loro ordinamento e' rumore e "
-             "un tau vicino a zero e' garantito per costruzione, non e' un risultato sul "
-             "trasferimento.")
+             "Un punto per dataset; barre = intervallo bootstrap al 95% ricampionando le domande "
+             "(le due classifiche sono calcolate sulle stesse domande),\nche tiene conto della "
+             "dipendenza fra metodi che condividono gli stessi dati. Niente linee fra modelli: sono "
+             "famiglie diverse.\nSe a una scala i metodi sono indistinguibili fra loro (vedi "
+             "fig_ties_vs_scale.png), un tau vicino a zero e' garantito per costruzione.")
     save(fig, results_dir, "fig_rank_transfer.png")
 
 
@@ -918,7 +960,7 @@ def fig_pareto(results_dir):
     if not os.path.exists(path) or raw is None:
         print("  Dati insufficienti per la frontiera di Pareto, salto.")
         return
-    t = pd.read_csv(path)
+    t = _drop_phase_rows(pd.read_csv(path))
     if "seconds_full_per_instance" not in t.columns:
         print("  estimator_timings.csv ha uno schema vecchio, salto la Pareto.")
         return
@@ -988,10 +1030,10 @@ def table_costi(results_dir):
     path = os.path.join(results_dir, "estimator_timings.csv")
     if not os.path.exists(path):
         return
-    t = pd.read_csv(path)
+    t = _drop_phase_rows(pd.read_csv(path))
     attese = {"seconds_marginal_per_instance", "seconds_full_per_instance", "peak_memory_gb"}
     if not attese.issubset(t.columns):
-        print(f"  estimator_timings.csv senza le colonne di costo, salto la tabella costi.")
+        print("  estimator_timings.csv senza le colonne di costo, salto la tabella costi.")
         return
     extra = [c for c in ("needs_cross_encoder", "needs_extra_forward") if c in t.columns]
     costo = t.groupby("paper_label", as_index=False).agg(
@@ -1039,16 +1081,23 @@ def table_costi(results_dir):
 
 
 def table_silent_failure(results_dir):
-    """Silent failure rate per metodo, dataset della griglia e modello, letto
-    direttamente dalle statistiche per-istanza (non dal pivot CSV, che ha due
-    righe di intestazione e usciva con colonne "MedQuAD.1" e una riga
-    "paper_label nan")."""
+    """Errori fra le risposte date con piu' fiducia, per metodo, dataset della
+    griglia e modello, accanto all'error rate complessivo della cella.
+
+    Sostituisce la vecchia tabella del silent failure rate ("quale frazione
+    degli errori finisce nel 10% piu' confidente"), che ha un tetto: con il 90%
+    di errori, come sui dataset clinici a risposta libera, vale al massimo ~0.11
+    e il caso da' 0.10, quindi non distingueva nulla proprio li'. La nuova
+    lettura: "fra le risposte date con piu' sicurezza, quante sono sbagliate",
+    da confrontare con quante sono sbagliate in tutto."""
     path = os.path.join(results_dir, "results_severity_grid_instance_stats.csv")
     if not os.path.exists(path):
-        print("  results_severity_grid_instance_stats.csv assente, salto il silent failure rate.")
+        print("  results_severity_grid_instance_stats.csv assente, salto la tabella degli errori.")
         return
     st = pd.read_csv(path)
-    if "silent_failure_rate" not in st.columns or st.empty:
+    if "error_rate_top10" not in st.columns or st.empty:
+        print("  statistiche senza error_rate_top10 (run precedente al 29/09): rilanciare "
+              "recompute_stats.py.")
         return
     abbrev = {"MedQAbstain-LT": "LT", "MedQAbstain-Safe": "Safe",
               "MedicationQA": "MedicationQA", "MedQuAD": "MedQuAD"}
@@ -1056,55 +1105,137 @@ def table_silent_failure(results_dir):
     ordine_m = _ordina_modelli(st["model"])
     colonne = [(d, m) for d in ordine_ds for m in ordine_m
                if ((st["dataset"] == d) & (st["model"] == m)).any()]
-    if not colonne:
-        return
     piv = st.pivot_table(index="paper_label", columns=["dataset", "model"],
-                         values="silent_failure_rate", aggfunc="first")
-    piv = piv.reindex(columns=pd.MultiIndex.from_tuples(colonne))
-    # Colonne interamente vuote = dati per-istanza assenti per quel modello
-    # (non un metodo costante): non vanno mostrate come una fila di "-".
-    vuote = [c for c in colonne if piv[c].isna().all()]
-    if vuote:
-        print(f"  silent failure rate: nessun dato per {vuote}, colonne omesse.")
-        colonne = [c for c in colonne if c not in vuote]
-        piv = piv.reindex(columns=pd.MultiIndex.from_tuples(colonne))
+                         values="error_rate_top10", aggfunc="first")
+    colonne = [c for c in colonne if c in piv.columns and not piv[c].isna().all()]
     if not colonne:
         return
-    acc = st.groupby(["dataset", "model"])["mean_quality"].first()
-    fuori = {c: not (INTERPRETABLE_ACCURACY[0] <= acc.get(c, np.nan) <= INTERPRETABLE_ACCURACY[1])
-             for c in colonne}
+    piv = piv.reindex(columns=pd.MultiIndex.from_tuples(colonne))
+    overall = st.groupby(["dataset", "model"])["error_rate_overall"].first()
     piv = piv.loc[piv.mean(axis=1).sort_values().index]
 
-    intest = [f"{abbrev[d]}\n{m.replace('-it', '')}" for d, m in colonne]
-    testo = piv.apply(lambda col: col.map(lambda v: "-" if pd.isna(v) else f"{v:.3f}"))
+    intest = [f"{abbrev[d]}\n{m.replace('-it', '')}\n(tutte: {overall.get((d, m), np.nan):.2f})"
+              for d, m in colonne]
+    testo = piv.apply(lambda col: col.map(lambda v: "-" if pd.isna(v) else f"{v:.2f}"))
     df = pd.DataFrame(testo.values, columns=intest)
     df.insert(0, "metodo", piv.index)
 
-    fig, ax = plt.subplots(figsize=(max(12, 1.05 * len(df.columns) + 3), 1.6 + 0.30 * len(df)))
+    fig, ax = plt.subplots(figsize=(max(12, 1.05 * len(df.columns) + 3), 1.9 + 0.30 * len(df)))
     larghezze = [0.25] + [0.75 / len(colonne)] * len(colonne)
     tab = _tabella_immagine(fig, ax, df, col_widths=larghezze, fontsize=6.5)
     for (r, c), cell in tab.get_celld().items():
         if r == 0 or c == 0:
             continue
-        colonna = colonne[c - 1]
         v = piv.iloc[r - 1, c - 1]
-        if fuori[colonna]:
-            cell.set_facecolor("#eeeeee")
-            cell.get_text().set_color("0.45")
-        elif pd.notna(v) and v <= 0.05:
+        base = overall.get(colonne[c - 1], np.nan)
+        if pd.isna(v) or pd.isna(base):
+            continue
+        if v <= 0.5 * base:
             cell.set_facecolor("#dff0d8")
-        elif pd.notna(v) and v >= 0.15:
+        elif v >= base:
             cell.set_facecolor("#f8d7da")
-    ax.set_title("Silent failure rate per strato di severita' (LT = domande letali, Safe = sicure)",
-                 fontsize=11, pad=16)
+    ax.set_title("Errori fra le risposte date con piu' fiducia (10% piu' confidente), per strato "
+                 "di severita'", fontsize=11, pad=16)
     add_note(fig,
-             "Frazione delle risposte SBAGLIATE che finisce nel 10% delle risposte su cui il metodo e' "
-             "piu' sicuro: gli errori che passano inosservati.\nUn metodo che ordina a caso da' circa "
-             "0.10, un metodo perfetto 0. Verde: <= 0.05 (meta' del caso o meno). Rosso: >= 0.15 "
-             "(peggio del caso).\nIn grigio le celle con accuracy fuori dall'intervallo "
-             f"{INTERPRETABLE_ACCURACY[0]:.2f}-{INTERPRETABLE_ACCURACY[1]:.2f}: li' la metrica misura il "
-             "regime, non il metodo. '-' = metodo con punteggio costante (non ordina nulla).")
+             "Ogni cella: frazione di risposte SBAGLIATE fra il 10% su cui il metodo e' piu' "
+             "sicuro. In intestazione, fra parentesi, la frazione di risposte sbagliate in tutto.\n"
+             "Un metodo che non sa nulla da' in media l'error rate complessivo; uno utile, meno. "
+             "Verde: al massimo meta' dell'error rate complessivo. Rosso: non meglio\ndel caso. "
+             "'-' = metodo con punteggio costante (non ordina nulla). Pareggi sul bordo del 10% "
+             "risolti in valore atteso.")
     save(fig, results_dir, "fig_tabella_silent_failure.png")
+
+
+def fig_severity_matched(results_dir):
+    """Severita' a parita' di difficolta' (vedi analysis_lib.severity_matched):
+    per ogni coppia di strati (LT/Safe, MedicationQA/MedQuAD) e ogni modello, il
+    PRR mediano fra i metodi sui dati completi e sui sottoinsiemi con la stessa
+    distribuzione di difficolta'. Scrive anche severity_matched_difficulty.csv."""
+    path = os.path.join(results_dir, "results_severity_grid_per_instance.csv")
+    if not os.path.exists(path):
+        print("  results_severity_grid_per_instance.csv assente, salto la severita' a parita' "
+              "di difficolta'.")
+        return
+    per = pd.read_csv(path)
+    coppie = [("MedQAbstain-LT", "MedQAbstain-Safe"), ("MedicationQA", "MedQuAD")]
+    frames = [severity_matched(per, a, b) for a, b in coppie
+              if a in set(per["dataset"]) and b in set(per["dataset"])]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        print("  severita' a parita' di difficolta': servono almeno tre modelli su entrambi gli "
+              "strati, salto.")
+        return
+    res = pd.concat(frames, ignore_index=True)
+    res.to_csv(os.path.join(results_dir, "severity_matched_difficulty.csv"), index=False)
+    print(f"Salvato: {os.path.join(results_dir, 'severity_matched_difficulty.csv')}")
+
+    agg = res.groupby(["dataset_a", "dataset_b", "model"], as_index=False).agg(
+        a_full=("prr_a_full", "median"), b_full=("prr_b_full", "median"),
+        a_matched=("prr_a_matched", "median"), b_matched=("prr_b_matched", "median"),
+        acc_a_full=("acc_a_full", "first"), acc_b_full=("acc_b_full", "first"),
+        acc_a_matched=("acc_a_matched", "first"), acc_b_matched=("acc_b_matched", "first"))
+    n_coppie = agg[["dataset_a", "dataset_b"]].drop_duplicates()
+    fig, axes = plt.subplots(1, len(n_coppie), figsize=(8 * len(n_coppie), 6), squeeze=False)
+    for ax, (_, cp) in zip(axes[0], n_coppie.iterrows()):
+        sub = agg[(agg["dataset_a"] == cp["dataset_a"]) & (agg["dataset_b"] == cp["dataset_b"])]
+        modelli = _ordina_modelli(sub["model"])
+        sub = sub.set_index("model").reindex(modelli)
+        x = np.arange(len(modelli))
+        for off, col, lab, mk, colr in ((-0.15, "a_full", f"{cp['dataset_a']} (tutte)", "o", "tab:red"),
+                                        (-0.05, "a_matched", f"{cp['dataset_a']} (stessa difficolta')", "s", "tab:red"),
+                                        (0.05, "b_full", f"{cp['dataset_b']} (tutte)", "o", "tab:blue"),
+                                        (0.15, "b_matched", f"{cp['dataset_b']} (stessa difficolta')", "s", "tab:blue")):
+            ax.scatter(x + off, sub[col], marker=mk, color=colr, s=45, label=lab,
+                       facecolors="none" if "matched" in col else colr)
+        for i, m in enumerate(modelli):
+            r = sub.loc[m]
+            ax.annotate(f"acc {r['acc_a_full']:.2f}/{r['acc_b_full']:.2f}\n"
+                        f"pari diff. {r['acc_a_matched']:.2f}/{r['acc_b_matched']:.2f}",
+                        (i, np.nanmin([r["a_full"], r["b_full"], r["a_matched"], r["b_matched"]])),
+                        textcoords="offset points", xytext=(0, -26), ha="center", fontsize=6)
+        ax.set_xticks(x)
+        ax.set_xticklabels(modelli, fontsize=8)
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_ylabel("PRR mediano fra i metodi")
+        ax.set_title(f"{cp['dataset_a']} contro {cp['dataset_b']}", fontsize=10)
+        ax.legend(fontsize=7)
+        ax.grid(axis="y", linewidth=0.3, alpha=0.5)
+    fig.suptitle("Severita' clinica a parita' di difficolta' delle domande")
+    add_note(fig,
+             "Difficolta' di una domanda = quanti ALTRI modelli la azzeccano (escluso quello "
+             "valutato, per non rendere l'analisi circolare). Per ogni livello si tengono tante "
+             "domande\nquante ne ha lo strato piu' povero (sottocampionamento ripetuto 50 volte). "
+             "Se la differenza fra gli strati resta anche a parita' di difficolta', e' "
+             "attribuibile alla severita';\nse sparisce, era la difficolta'. Sotto ogni modello: "
+             "accuracy dei due strati, su tutte le domande e a parita' di difficolta'.", top=0.88)
+    save(fig, results_dir, "fig_severity_matched.png")
+
+
+def fig_phase_timings(results_dir):
+    """Tempo per fase (generazione greedy, K campioni, NLI, cross-encoder,
+    metrica di qualita', ...) per modello e dataset, da phase_timings.csv."""
+    path = os.path.join(results_dir, "phase_timings.csv")
+    if not os.path.exists(path):
+        print("  phase_timings.csv assente (run precedente al 29/09), salto i tempi per fase.")
+        return
+    ph = pd.read_csv(path)
+    ph["cella"] = ph["model"] + " / " + ph["dataset"]
+    piv = ph.pivot_table(index="cella", columns="phase", values="seconds_per_instance",
+                         aggfunc="sum").fillna(0)
+    piv = piv.loc[piv.sum(axis=1).sort_values().index]
+    piv = piv[piv.sum().sort_values(ascending=False).index]
+    fig, ax = plt.subplots(figsize=(12, max(5, 0.35 * len(piv))))
+    piv.plot(kind="barh", stacked=True, ax=ax, width=0.8)
+    ax.set_xlabel("Secondi per istanza")
+    ax.set_ylabel("")
+    ax.set_title("Dove va il tempo: fasi del calcolo per modello e dataset")
+    ax.legend(fontsize=7, loc="lower right")
+    add_note(fig,
+             "Somma su tutti i metodi della cella: ogni fase e' calcolata una volta e condivisa. "
+             "'metrica_qualita' e' il calcolo della correttezza (AlignScore o\nestrazione della "
+             "lettera), che sul telefono non esiste. 'generazione_interna_stimatore' e' BB P(True), "
+             "che genera da se' le proprie risposte.")
+    save(fig, results_dir, "fig_phase_timings.png")
 
 
 def _tabella_da_csv(results_dir, filename, titolo, out_name, nota, indice=None):
@@ -1181,6 +1312,8 @@ def generate_all(results_dir):
             rd, f"parse_failure_rate_{style}.csv", f"Parse-failure rate, confidenza {style}",
             f"fig_tabella_parse_failure_{style}.png", nota_parse_failure)))
     figure.append(("fig_tabella_silent_failure", lambda: table_silent_failure(rd)))
+    figure.append(("fig_severity_matched", lambda: fig_severity_matched(rd)))
+    figure.append(("fig_phase_timings", lambda: fig_phase_timings(rd)))
 
     fallite = []
     for nome, disegna in figure:

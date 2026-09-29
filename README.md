@@ -15,10 +15,21 @@ LM-Polygraph* (TACL 2025, arXiv:2406.15627), e lo estende in quattro direzioni:
 | **Severità** | l'UQ funziona allo stesso modo su domande dove un errore può essere letale? |
 | **Costo** | quanto costa ogni metodo, e cosa resta dopo la quantizzazione a 4 bit? |
 
-Ogni metodo UQ viene valutato con il **Prediction-Rejection Ratio (PRR)**: quanto
-migliora la qualità media delle risposte scartando quelle con l'incertezza più
-alta. La definizione delle metriche, i valori possibili e come leggerle sono in
-[`METRICHE.md`](METRICHE.md).
+Ogni metodo UQ viene valutato con il **Prediction-Rejection Ratio (PRR)** del
+paper: quanto del guadagno massimo possibile, rispetto a scartare risposte a caso,
+si ottiene scartando quelle con l'incertezza più alta (0 = come il caso, 1 = come
+un oracolo). La definizione delle metriche, i valori possibili e come leggerle
+sono in [`METRICHE.md`](METRICHE.md).
+
+> **Revisione del 29/09/2026.** Una revisione del codice ha trovato difetti che
+> cambiano i risultati: il PRR riportato era l'area grezza e non il rapporto
+> normalizzato del paper; i prompt erano in italiano; LFM2 non riceveva il suo
+> chat template; i prompt con chat template avevano due token BOS; l'estrazione
+> della lettera MCQ leggeva l'articolo "a" come risposta "A"; più problemi nelle
+> analisi statistiche e nell'attribuzione dei costi. Tutti corretti; il dettaglio
+> è nella sezione 10. **I risultati prodotti prima di questa data non sono
+> confrontabili con quelli nuovi**: si possono rileggere con il PRR corretto
+> (`recompute_stats.py`), ma i difetti nelle generazioni restano.
 
 ---
 
@@ -43,25 +54,28 @@ alta. La definizione delle metriche, i valori possibili e come leggerle sono in
 |---|---|
 | `main.py` | La pipeline: carica modelli e dataset, esegue i metodi UQ con lm-polygraph, calcola PRR, intervalli di confidenza, costi, e salva tutti i CSV. Contiene anche le sezioni extra (griglia di severità, metodi verbalized, confronto sulla quantizzazione). |
 | `dataset_prep.py` | Caricamento e formattazione degli 8 dataset (prompt, risposte di riferimento, numero di istanze, stringhe di arresto) e le metriche di correttezza scritte per il progetto (`MCQAccuracyMetric`, `GSM8kAccuracyMetric`). |
-| `analysis_lib.py` | Funzioni condivise fra `main.py` e gli script offline: aggregazione fra dataset, famiglie di metodi, silent failure rate. Dipende solo da numpy e pandas. |
+| `analysis_lib.py` | Le metriche, in un'unica implementazione condivisa da `main.py` e dagli script offline: PRR (normalizzato e grezzo, pareggi in valore atteso), intervalli bootstrap, errori fra le risposte più confidenti, Kendall tau con intervallo, severità a parità di difficoltà, aggregazione fra dataset, famiglie di metodi. Dipende solo da numpy, pandas e scipy. |
+| `batched_sampling.py` | Generatore dei K campioni in una sola chiamata, senza conservare stati nascosti e logit completi. Sostituisce quello di lm-polygraph (più lento e con molta più memoria); stesse statistiche. |
 | `make_figures.py` | Rigenera **tutte le figure e le tabelle-immagine** dai CSV, in pochi secondi e senza GPU. |
 | `paired_comparisons.py` | Test bootstrap appaiati: quali metodi sono statisticamente indistinguibili dal migliore. Senza GPU. |
-| `recompute_silent_failure.py` | Ricalcola il silent failure rate di una cartella di risultati prodotta da versioni vecchie del codice. Senza GPU. |
+| `recompute_stats.py` | Ricalcola le statistiche di una cartella di risultati già esistente con le metriche corrette il 29/09 (PRR normalizzato, nuove colonne, Kendall per dataset). Senza GPU. |
+| `paper_reference_prr.csv` | Valori del paper per l'ancora (Mistral 7B), da riempire con le Tabelle 6-7 di Vashurin et al.: li usa `fig_anchor_replication.png`. |
 | `drop_models_from_checkpoints.py` | Toglie modelli o dataset dai checkpoint, per rieseguire solo quelli. |
+| `tests/` | Test della pipeline senza GPU né rete, con un modello minuscolo e dataset finti: `bash tests/run_tests.sh`. |
 | `preflight.sh` | Controlli di sola lettura prima di un run lungo (codice, token, immagine Docker, GPU, disco). |
 | `sbatch_script.sh`, `run_docker.sh`, `train.sh` | Catena di lancio su cluster SLURM: `sbatch` → container Docker → `main.py`. |
 | `create_docker_image.sh`, `build/` | Costruzione dell'immagine Docker (`Dockerfile` e file dei requirements). |
 | `sync_results.sh` | Allinea la cartella `results/` fra i due nodi del cluster (faretra e moro232). |
 | `results_store.py` | Modulo per checkpoint con semantica di sovrascrittura per riga. **Non è usato** dalla pipeline attuale: è una base per un'eventuale riorganizzazione dei checkpoint. |
-| `METRICHE.md` | Spiegazione di tutte le metriche: accuracy, AlignScore, PRR, bootstrap, silent failure rate, parse-failure rate, Kendall tau, costo marginale e pieno. |
+| `METRICHE.md` | Spiegazione di tutte le metriche: accuracy, AlignScore, PRR, pareggi, bootstrap, confronti appaiati, errori fra le risposte più confidenti, severità a parità di difficoltà, parse-failure rate, Kendall tau, costo marginale e pieno. |
 
 ---
 
 ## 2. Requisiti
 
 - **GPU NVIDIA con 24 GB** (sviluppato su RTX 3090). I modelli da 4B girano in bf16
-  e occupano circa 9 GB; sulla stessa GPU girano anche il modello NLI
-  (DeBERTa-large) e AlignScore.
+  (circa 9 GB), Mistral-7B in bf16 circa 15 GB; sulla stessa GPU girano anche il
+  modello NLI (DeBERTa-large), il cross-encoder e AlignScore.
 - **Token Hugging Face** con la licenza accettata per i modelli *gated*:
   [`google/gemma-3-4b-it`](https://huggingface.co/google/gemma-3-4b-it) e
   [`google/medgemma-4b-it`](https://huggingface.co/google/medgemma-4b-it).
@@ -197,9 +211,28 @@ Se il job si interrompe (limite di tempo, nodo perso, errore) basta **rilanciare
 stesso identico comando**: le celle complete e i blocchi già calcolati vengono
 ripresi dai checkpoint, e si perde al massimo il blocco in corso.
 
-La ripresa riusa i risultati salvati **anche se nel frattempo il codice è
-cambiato**. Dopo una modifica al codice che cambia i risultati, usare
-`--no_resume` oppure una `--results_dir` nuova.
+Al primo lancio viene salvata un'**impronta** del codice (`main.py`,
+`dataset_prep.py`, `batched_sampling.py`, `analysis_lib.py`) e delle impostazioni
+che cambiano i risultati (`run_fingerprint.json`). Una ripresa con un'impronta
+diversa viene **rifiutata** con un messaggio che dice quali file o impostazioni
+sono cambiati: riprendere mescolerebbe risultati di due versioni nelle stesse
+figure. Le alternative: una `--results_dir` nuova, `--no_resume` (ricalcola
+tutto), oppure `--force_resume` se la modifica non tocca generazioni e metriche
+(ad esempio un commento). Le impostazioni che non cambiano i risultati
+(`--models`, `--datasets`, le sezioni extra) si possono variare liberamente fra
+un lancio e l'altro.
+
+Due protezioni in più contro i risultati mescolati:
+
+- `--no_resume` sposta **subito** tutti i risultati già presenti nella cartella
+  (CSV, figure e `chunks/`) in `<results_dir>/_superati/<data-ora>/`, senza
+  cancellare niente. Prima i checkpoint vecchi venivano scartati solo quando il
+  run raggiungeva la loro cella: se il run si interrompeva, o girava solo su
+  alcuni `--models`, il rilancio successivo riprendeva come validi i checkpoint
+  della versione precedente per tutte le celle non ancora toccate.
+- ogni cartella di blocchi porta l'impronta del codice che l'ha prodotta
+  (`chunks/.../run_fingerprint.txt`): blocchi con un'impronta diversa o senza
+  impronta vengono spostati in `_superati/` e la cella riparte da zero.
 
 ---
 
@@ -215,7 +248,7 @@ cambiato**. Dopo una modifica al codice che cambia i risultati, usare
 | `--run_severity_grid` | no | Esegue anche la griglia severità × formato: MedQAbstain-LT, MedQAbstain-Safe, MedicationQA, MedQuAD. |
 | `--run_verbalized` | no | Esegue anche i metodi *verbalized* (il modello dichiara la propria confidenza, in forma numerica e verbale) su CoQA, TriviaQA e MMLU. |
 | `--run_quant_comparison` | no | Esegue anche il confronto 4 bit contro bf16 sullo stesso modello, sui dataset principali. |
-| `--quant_compare_model M` | `LFM2-1.2B` | Modello del confronto sulla quantizzazione. I due Gemma non sono utilizzabili: a 4 bit producono logit NaN. |
+| `--quant_compare_model M` | `LFM2-1.2B` | Modello del confronto sulla quantizzazione. I due Gemma non sono utilizzabili: a 4 bit producono logit NaN. Con `Mistral-7B-it` si confronta l'ancora. |
 
 ### Esecuzione
 
@@ -223,7 +256,10 @@ cambiato**. Dopo una modifica al codice che cambia i risultati, usare
 |---|---|---|
 | `--batch_size N` | `1` | Batch di generazione. Con 1 la memoria usata è minima e non c'è padding fra sequenze di lunghezza diversa. Per i modelli pesanti il batch viene comunque ridotto in automatico. |
 | `--chunk_size N` | `100` | Istanze per blocco con checkpoint dentro ogni cella. `0` disattiva i blocchi. I risultati sono identici con o senza blocchi. |
-| `--no_resume` | no | Ignora i checkpoint e riesegue tutto. Da usare dopo ogni modifica al codice che cambia i risultati. |
+| `--no_resume` | no | Riesegue tutto da zero; i risultati già presenti vengono spostati in `<results_dir>/_superati/<data-ora>/`, non cancellati. |
+| `--force_resume` | no | Riprende dai checkpoint anche se l'impronta del codice è cambiata (vedi "Ripresa dopo un'interruzione"). |
+| `--anchor_precision {bf16,4bit}` | `bf16` | Precisione dell'ancora Mistral-7B. `bf16` è la precisione del paper; `4bit` riproduce le run fino al 29/09. |
+| `--sampler {batched,library}` | `batched` | Generatore dei K campioni: `batched_sampling.py` (una chiamata, memoria costante) oppure quello di lm-polygraph, per confronto. |
 | `--max_rejection F` | `0.5` | Frazione massima di risposte scartate nel calcolo del PRR, come nel paper. |
 | `--n_bootstrap N` | `1000` | Ricampionamenti bootstrap per gli intervalli di confidenza. Costa solo CPU; abbassarlo accelera i test. |
 | `--verbalized_max_new_tokens N` | `40` | Token generati nella sezione verbalized: devono bastare per la risposta **e** per la riga di confidenza. |
@@ -237,9 +273,14 @@ cambiato**. Dopo una modifica al codice che cambia i risultati, usare
 | `--datasets_cache_dir DIR` | `$HF_DATASETS_CACHE` oppure `/workspace/hf_datasets_cache` | Cache dei dataset. |
 
 Parametri fissi nel codice (cambiarli significa cambiare il protocollo):
-seed `3407` (`SEED` in `main.py`), numero di istanze, stringhe di arresto e numero
-massimo di token per dataset (`DATASETS` e `SEVERITY_DATASETS` in
-`dataset_prep.py`), precisione dei modelli (`NO_QUANT_MODELS` in `main.py`).
+seed `3407` (`SEED` in `main.py`), prompt, numero di istanze, stringhe di arresto
+e numero massimo di token per dataset (`DATASETS` e `SEVERITY_DATASETS` in
+`dataset_prep.py`), modelli che non tollerano la quantizzazione
+(`CANNOT_QUANTIZE_MODELS` in `main.py`), batch del modello NLI
+(`DEBERTA_BATCH_SIZE_*`), fase di costo di ogni calcolatore (`PHASE_OF_CALCULATOR`).
+Le condizioni effettive di ogni cella (precisione, attenzione, formato del prompt,
+token, arresti, batch, campionatore, versioni delle librerie, GPU) vengono scritte
+in `run_conditions.csv`.
 
 ---
 
@@ -256,8 +297,12 @@ SB --results_dir /workspace/results_smoke --n_test_samples 6 --chunk_size 3 \
 ```
 
 Nel log controllare che non ci siano righe `!!!` e che compaia
-`stringhe di arresto`; in `results_smoke/sample_generations.csv` le risposte devono
-fermarsi alla fine della riga.
+`stringhe di arresto`; in `results_smoke/sample_generations.csv` e nella colonna
+`greedy_text` di `per_instance_scores.csv` le risposte devono essere in inglese e
+fermarsi alla fine della riga; in `run_conditions.csv` tutti i modelli devono avere
+`prompt_format = chat_template`. Dopo le modifiche del 29/09 questo test va fatto
+**prima** di qualunque run lungo, anche per verificare che Mistral in bf16 stia nei
+24 GB.
 
 **Esperimento completo, in un unico run:**
 
@@ -297,6 +342,15 @@ completo, e la pipeline principale viene ripresa interamente dai checkpoint.
 **Rifare da zero un modello o un dataset** mantenendo il resto: vedi
 `drop_models_from_checkpoints.py` nella sezione 8.
 
+**Rileggere una run vecchia con le metriche corrette** (senza GPU):
+
+```bash
+python3.11 recompute_stats.py results_vecchi
+python3.11 paired_comparisons.py results_vecchi
+python3.11 paired_comparisons.py results_vecchi --per_instance_file results_severity_grid_per_instance.csv
+python3.11 make_figures.py results_vecchi
+```
+
 **Misurare solo i costi** (bastano poche istanze):
 
 ```bash
@@ -318,7 +372,7 @@ L'ordine conta: `fig_ties_vs_scale.png` legge i riepiloghi di `paired_comparison
 
 ### Tempi indicativi (RTX 3090, 5 modelli)
 
-| Parte | Istanze | Tempo stimato |
+| Parte | Istanze | Tempo con il codice fino al 29/09 |
 |---|---|---|
 | CoQA, TriviaQA, MMLU | 500, 1000, 1000 | circa 25 ore |
 | GSM8k | 500 | circa 70 ore |
@@ -326,8 +380,12 @@ L'ordine conta: `fig_ties_vs_scale.png` legge i riepiloghi di `paired_comparison
 | Quantizzazione (LFM2-1.2B, 2 varianti) | come la pipeline principale | circa 10 ore |
 | Verbalized | come la pipeline principale, senza GSM8k | alcune ore |
 
-Stime ricavate dai tempi misurati nei run precedenti; dipendono dal carico del
-nodo.
+Stime dai run precedenti al 29/09. Con il campionatore in batch, i batch NLI più
+grandi e l'attenzione SDPA sui Gemma i tempi dovrebbero scendere nettamente, ma
+non sono ancora stati misurati; in senso opposto pesano Mistral in bf16, 256 token
+su GSM8k (erano 200) e AlignScore su tutti gli alias di TriviaQA. Il test rapido
+stampa i tempi per fase (`[fase ...]`) e li salva in `phase_timings.csv`: da lì si
+stima la durata di un run completo.
 
 ---
 
@@ -340,15 +398,18 @@ rigenerano da lì con `make_figures.py`.
 
 | File | Contenuto |
 |---|---|
-| `results_final.csv` | PRR di ogni metodo per ogni modello × dataset, nel formato di lm-polygraph (colonne `model, key, estimator, ue_metric, value, dataset`). `ue_metric = prr_0.5` è l'area sotto la curva di rifiuto; `prr_0.5_normalized` è la stessa area normalizzata fra metodo casuale (0) e oracolo (1). |
+| `results_final.csv` | PRR di ogni metodo per ogni modello × dataset, nel formato di lm-polygraph (colonne `model, key, estimator, ue_metric, value, dataset`). `ue_metric = prr_0.5_normalized` è il PRR del paper (0 = casuale, 1 = oracolo), `prr_0.5` la sola area; entrambi ricalcolati dagli array per istanza con i pareggi in valore atteso. Il valore originale della libreria è in `value_lmpolygraph`. |
 | `results_partial.csv` | Checkpoint di `results_final.csv`, aggiornato dopo ogni cella. |
-| `results_paper_mapped.csv` | Righe `prr_0.5` con le etichette dei metodi usate nel paper, intervalli di confidenza, accuracy, silent failure rate. È la base delle Figure A e B. |
-| `instance_level_stats.csv` | Per metodo × modello × dataset: PRR, intervallo bootstrap al 95%, accuracy di base, numero di istanze, frazione di punteggi NaN, silent failure rate, parse-failure rate della risposta, istanze saltate. |
-| `per_instance_scores.csv` | **Il dato grezzo**: per ogni domanda, la qualità della risposta e il punteggio di incertezza di ogni metodo. Tutte le analisi offline ripartono da qui. |
+| `results_paper_mapped.csv` | Righe del PRR del paper con le etichette dei metodi usate nel paper, intervalli di confidenza, accuracy, errori fra le risposte più confidenti. È la base delle Figure A e B. |
+| `instance_level_stats.csv` | Per metodo × modello × dataset: `prr` (PRR del paper) con intervallo bootstrap al 95%, `prr_raw` (area grezza, per confronto), accuracy di base, numero di istanze, frazione di punteggi NaN, `distinct_fraction` (punteggi distinti), `error_rate_top10` ed `error_rate_overall`, il vecchio `silent_failure_rate`, parse-failure rate della risposta, istanze saltate. |
+| `per_instance_scores.csv` | **Il dato grezzo**: per ogni domanda l'indice dell'istanza (`instance_index`, lo stesso per tutti i modelli), il testo generato (`greedy_text`), la qualità della risposta e il punteggio di incertezza di ogni metodo. Tutte le analisi offline ripartono da qui. |
 | `accuracy_table.csv` | Accuracy (o AlignScore) per modello × dataset. |
 | `table6_style_<modello>.csv` | Tabella nello stile della Tabella 6 del paper, per modello. |
-| `rank_transfer_kendall_tau.csv` | Kendall tau fra il ranking dei metodi di ogni modello e quello di Mistral-7B, con p-value. |
-| `estimator_timings.csv` | Tempi per metodo × modello × dataset: costo marginale (solo il calcolo del metodo), costo pieno standalone (tutti i calcolatori da cui dipende), quali modelli ausiliari usa, elenco dei calcolatori, memoria di picco della cella. |
+| `rank_transfer_kendall_tau.csv` | Kendall tau fra la classifica dei metodi di ogni modello e quella di Mistral-7B, per dataset, con intervallo bootstrap appaiato sulle domande. |
+| `estimator_timings.csv` | Tempi per metodo × modello × dataset: costo marginale (solo il calcolo del metodo), costo pieno standalone (tutti i calcolatori da cui dipende), fasi e modelli ausiliari usati, elenco dei calcolatori, memoria di picco della cella. |
+| `phase_timings.csv` | Tempo per fase (generazione greedy, K campioni, NLI, cross-encoder, forward extra, metrica di qualità, ...) per modello × dataset. |
+| `run_conditions.csv` | Scheda delle condizioni di esecuzione di ogni cella (vedi sezione 5). |
+| `run_fingerprint.json` | Impronta del codice e delle impostazioni (vedi "Ripresa dopo un'interruzione"). |
 | `estimator_timing_table.csv`, `estimator_cost_table.csv` | Riepiloghi dei tempi per metodo. |
 | `excluded_methods.md` | Metodi del paper non inclusi e perché. |
 | `sample_generations.csv` | Campione di generazioni grezze con la lettera estratta e quella attesa (task a scelta multipla): serve a controllare a occhio che le risposte siano estratte bene. |
@@ -357,7 +418,7 @@ rigenerano da lì con `make_figures.py`.
 
 | File | Sezione |
 |---|---|
-| `results_severity_grid*.csv`, `accuracy_table_severity_grid.csv`, `silent_failure_rate.csv` | Griglia di severità (stessa struttura dei file principali: `_instance_stats`, `_per_instance`, `_mapped`). |
+| `results_severity_grid*.csv`, `accuracy_table_severity_grid.csv`, `error_rate_most_confident.csv`, `severity_matched_difficulty.csv` | Griglia di severità (stessa struttura dei file principali: `_instance_stats`, `_per_instance`, `_mapped`) e confronto degli strati a parità di difficoltà. |
 | `results_verbalized_{numeric,linguistic}*.csv`, `accuracy_table_verbalized_*.csv`, `parse_failure_rate_*.csv` | Metodi verbalized. Il parse-failure rate è la frazione di risposte in cui la confidenza non è estraibile. |
 | `results_quant_comparison*.csv`, `accuracy_table_quant_comparison.csv` | Confronto 4 bit contro bf16. |
 
@@ -373,19 +434,21 @@ possono cancellare a run concluso: servono solo alla ripresa.
 | Figura | Cosa mostra |
 |---|---|
 | `fig_accuracy.png` | Accuracy per modello e dataset, con il livello del caso sui task a scelta multipla. |
-| `fig_accuracy_vs_prr.png` | PRR contro accuracy di base, con le zone in cui il PRR non è interpretabile. |
+| `fig_accuracy_vs_prr.png` | Area grezza e PRR del paper contro l'accuracy di base: mostra perché la prima misurava l'accuracy. |
 | `fig_a_white_box.png`, `fig_b_reflexive.png` | Repliche delle Figure 2 e 3 del paper, con intervalli di confidenza. |
 | `fig_prr_vs_scale_by_family.png` | PRR per famiglia di metodi al variare della scala. |
-| `fig_rank_transfer.png` | Kendall tau del ranking dei metodi contro il modello da 7B. |
+| `fig_rank_transfer.png` | Kendall tau della classifica dei metodi contro il modello da 7B, per dataset, con intervalli. |
 | `fig_ties_vs_scale.png` | Quanti metodi sono indistinguibili dal migliore, per scala. Richiede `paired_comparisons.py`. |
-| `fig_anchor_replication.png` | Mistral-7B contro i valori del paper. |
+| `fig_anchor_replication.png` | Mistral-7B contro i valori del paper (da `paper_reference_prr.csv`), metodo per metodo. |
 | `fig_severity_grid.png` | Griglia 2×2 severità × formato. |
+| `fig_severity_matched.png` | Gli strati di severità confrontati a parità di difficoltà delle domande. |
+| `fig_phase_timings.png` | Dove va il tempo: fasi del calcolo per modello e dataset. |
 | `fig_quant_comparison.png` | 4 bit contro bf16, per metodo, con intervalli di confidenza. |
 | `fig_timing_full_cost.png`, `estimator_timing_chart.png` | Costo pieno contro costo marginale; costo marginale per modello. |
 | `fig_pareto_cost_quality.png` | Frontiera di Pareto costo contro PRR, con intervalli di confidenza. |
 | `fig_verbalized_accuracy_cost.png` | Quanto la richiesta di confidenza peggiora le risposte. |
 | `fig_verbalized_{numeric,linguistic}.png` | PRR dei metodi verbalized per modello, con intervalli di confidenza e parse-failure rate. |
-| `fig_tabella_*.png` | Tabelle in forma di immagine: accuracy, PRR affiancato all'accuracy, costi, parse-failure rate, silent failure rate. |
+| `fig_tabella_*.png` | Tabelle in forma di immagine: accuracy, PRR affiancato all'accuracy (con l'intervallo del metodo migliore), costi, parse-failure rate, errori fra le risposte più confidenti per strato di severità. |
 
 ---
 
@@ -416,23 +479,32 @@ python3.11 paired_comparisons.py <results_dir> [--per_instance_file F] [--out F]
                                  [--n_resamples 1000] [--max_rejection 0.5]
 ```
 
-Per ogni modello × dataset trova il metodo con il PRR più alto e confronta tutti
-gli altri contro di lui con un bootstrap **appaiato** (stesse domande per i due
-metodi). Scrive `<input>_paired_comparisons.csv` e un riepilogo
-`_paired_comparisons_summary.csv` con il numero di metodi indistinguibili dal
-migliore. Per la griglia clinica:
+Per ogni modello × dataset ricampiona le domande e, su ogni ricampionamento,
+ricalcola i PRR di tutti i metodi e guarda chi è il migliore **in quel
+ricampionamento**. Un metodo è *peggiore* del migliore solo se risulta il migliore
+in meno di 0.05/(m−1) dei ricampionamenti (Bonferroni sugli m−1 confronti),
+altrimenti *indistinguibile*; *non testabile* se il PRR non è calcolabile nella
+maggior parte dei ricampionamenti. Scrive `<input>_paired_comparisons.csv` e un
+riepilogo `_paired_comparisons_summary.csv` (metodi equivalenti al migliore,
+peggiori, non testabili). Prima di tutto esegue i controlli di sanità del PRR
+(casuale ≈ 0, oracolo = 1). Per la griglia clinica:
 `--per_instance_file results_severity_grid_per_instance.csv`.
 
-### `recompute_silent_failure.py`
+### `recompute_stats.py`
 
 ```bash
-python3.11 recompute_silent_failure.py <results_dir>
+python3.11 recompute_stats.py <results_dir> [--n_bootstrap 1000] [--n_resamples_kendall 200]
 ```
 
-Serve solo per cartelle prodotte **prima** della correzione del silent failure
-rate (commit `8ccbd95`). Ricalcola il valore dai punteggi per istanza e aggiorna
-i CSV in place, dopo averne salvato una copia `*.pre_sfr_fix.bak`. Sui risultati
-prodotti dal codice attuale non cambia nulla.
+Per cartelle prodotte **prima** del 29/09: ricalcola dai punteggi per istanza le
+statistiche di tutte le sezioni con le metriche corrette (PRR del paper con
+intervalli, area grezza, punteggi distinti, errori fra le risposte più confidenti),
+riscrive i file `*_mapped.csv` letti dalle figure e il Kendall tau per dataset. I
+file originali vengono copiati una volta in `<results_dir>/_pre_ricalcolo/`. Dopo,
+lanciare `paired_comparisons.py` e `make_figures.py`. I difetti nelle generazioni
+(prompt in italiano, doppio BOS, LFM2 senza chat template, lettera "a" nelle MCQ,
+un solo riferimento su TriviaQA) non si correggono così: servono run nuove.
+Sostituisce `recompute_silent_failure.py`.
 
 ### `drop_models_from_checkpoints.py`
 
@@ -447,6 +519,24 @@ i loro checkpoint a blocchi in `chunks_rimossi/`, così che il run successivo, l
 **senza** `--no_resume`, rifaccia solo quelle celle e riprenda tutte le altre.
 Da usare quando cambia la configurazione di un singolo modello o la metrica di un
 task.
+
+### `tests/run_tests.sh`
+
+```bash
+bash tests/run_tests.sh            # nel container; fuori: PY=python bash tests/run_tests.sh
+```
+
+Esegue, in circa dieci minuti su CPU, i test della pipeline con un modello Llama
+minuscolo creato al volo e dataset finti: stringhe di arresto, esecuzione a
+blocchi e ripresa, errori di singola istanza e OOM, costi e dipendenze dei metodi,
+campionatore in batch equivalente a quello di lm-polygraph, chat template e un
+solo BOS, prompt inglesi dai template ufficiali, estrazione della lettera MCQ,
+PRR normalizzato (casuale ≈ 0, oracolo = 1), confronti appaiati, impronta del
+codice, orchestrazione completa di `main.py` con tutte le sezioni e le figure,
+confronto quantizzazione con due modelli nella stessa cartella (sulla CPU la
+variante 4-bit è caricata non quantizzata: si verifica la logica della sezione,
+non l'effetto della quantizzazione).
+Va rilanciato dopo ogni modifica al codice.
 
 ### `preflight.sh`
 
@@ -475,10 +565,13 @@ sostituita viene conservata in `results.prev/`.
 | `LFM2-1.2B` | `LiquidAI/LFM2-1.2B` | 1.2B | 4 bit (NF4); anche bf16 nel confronto sulla quantizzazione |
 | `Gemma3-4B-it` | `google/gemma-3-4b-it` | 4B | bf16 |
 | `MedGemma-4B-it` | `google/medgemma-4b-it` | 4B | bf16 |
-| `Mistral-7B-it` | `mistralai/Mistral-7B-Instruct-v0.2` | 7B | 4 bit (NF4) |
+| `Mistral-7B-it` | `mistralai/Mistral-7B-Instruct-v0.2` | 7B | bf16 (`--anchor_precision 4bit` per NF4) |
 
-I due Gemma girano in bf16 perché a 4 bit producono logit NaN. Gemma, MedGemma e
-Mistral usano il loro chat template; gli LFM2 un prompt a completamento semplice.
+I due Gemma girano in bf16 perché a 4 bit producono logit NaN. **Tutti** i modelli
+ricevono il prompt dentro il proprio chat template (anche gli LFM2, che sono
+modelli chat: fino al 29/09 ricevevano un prompt a completamento semplice), con un
+solo token BOS. L'attenzione è SDPA per tutti; eager solo per un modello la cui
+configurazione dichiara `attn_logit_softcapping` (Gemma 2, non Gemma 3).
 Mistral-7B è l'**ancora di replica**: è uno dei modelli del paper, e serve a
 verificare che la pipeline riproduca i risultati nel regime di scala originale.
 
@@ -487,13 +580,13 @@ verificare che la pipeline riproduca i risultati nel regime di scala originale.
 | Dataset | Fonte HF | Tipo | Metrica | Istanze | Arresto della generazione |
 |---|---|---|---|---|---|
 | CoQA | `stanfordnlp/coqa` (validation) | QA conversazionale, risposta breve | AlignScore | 500 (tutte) | primo a capo |
-| TriviaQA | `mandarjoshi/trivia_qa` rc.nocontext (validation) | QA, risposta breve, 5-shot | AlignScore | 1000 | primo a capo |
-| MMLU | `cais/mmlu` (test) | scelta multipla, 5-shot | Accuracy | 1000 | primo a capo |
-| GSM8k | `openai/gsm8k` (test) | problemi aritmetici, 5-shot | Accuracy sul numero finale | 500 | inizio di un nuovo "Problema:" |
+| TriviaQA | `mandarjoshi/trivia_qa` rc.nocontext (validation) | QA, risposta breve, 5-shot | AlignScore, massimo sugli alias | 1000 | primo a capo |
+| MMLU | `cais/mmlu` (test) | scelta multipla, 5-shot per subject | Accuracy | 1000, stratificate sui 57 subject | primo a capo |
+| GSM8k | `openai/gsm8k` (test) | problemi aritmetici, 8-shot chain-of-thought | Accuracy sul numero dopo "The answer is" | 500 | inizio di un nuovo "Question:" |
 | MedQAbstain-LT | `disi-unibo-nlp/MedQAbstain` (LT, fonte medqa_4opt) | scelta multipla, severità **alta** | Accuracy | 556 | primo a capo |
 | MedQAbstain-Safe | `disi-unibo-nlp/MedQAbstain` (Safe, fonte medqa_4opt) | scelta multipla, severità **bassa** | Accuracy | 556 (tutte) | primo a capo |
-| MedicationQA | `truehealth/medicationqa` | testo libero, severità **alta** | AlignScore | tutte dopo i filtri | inizio di una nuova "Domanda:" |
-| MedQuAD | `lavita/MedQuAD` (solo domande informative) | testo libero, severità **bassa** | AlignScore | 1000 | inizio di una nuova "Domanda:" |
+| MedicationQA | `truehealth/medicationqa` | testo libero, severità **alta** | AlignScore | tutte dopo i filtri | inizio di una nuova "Question:" |
+| MedQuAD | `lavita/MedQuAD` (solo domande informative) | testo libero, severità **bassa** | AlignScore | 1000 | inizio di una nuova "Question:" |
 
 - I primi quattro sono i dataset del paper; gli altri quattro formano la griglia
   **severità × formato**, in cui le due celle di ogni colonna condividono formato e
@@ -504,6 +597,17 @@ verificare che la pipeline riproduca i risultati nel regime di scala originale.
   della fonte a 4 opzioni disponibili nella cella Safe, così che le due celle
   abbiano la stessa dimensione.
 - Il campionamento delle istanze è fissato dal seed 3407.
+- **Prompt**: in inglese. Per i quattro dataset del paper sono i template ufficiali
+  di lm-polygraph per i modelli instruct (sottoinsieme `simple_instruct` in
+  `dataset_builders/builders/` del repository IINemo/lm-polygraph), trascritti
+  carattere per carattere; le celle MCQ cliniche usano lo stesso template di MMLU,
+  quelle a testo libero "Question: ... / Answer:".
+- **Differenze dal protocollo del paper**, da dichiarare: CoQA con una sola
+  domanda per conversazione (l'ultima); MMLU con 1000 domande stratificate invece
+  di fino a 100 per subject; 12 token invece di 3 sui task a scelta multipla, con
+  estrazione della lettera invece del confronto esatto; 256 token su GSM8k come
+  nel protocollo, ma con arresto su un nuovo "Question:"; 5 esempi few-shot di
+  TriviaQA scelti con il nostro seed.
 
 ### Metodi UQ
 
@@ -523,16 +627,18 @@ Il dettaglio è in `excluded_methods.md`, generato a ogni run.
 ## 10. Note metodologiche e limiti noti
 
 - **Precisione non uniforme.** Nei confronti di scala cambiano insieme dimensione
-  e precisione (4 bit per LFM2 e Mistral, bf16 per i Gemma). L'effetto della
-  quantizzazione si legge in modo pulito solo nel confronto dedicato su
-  LFM2-1.2B.
-- **Prompt in italiano** su dataset in inglese; il few-shot è costruito nello
-  stile della pipeline, non copiato dai template di lm-evaluation-harness usati
-  nel paper.
-- **PRR e accuracy.** Il PRR dipende fortemente dall'accuracy di base del modello
-  (vedi `fig_accuracy_vs_prr.png` e `METRICHE.md`). Le celle cliniche a testo
-  libero hanno AlignScore fra 0.05 e 0.25: in quel regime il PRR non è
-  interpretabile.
+  e precisione (4 bit per gli LFM2, bf16 per i Gemma e per Mistral). L'effetto della
+  quantizzazione si legge in modo pulito solo nel confronto dedicato
+  (`--run_quant_comparison`).
+- **Poche risposte giuste o sbagliate.** Il PRR del paper non dipende
+  meccanicamente dall'accuracy, ma con pochi casi nella classe minoritaria è
+  rumoroso: lo mostrano gli intervalli di confidenza. Le celle cliniche a testo
+  libero hanno AlignScore basso: lì gli intervalli vanno letti prima dei valori.
+- **Severità e difficoltà.** Gli strati di severità contengono domande diverse;
+  `fig_severity_matched.png` separa i due effetti in modo approssimato (la
+  difficoltà è stimata dagli altri modelli).
+- **Metodi indistinguibili.** Con poche centinaia di domande molti metodi non sono
+  separabili: una classifica va letta con `paired_comparisons.py`.
 - **Metodi verbalized.** lm-polygraph tratta una confidenza non estraibile come
   massima confidenza, quindi il PRR di un modello che non rispetta il formato va
   letto insieme al parse-failure rate. GSM8k è escluso da questa sezione perché
@@ -540,9 +646,21 @@ Il dettaglio è in `excluded_methods.md`, generato a ogni run.
 - **Costi** misurati su GPU, non su un dispositivo mobile: indicano i rapporti fra
   i metodi, non i tempi reali sul telefono. La memoria di picco è misurata per
   cella modello × dataset, non per singolo metodo.
-- **Differenze rispetto alle run precedenti al 29/09/2026.** Le cartelle di
-  risultati prodotte prima dei commit `8ccbd95` ed `e2dedbf` hanno difetti noti:
-  TriviaQA valutato sullo split di test, che su Hugging Face non ha le risposte;
-  generazione senza stringhe di arresto; silent failure rate errato con i
-  pareggi; costi di alcuni metodi sottostimati; 100 istanze per cella. I dettagli
-  sono nei messaggi di quei commit. Non vanno mescolate con i risultati nuovi.
+- **Correzioni del 29/09/2026** (revisione del codice). Cambiano i risultati:
+  PRR del paper (normalizzato) al posto dell'area grezza, con pareggi in valore
+  atteso; prompt in inglese dai template ufficiali; chat template anche per gli
+  LFM2; un solo BOS nei prompt con chat template (prima due); lettera MCQ non più
+  letta dall'articolo "a"; TriviaQA con tutti gli alias; MMLU stratificato;
+  Mistral in bf16. Cambiano le analisi: confronti appaiati con il migliore scelto
+  in ogni ricampionamento, Bonferroni e stato "non testabile"; errori fra le
+  risposte più confidenti al posto del silent failure rate; Kendall tau per
+  dataset con intervallo bootstrap; severità a parità di difficoltà; fasi di costo
+  dichiarate per ogni calcolatore e metrica di qualità cronometrata a parte.
+  Cambiano velocità e memoria: K campioni in una sola chiamata senza stati
+  nascosti, batch NLI 50/20 invece di 10/2, SDPA sui Gemma. Rendono il run più
+  sicuro: impronta del codice che blocca le riprese miste, scheda delle
+  condizioni di esecuzione, log con modello, dataset e blocco.
+- **Run precedenti.** Le cartelle prodotte prima dei commit `8ccbd95` ed
+  `e2dedbf` hanno anche altri difetti noti (TriviaQA valutato sullo split di test
+  senza risposte, generazione senza stringhe di arresto, 100 istanze per cella).
+  Nessuna run precedente al 29/09 va mescolata con i risultati nuovi.

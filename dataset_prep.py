@@ -18,7 +18,7 @@ import re
 import numpy as np
 from datasets import load_dataset
 
-from lm_polygraph.generation_metrics import AccuracyMetric, AlignScore
+from lm_polygraph.generation_metrics import AlignScore
 from lm_polygraph.generation_metrics.generation_metric import GenerationMetric
 
 
@@ -26,29 +26,41 @@ from lm_polygraph.generation_metrics.generation_metric import GenerationMetric
 # SEZIONE 1 -- I quattro dataset di selective QA della Sezione 5.1 del paper
 # (Vashurin et al., arXiv:2406.15627).
 #
-# Dimensioni (il paper usa 2000 istanze/dataset, 100 per subject su MMLU).
-# Le run fino al 13/09 usavano n=100 (n=50 su GSM8k): troppo poche, con
-# intervalli di confidenza del PRR larghi ~0.19 e la maggior parte dei metodi
-# statisticamente indistinguibili. Ora: CoQA tutte le 500, TriviaQA e MMLU
-# 1000, GSM8k 500. GSM8k e' l'unico limitato per il tempo: le sue generazioni
-# sono molto piu' lunghe (~128 token di ragionamento contro i ~4 degli altri)
-# e sui modelli Gemma costano ~3 minuti per istanza con il campionamento.
-# Per alzarlo basta cambiare il suo n_test: l'esecuzione a blocchi con
-# checkpoint (vedi --chunk_size in main.py) rende sicure anche celle lunghe.
+# PROMPT. Fino al 29/09 tutte le istruzioni erano in italiano, mentre domande,
+# risposte di riferimento, valutatore (AlignScore) e modello NLI sono inglesi:
+# un modello piccolo poteva rispondere in italiano e una risposta giusta veniva
+# giudicata sbagliata, e l'ancora a 7B non poteva essere una replica del paper.
+# Ora i prompt sono quelli ufficiali di lm-polygraph per i modelli instruct,
+# sottoinsieme "simple_instruct" (dataset_builders/builders/{coqa,trivia_qa,
+# mmlu,gsm8k}.py del repository IINemo/lm-polygraph, commit 32cdf4a), trascritti
+# carattere per carattere: tutti i nostri modelli sono instruction-tuned e
+# ricevono il prompt dentro il loro chat template.
 #
-# I prompt 5-shot (TriviaQA/MMLU/GSM8k) sono costruiti in uno stile coerente
-# col resto della pipeline, NON sono una replica byte-per-byte dei template di
-# lm-evaluation-harness citati nel paper -- da tenere come caveat in tesi.
-# Per MMLU il paper campiona fino a 100 domande PER SUBJECT (57 subject); qui
-# se ne campionano 100 totali su tutti i subject insieme (stesso budget degli
-# altri dataset), quindi non tutti i 57 subject saranno rappresentati.
+# Dimensioni (il paper usa fino a 2000 istanze per dataset, 100 per subject su
+# MMLU): CoQA tutte le 500 conversazioni del validation, TriviaQA e MMLU 1000,
+# GSM8k 500. GSM8k e' limitato per il tempo: le sue generazioni sono molto piu'
+# lunghe. L'esecuzione a blocchi con checkpoint (--chunk_size in main.py) rende
+# sicure anche celle lunghe.
+#
+# Differenze dal protocollo del paper, da dichiarare in tesi:
+# - CoQA: una sola domanda per conversazione (l'ultima, con le precedenti come
+#   storico), invece di tutte le domande di ogni conversazione;
+# - MMLU: 1000 domande stratificate sui 57 subject (~18 per subject) invece di
+#   fino a 100 per subject; i 5 esempi few-shot del subject sono quelli dello
+#   split dev nell'ordine del dataset;
+# - MMLU e MedQAbstain: max_new_tokens 12 invece di 3 (vedi MCQ_MAX_NEW_TOKENS)
+#   e lettera estratta con MCQAccuracyMetric invece del confronto esatto;
+# - TriviaQA: 5 esempi few-shot presi dal train con il nostro seed.
 # ---------------------------------------------------------------------------
 
+# Frase che chiude il few-shot nei template ufficiali.
+_FEWSHOT_INTRO = "Here are a few examples of questions and answers:"
+
+
 def prepare_coqa(n_test, seed, cache_dir=None):
-    """CoQA (stanfordnlp/coqa, split 'validation', 500 righe = 500 istanze di
-    test come da Table 2 del paper). Ogni riga e' una conversazione: usiamo
-    tutte le domande/risposte tranne l'ultima come storico (few-shot
-    "naturale") e l'ultima domanda come target, come descritto nel paper."""
+    """CoQA (stanfordnlp/coqa, split 'validation', 500 conversazioni). Template
+    ufficiale coqa/simple_instruct: la storia, poi le domande e risposte
+    precedenti della stessa conversazione come esempi, poi l'ultima domanda."""
     raw = load_dataset("stanfordnlp/coqa", cache_dir=cache_dir)["validation"]
     raw = raw.shuffle(seed=seed).select(range(min(n_test, len(raw))))
     examples = []
@@ -57,111 +69,166 @@ def prepare_coqa(n_test, seed, cache_dir=None):
         answers = row["answers"]["input_text"]
         if len(questions) < 1:
             continue
-        history = list(zip(questions[:-1], answers[:-1]))
-        lines = [
-            "Leggi il passaggio seguente e rispondi in modo breve e diretto alla domanda "
-            "finale della conversazione, nello stesso stile delle risposte precedenti.",
-            "",
-            f"Passaggio: {row['story'].strip()}",
-            "",
-        ]
-        for q, a in history:
-            lines.append(f"D: {q.strip()}")
-            lines.append(f"R: {a.strip()}")
-        lines.append(f"D: {questions[-1].strip()}")
-        examples.append({"content": "\n".join(lines), "reference": answers[-1]})
+        description = (f"Here's a short story:\n\n{row['story']} (End of story)\n\n"
+                       "Answer the following question as briefly as possible.")
+        history = "".join(f"\n\nQuestion: {q}\nAnswer: {a}"
+                          for q, a in zip(questions[:-1], answers[:-1]))
+        if history:
+            few_shot = (f"\n\n{_FEWSHOT_INTRO}{history}"
+                        "\n\nNow answer the following question.\n\n")
+        else:
+            few_shot = "\n\n"
+        content = description + few_shot + f"Question: {questions[-1]}\nAnswer: "
+        examples.append({"content": content, "reference": answers[-1]})
     return examples
 
 
 def prepare_triviaqa(n_test, seed, cache_dir=None, n_fewshot=5):
     """TriviaQA (mandarjoshi/trivia_qa, config 'rc.nocontext' -- "without
-    context" come nel paper). Split train/test hanno 138384/17210 righe,
-    identici ai numeri di Table 2. 5-shot da esempi del train set.
+    context" come nel paper). Template ufficiale triviaqa/simple_instruct.
 
-    Le domande di valutazione vengono dallo split 'validation' (17944 righe),
-    NON da 'test': su Hugging Face il test di TriviaQA non ha le risposte
-    pubbliche e il campo answer vale "<unk>" per ogni riga. Le run fino al
-    13/09 usavano 'test', quindi AlignScore era calcolato contro "<unk>" e
-    tutti i risultati TriviaQA di quelle run non sono validi."""
+    Le domande di valutazione vengono dallo split 'validation', come nel
+    builder ufficiale: su Hugging Face il test di TriviaQA non ha le risposte
+    pubbliche (il campo answer vale "<unk>").
+
+    Riferimento: la LISTA degli alias accettati (answer.aliases), come nel
+    paper (multiref: la qualita' e' il massimo di AlignScore sugli alias, vedi
+    MaxOverReferences). Prima si usava un solo valore, e una risposta giusta
+    espressa con un alias diverso ("JFK" per "John F. Kennedy") poteva risultare
+    sbagliata."""
     raw = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", cache_dir=cache_dir)
     fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
-    fewshot_block = "\n\n".join(
-        f"Domanda: {r['question'].strip()}\nRisposta: {r['answer']['value']}" for r in fewshot
-    )
+    prefix = "Answer the following question as briefly as possible."
+    prefix += f"\n\n{_FEWSHOT_INTRO}\n\n"
+    for r in fewshot:
+        prefix += f"Question: {r['question'].strip()}\nAnswer: {r['answer']['normalized_value']}\n\n"
+    prefix += "Now answer the following question:\n\n"
     evaluation = raw["validation"]
     test = evaluation.shuffle(seed=seed).select(range(min(n_test, len(evaluation))))
     examples = []
     for r in test:
-        if not r["answer"]["value"] or r["answer"]["value"] == "<unk>":
+        aliases = [a for a in r["answer"]["aliases"] if a and a != "<unk>"]
+        if not aliases:
+            aliases = [r["answer"]["value"]] if r["answer"]["value"] not in ("", "<unk>") else []
+        if not aliases:
             raise ValueError("TriviaQA: risposta di riferimento mancante -- split sbagliato?")
-        content = (
-            "Rispondi alla domanda in modo breve e diretto (poche parole), senza spiegazioni.\n\n"
-            f"{fewshot_block}\n\nDomanda: {r['question'].strip()}"
-        )
-        examples.append({"content": content, "reference": r["answer"]["value"]})
+        content = prefix + f"Question: {r['question']}\nAnswer: "
+        examples.append({"content": content, "reference": aliases})
     return examples
 
 
+def _mmlu_block(question, choices, answer=""):
+    return (f"Q:{question}\nA. {choices[0]}\nB. {choices[1]}\nC. {choices[2]}\n"
+            f"D. {choices[3]}\nAnswer:{answer}")
+
+
 def prepare_mmlu(n_test, seed, cache_dir=None):
-    """MMLU (cais/mmlu, config 'all'). 5-shot per-subject usando lo split
-    'dev' (5 esempi per subject, protocollo standard MMLU), come nel paper."""
+    """MMLU (cais/mmlu, config 'all'). Template ufficiale mmlu/simple_instruct,
+    5-shot per subject dallo split 'dev'.
+
+    Campionamento stratificato: le domande vengono prese a turno da ciascuno
+    dei 57 subject (in ordine casuale col seed), cosi' che tutti siano
+    rappresentati come nel paper (che ne prende fino a 100 per subject). Prima
+    se ne prendevano 1000 a caso sull'insieme, e i subject piu' grandi
+    dominavano."""
     raw = load_dataset("cais/mmlu", "all", cache_dir=cache_dir)
     letters = ["A", "B", "C", "D"]
     dev_by_subject = {}
     for r in raw["dev"]:
         dev_by_subject.setdefault(r["subject"], []).append(r)
-    test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
-    examples = []
+
+    test = raw["test"].shuffle(seed=seed)
+    by_subject = {}
     for r in test:
-        fewshot_rows = dev_by_subject.get(r["subject"], [])[:5]
-        blocks = []
-        for f in fewshot_rows:
-            opt_lines = "\n".join(f"{letters[i]}) {c}" for i, c in enumerate(f["choices"]))
-            blocks.append(f"Domanda: {f['question']}\n{opt_lines}\nRisposta: {letters[f['answer']]}")
-        fewshot_block = "\n\n".join(blocks)
-        opt_lines = "\n".join(f"{letters[i]}) {c}" for i, c in enumerate(r["choices"]))
-        content = (
-            "Rispondi SOLO con la lettera dell'opzione corretta (A, B, C o D), senza altro testo.\n\n"
-            f"{fewshot_block}\n\nDomanda: {r['question'].strip()}\n{opt_lines}"
-        )
-        examples.append({"content": content, "reference": letters[r["answer"]]})
+        by_subject.setdefault(r["subject"], []).append(r)
+    subjects = sorted(by_subject)
+    selected, depth = [], 0
+    while len(selected) < n_test and any(depth < len(v) for v in by_subject.values()):
+        for s in subjects:
+            if depth < len(by_subject[s]) and len(selected) < n_test:
+                selected.append(by_subject[s][depth])
+        depth += 1
+
+    examples = []
+    for r in selected:
+        subject = r["subject"].replace("_", " ")
+        description = (f"Given the following question about {subject} and four candidate answers "
+                       "(A, B, C, and D), choose the best answer. Your response should contain only "
+                       "the selected option's letter (A, B, C, or D), not a complete sentence.")
+        few_shot = f"{_FEWSHOT_INTRO}\n\n"
+        for f in dev_by_subject.get(r["subject"], [])[:5]:
+            few_shot += _mmlu_block(f["question"].strip(), f["choices"], letters[f["answer"]]) + "\n\n"
+        few_shot += "Now answer the following question in the same format:\n\n"
+        content = description + "\n\n" + few_shot + _mmlu_block(r["question"].strip(), r["choices"])
+        examples.append({"content": content, "reference": letters[r["answer"]], "subject": r["subject"]})
     return examples
 
 
-def prepare_gsm8k(n_test, seed, cache_dir=None, n_fewshot=5):
-    """GSM8k (openai/gsm8k, config 'main'). Split train/test hanno 7473/1319
-    righe, identici a Table 2. 5-shot dal train set, con la 'reference'
-    ridotta al solo numero finale (dopo '####')."""
+# Esempi few-shot ufficiali di GSM8k in lm-polygraph (dataset_builders/builders/
+# gsm8k.py, base_few_shot_prompt_gsm8k con "Q:"/"A:" sostituiti da
+# "Question:"/"Answer:" come in instruct_few_shot_prompt_gsm8k). Sono gli 8
+# esempi chain-of-thought di Wei et al. (2022), una riga per soluzione.
+GSM8K_FEWSHOT = """Question: There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?
+Answer: There are 15 trees originally. Then there were 21 trees after some more were planted. So there must have been 21 - 15 = 6. The answer is 6.
+
+Question: If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?
+Answer: There are originally 3 cars. 2 more cars arrive. 3 + 2 = 5. The answer is 5.
+
+Question: Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?
+Answer: Originally, Leah had 32 chocolates. Her sister had 42. So in total they had 32 + 42 = 74. After eating 35, they had 74 - 35 = 39. The answer is 39.
+
+Question: Jason had 20 lollipops. He gave Denny some lollipops. Now Jason has 12 lollipops. How many lollipops did Jason give to Denny?
+Answer: Jason started with 20 lollipops. Then he had 12 after giving some to Denny. So he gave Denny 20 - 12 = 8. The answer is 8.
+
+Question: Shawn has five toys. For Christmas, he got two toys each from his mom and dad. How many toys does he have now?
+Answer: Shawn started with 5 toys. If he got 2 toys each from his mom and dad, then that is 4 more toys. 5 + 4 = 9. The answer is 9.
+
+Question: There were nine computers in the server room. Five more computers were installed each day, from monday to thursday. How many computers are now in the server room?
+Answer: There were originally 9 computers. For each of 4 days, 5 more computers were added. So 5 * 4 = 20 computers were added. 9 + 20 is 29. The answer is 29.
+
+Question: Michael had 58 golf balls. On tuesday, he lost 23 golf balls. On wednesday, he lost 2 more. How many golf balls did he have at the end of wednesday?
+Answer: Michael started with 58 golf balls. After losing 23 on tuesday, he had 58 - 23 = 35. After losing 2 more, he had 35 - 2 = 33 golf balls. The answer is 33.
+
+Question: Olivia has $23. She bought five bagels for $3 each. How much money does she have left?
+Answer: Olivia had 23 dollars. 5 bagels for 3 dollars each will be 5 x 3 = 15 dollars. So she has 23 - 15 dollars left. 23 - 15 is 8. The answer is 8."""
+
+
+def prepare_gsm8k(n_test, seed, cache_dir=None):
+    """GSM8k (openai/gsm8k, config 'main'). Template ufficiale
+    gsm8k/simple_instruct: istruzione, 8 esempi chain-of-thought, domanda. La
+    'reference' e' il solo numero finale (dopo '####')."""
     raw = load_dataset("openai/gsm8k", "main", cache_dir=cache_dir)
-    fewshot = raw["train"].shuffle(seed=seed).select(range(n_fewshot))
-    blocks = []
-    for r in fewshot:
-        ans_clean = r["answer"].replace("####", "Risposta finale:")
-        blocks.append(f"Problema: {r['question'].strip()}\nSoluzione: {ans_clean}")
-    fewshot_block = "\n\n".join(blocks)
+    prefix = ('Given the following question, reason and give a final answer to the question. '
+              'Your response should end with "The answer is [answer]" where [answer] is the '
+              f'response to the question.\n\n{_FEWSHOT_INTRO}\n\n{GSM8K_FEWSHOT}\n\n'
+              'Now answer the following question.')
     test = raw["test"].shuffle(seed=seed).select(range(min(n_test, len(raw["test"]))))
     examples = []
     for r in test:
-        content = (
-            "Risolvi il problema passo per passo, poi scrivi il risultato finale preceduto "
-            "esattamente da 'Risposta finale:'.\n\n"
-            f"{fewshot_block}\n\nProblema: {r['question'].strip()}"
-        )
+        content = prefix + f"\n\nQuestion: {r['question']}\nAnswer:"
         final = r["answer"].split("####")[-1].strip().replace(",", "")
         examples.append({"content": content, "reference": final})
     return examples
 
 
 class GSM8kAccuracyMetric(GenerationMetric):
-    """lm-polygraph non ha una metrica pronta per problemi matematici a
-    risposta numerica (solo Accuracy per multiple-choice o AlignScore per
-    testo libero). Estrae l'ULTIMO numero presente nel testo generato
-    (robusto anche se il modello non segue esattamente il formato "Risposta
-    finale: X" richiesto nel prompt) e lo confronta col numero di riferimento
-    con una tolleranza numerica minima.
+    """Accuracy su GSM8k: il numero dopo "The answer is" (il formato chiesto
+    dal template ufficiale) confrontato col numero di riferimento.
+
+    Il protocollo di lm-polygraph fa la stessa cosa con
+    output_ignore_regex "(?s).*The answer is " e un confronto esatto dopo la
+    normalizzazione; qui il confronto e' numerico (tollera "18.00" contro
+    "18", "$18", "1,250") e si prende la PRIMA occorrenza di "The answer is",
+    non l'ultima: se un modello, finita la soluzione, inventasse un nuovo
+    esempio completo di risposta, l'ultima occorrenza sarebbe quella inventata.
+    Le stringhe di arresto (vedi DATASETS) tagliano gia' la continuazione;
+    questo e' il secondo livello di difesa. Se il formato manca si usa
+    l'ultimo numero del testo.
 
     Range: 0.0 o 1.0 per istanza (binaria), quindi la media su un dataset e'
     l'accuracy nell'intervallo [0, 1]."""
+
+    ANSWER_MARKER = re.compile(r"The answer is\s*:?\s*\$?\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
 
     def __init__(self):
         super().__init__(["greedy_texts"], "sequence")
@@ -169,29 +236,16 @@ class GSM8kAccuracyMetric(GenerationMetric):
     def __str__(self):
         return "GSM8kAccuracy"
 
-    @staticmethod
-    def _extract_number(text):
-        cleaned = text.replace(",", "")
-        # Prima scelta: il numero dopo "Risposta finale:", cioe' esattamente
-        # il formato chiesto dal prompt. Serve perche' i modelli senza chat
-        # template, finita la soluzione, continuano a generare un nuovo
-        # "Problema: ..." inventato: prendendo l'ULTIMO numero del testo si
-        # finiva per leggere un numero di quel problema. Le stringhe di arresto
-        # (vedi DATASETS) tagliano gia' la continuazione; questo e' il secondo
-        # livello di difesa.
-        final = re.search(r"Risposta finale:\s*\$?\s*(-?\d+\.?\d*)", cleaned)
+    @classmethod
+    def _extract_number(cls, text):
+        cleaned = str(text).replace(",", "")
+        final = cls.ANSWER_MARKER.search(cleaned)
         if final:
-            try:
-                return float(final.group(1))
-            except ValueError:
-                pass
-        matches = re.findall(r"-?\d+\.?\d*", cleaned)
+            return float(final.group(1))
+        matches = re.findall(r"-?\d+(?:\.\d+)?", cleaned)
         if not matches:
             return None
-        try:
-            return float(matches[-1])
-        except ValueError:
-            return None
+        return float(matches[-1])
 
     def __call__(self, stats, target_texts):
         preds = stats["greedy_texts"]
@@ -247,13 +301,14 @@ ALL_AVAILABLE = 10 ** 9
 # (su GSM8k l'estrattore leggeva un numero del problema inventato) e nei
 # punteggi di incertezza calcolati sui token generati.
 #
-# Il protocollo ufficiale di lm-polygraph (examples/configs/polygraph_eval_*.yaml,
-# lo stesso del paper) ferma la generazione al primo a capo, stop_strings:
-# ["\n"], per CoQA, TriviaQA, MMLU e GSM8k. Lo adottiamo per tutti i task a
-# risposta breve. Due eccezioni, perche' la risposta attesa occupa piu' righe:
-#   - GSM8k: il nostro few-shot ha soluzioni su piu' righe (quello ufficiale
-#     le ha su una riga sola), quindi ci si ferma all'inizio del problema
-#     successivo inventato;
+# Il protocollo ufficiale di lm-polygraph per i modelli instruct
+# (examples/configs/polygraph_eval_*_simple_instruct.yaml) ferma la generazione
+# al primo a capo, stop_strings: ["\n"], per CoQA, TriviaQA e MMLU. Lo adottiamo
+# per tutti i task a risposta breve. Due eccezioni, perche' la risposta attesa
+# puo' occupare piu' righe:
+#   - GSM8k: la configurazione ufficiale non ha arresti (un modello instruct
+#     puo' ragionare su piu' righe); ci si ferma solo se inizia un nuovo
+#     esempio inventato ("\nQuestion:");
 #   - MedicationQA e MedQuAD: risposte libere lunghe, stesso criterio.
 # `continuation_stop_strings` contiene solo l'arresto sull'esempio inventato:
 # e' quello usato dalla sezione verbalized, dove la confidenza va scritta su
@@ -271,14 +326,21 @@ class MCQAccuracyMetric(GenerationMetric):
     "Risposta:", "La lettera corretta e'", asterischi di markdown, a capo).
 
     Strategia, dalla piu' affidabile alla piu' permissiva:
-      1. lettera isolata come parola a se' ("C", "C)", "(C)", "**C**", " C.")
-         -> e' il caso di gran lunga piu' frequente col prompt attuale, che
-         chiede esplicitamente la sola lettera;
-      2. se non c'e', la prima lettera valida preceduta da un marcatore di
-         risposta ("Risposta: C", "answer is C");
-      3. se non c'e' nemmeno quella, nessuna estrazione -> istanza sbagliata.
+      0. risposta che e' la sola lettera, anche minuscola ("c", "C.", "(c)");
+      1. lettera dopo un marcatore esplicito di risposta ("Answer: C",
+         "The answer is C", "Risposta: C");
+      2. lettera MAIUSCOLA isolata che non sia l'articolo inglese "A": si
+         scarta una "A" seguita da spazio e da una parola minuscola ("A patient
+         with..."), che e' un articolo e non un'opzione;
+      3. qualunque lettera maiuscola isolata (copre "B is correct");
+      4. altrimenti nessuna estrazione -> istanza sbagliata.
 
-    Il caso 3 e' informativo di suo e viene contato: un parse-failure rate alto
+    BUG CORRETTO il 29/09: prima il testo veniva messo in maiuscolo PRIMA di
+    cercare la lettera isolata, quindi l'articolo inglese "a" diventava "A" e
+    veniva letto come la risposta ("I think it is a C" -> A). Ora le lettere si
+    cercano nel testo originale e solo maiuscole (tranne al passo 0).
+
+    Il caso 4 e' informativo di suo e viene contato: un parse-failure rate alto
     significa che il modello non rispetta il formato, ed e' un risultato da
     riportare, non da nascondere dentro un'accuracy bassa (stessa logica del
     parse-failure rate dei metodi verbalized).
@@ -289,15 +351,27 @@ class MCQAccuracyMetric(GenerationMetric):
     def __init__(self, valid_letters="ABCD"):
         super().__init__(["greedy_texts"], "sequence")
         self.valid_letters = valid_letters.upper()
-        # Lettera isolata: non attaccata ad altre lettere. Consente
-        # punteggiatura e delimitatori attorno.
-        self._standalone = re.compile(
-            rf"(?<![A-Za-z])([{self.valid_letters}])(?![A-Za-z])")
-        # Ripiego: dopo un marcatore esplicito di risposta.
+        L = self.valid_letters
+        self._only_letter = re.compile(rf"^[\s\*\(\[]*([{L}{L.lower()}])[\s\*\)\]\.:,]*$")
+        # Marcatore case-insensitive, lettera case-sensitive e isolata.
         self._after_marker = re.compile(
-            rf"(?:risposta|answer|opzione|option)\s*(?:corretta|is|:|e')?\s*"
-            rf"[:\-\)\s]*([{self.valid_letters}])",
-            re.IGNORECASE)
+            rf"(?i:answer\s+is|answer|risposta\s+(?:corretta\s+)?(?:e'|è)|risposta|option|opzione)"
+            rf"\s*[:\-]?\s*[\*\(\[]*([{L}])(?![A-Za-z])")
+        # Etichetta d'opzione minuscola a inizio risposta: "a) placing the infant".
+        self._lower_label = re.compile(rf"^[\s\*]*[\(\[]?([{L.lower()}])[\)\]]\s")
+        # Due lettere coordinate ("Both A and C", "A or B", "A, C"): risposta
+        # ambigua, conta come non estraibile invece di prendere l'ultima.
+        self._ambiguous = re.compile(
+            rf"(?<![A-Za-z])[{L}](?![A-Za-z])\s*(?:,|&|/|\band\b|\bor\b)\s*[{L}](?![A-Za-z])")
+        # Senza parola minuscola o numero dopo: esclude l'articolo inglese
+        # ("A patient...", "A 3-month-old...").
+        self._standalone_strict = re.compile(
+            rf"(?<![A-Za-z])([{L}])(?![A-Za-z])(?!\s+[a-z0-9])")
+        # Ultima risorsa ("B is correct"). La "A" seguita da una parola
+        # minuscola o da un numero e' l'articolo, non una risposta.
+        L_noA = L.replace("A", "")
+        self._standalone = re.compile(
+            rf"(?<![A-Za-z])(A(?![A-Za-z])(?!\s+[a-z0-9])|[{L_noA}](?![A-Za-z]))")
         self.n_parse_failures = 0
         self.n_seen = 0
         # Campione di generazioni grezze, per poter GUARDARE cosa risponde il
@@ -318,12 +392,16 @@ class MCQAccuracyMetric(GenerationMetric):
         if text is None:
             return None
         candidate = str(text).strip()
-        match = self._standalone.search(candidate.upper())
-        if match:
-            return match.group(1)
-        match = self._after_marker.search(candidate)
-        if match:
-            return match.group(1).upper()
+        for pattern in (self._only_letter, self._after_marker, self._lower_label):
+            match = pattern.search(candidate)
+            if match:
+                return match.group(1).upper()
+        if self._ambiguous.search(candidate):
+            return None
+        for pattern in (self._standalone_strict, self._standalone):
+            match = pattern.search(candidate)
+            if match:
+                return match.group(1).upper()
         return None
 
     def __call__(self, stats, target_texts):
@@ -363,8 +441,19 @@ def self_test_mcq_metric():
     casi = [
         ("C", "C", 1.0), (" C ", "C", 1.0), ("C.", "C", 1.0), ("(C)", "C", 1.0),
         ("**C**", "C", 1.0), ("\n\nC", "C", 1.0), ("C) Aspirina", "C", 1.0),
+        ("c", "C", 1.0), ("B. Heparin drip", "B", 1.0),
         ("La risposta e' C", "C", 1.0), ("Risposta: B", "B", 1.0),
-        ("The answer is B", "B", 1.0), ("D", "A", 0.0), ("Non lo so", "A", 0.0),
+        ("The answer is B", "B", 1.0), ("Answer: D", "D", 1.0),
+        ("D", "A", 0.0), ("Non lo so", "A", 0.0), ("I don't know", "A", 0.0),
+        # il bug dell'articolo inglese "a"/"A" (corretto il 29/09)
+        ("I think it is a C", "C", 1.0), ("A patient with... B", "B", 1.0),
+        ("It is a tricky one, but B", "B", 1.0), ("A. Anticipation", "A", 1.0),
+        ("A", "A", 1.0), ("B is correct", "B", 1.0),
+        # casi limite trovati in revisione (29/09)
+        ("Both A and C", "C", 0.0), ("A or B", "A", 0.0),
+        ("A 3-month-old infant presents with fever", "A", 0.0),
+        ("a) placing the infant supine", "A", 1.0), ("(b) Heparin", "B", 1.0),
+        ("A) Aspirin", "A", 1.0), ("Answer: A and B", "A", 1.0),
     ]
     preds = [c[0] for c in casi]
     refs = [c[1] for c in casi]
@@ -435,16 +524,16 @@ MEDQA_FEWSHOT_EXAMPLES = [
 ]
 
 
+def _mcq_block(question, options, answer=""):
+    """Stesso formato di MMLU/simple_instruct ("Q:...\nA. ...\nAnswer:"),
+    cosi' che le celle MCQ cliniche e MMLU condividano il template."""
+    opt_lines = "\n".join(f"{letter}. {text}" for letter, text in sorted(options.items()))
+    return f"Q:{question}\n{opt_lines}\nAnswer:{answer}"
+
+
 def _build_medqa_fewshot_block():
-    blocks = []
-    for ex in MEDQA_FEWSHOT_EXAMPLES:
-        opts = ex["options"]
-        blocks.append(
-            f"Domanda: {ex['question']}\n\n"
-            f"A) {opts['A']}\nB) {opts['B']}\nC) {opts['C']}\nD) {opts['D']}\n\n"
-            f"Risposta: {ex['answer_idx']}"
-        )
-    return "\n\n".join(blocks)
+    return "".join(_mcq_block(ex["question"], ex["options"], ex["answer_idx"]) + "\n\n"
+                   for ex in MEDQA_FEWSHOT_EXAMPLES)
 
 
 def _parse_options_dict(raw_value):
@@ -507,14 +596,16 @@ def prepare_medqabstain(n_test, seed, cache_dir=None, split="LT", source="medqa_
         gold = ex["original_answer"].strip()
         if gold not in opts:
             continue
-        opt_lines = "\n".join(f"{letter}) {text}" for letter, text in sorted(opts.items()))
-        letters_str = ", ".join(sorted(opts.keys()))
+        letters = sorted(opts.keys())
+        letters_str = ", ".join(letters[:-1]) + f", and {letters[-1]}"
         content = (
-            "Sei un assistente medico che risponde a domande in stile esame USMLE.\n"
-            "Leggi il quesito clinico e rispondi SOLO con la lettera dell'opzione corretta "
-            f"({letters_str}), senza altro testo.\n\n"
-            f"{fewshot_block}\n\n"
-            f"Domanda: {ex['question'].strip()}\n\n{opt_lines}"
+            f"Given the following USMLE-style clinical question and {len(letters)} candidate answers "
+            f"({letters_str}), choose the best answer. Your response should contain only the "
+            f"selected option's letter ({', '.join(letters[:-1])}, or {letters[-1]}), not a complete "
+            "sentence.\n\n"
+            f"{_FEWSHOT_INTRO}\n\n{fewshot_block}"
+            "Now answer the following question in the same format:\n\n"
+            + _mcq_block(ex["question"].strip(), opts)
         )
         examples.append({"content": content, "reference": gold})
     return examples
@@ -562,9 +653,9 @@ def prepare_medicationqa(n_test, seed, cache_dir=None):
     examples = []
     for ex in raw:
         content = (
-            "Sei un assistente farmaceutico che risponde a domande reali di pazienti sui farmaci "
-            "(dosaggi, interazioni, effetti collaterali). Rispondi in modo chiaro e conciso.\n\n"
-            f"Domanda: {ex['Question'].strip()}"
+            "Answer the following question from a patient about a medication (dosage, "
+            "interactions, side effects) clearly and concisely.\n\n"
+            f"Question: {ex['Question'].strip()}\nAnswer: "
         )
         examples.append({"content": content, "reference": ex["Answer"].strip()})
     return examples
@@ -610,9 +701,9 @@ def prepare_medquad(n_test, seed, cache_dir=None):
     examples = []
     for ex in raw:
         content = (
-            "Sei un assistente medico che risponde a domande informative di pazienti "
-            "su malattie e condizioni cliniche. Rispondi in modo chiaro e conciso.\n\n"
-            f"Domanda: {ex['question'].strip()}"
+            "Answer the following question from a patient about a disease or medical condition "
+            "clearly and concisely.\n\n"
+            f"Question: {ex['question'].strip()}\nAnswer: "
         )
         examples.append({"content": content, "reference": ex["answer"].strip()})
     return examples
@@ -651,106 +742,172 @@ LINGUISTIC_EXPRESSIONS = {
 VERBALIZED_CONFIDENCE_REGEX = r"Confidence:\s*([01]?\.?\d+)"
 
 _VERBALIZED_NUMERIC_INSTRUCTION = (
-    "\n\nDopo la risposta, su una nuova riga, dichiara quanto sei sicuro della tua "
-    "risposta nel formato esatto:\nConfidence: <numero tra 0.00 e 1.00>"
+    "After your answer, on a new line, state how confident you are that your answer is "
+    "correct, in exactly this format:\nConfidence: <a number between 0.00 and 1.00>"
 )
 
 _VERBALIZED_LINGUISTIC_INSTRUCTION = (
-    "\n\nDopo la risposta, su una nuova riga, dichiara quanto sei sicuro della tua "
-    "risposta nel formato esatto:\nConfidence: <una tra Very Low, Low, Moderate, High, Very High>"
+    "After your answer, on a new line, state how confident you are that your answer is "
+    "correct, in exactly this format:\nConfidence: <one of Very Low, Low, Moderate, High, Very High>"
 )
 
 
 def build_verbalized_content(content, style):
-    """Aggiunge in coda al prompt la richiesta di dichiarare la confidenza.
-    `style` e' "numeric" (per Verbalized1S) o "linguistic" (per Linguistic1S)."""
+    """Inserisce la richiesta di dichiarare la confidenza PRIMA della riga
+    finale "Answer:" del prompt (che deve restare l'ultima, perche' la
+    risposta del modello la continua). `style` e' "numeric" (per
+    Verbalized1S) o "linguistic" (per Linguistic1S)."""
     if style == "numeric":
-        return content + _VERBALIZED_NUMERIC_INSTRUCTION
-    if style == "linguistic":
-        return content + _VERBALIZED_LINGUISTIC_INSTRUCTION
-    raise ValueError(f"Stile verbalized sconosciuto: {style}")
+        instruction = _VERBALIZED_NUMERIC_INSTRUCTION
+    elif style == "linguistic":
+        instruction = _VERBALIZED_LINGUISTIC_INSTRUCTION
+    else:
+        raise ValueError(f"Stile verbalized sconosciuto: {style}")
+    head, sep, last = content.rpartition("\n")
+    if sep and last.lstrip().startswith("Answer:"):
+        return f"{head}\n{instruction}\n{last}"
+    return f"{content}\n\n{instruction}"
 
 
 # ---------------------------------------------------------------------------
 # SEZIONE 4 -- Costruzione del prompt finale e registri di configurazione.
 # ---------------------------------------------------------------------------
 
-def format_prompt(content, suffix):
-    """Prompt a completamento di testo semplice (modelli base, es. LFM2)."""
+def format_prompt(content, suffix=""):
+    """Prompt a completamento di testo semplice. Nessuno dei modelli attuali lo
+    usa (sono tutti instruction-tuned, vedi CHAT_TEMPLATE_MODELS in main.py):
+    resta come ripiego per un tokenizer senza chat template."""
     return content + suffix
 
 
+def tokenizer_adds_bos(tokenizer):
+    """True se il tokenizer aggiunge da solo il token BOS quando si chiama
+    tokenizer(testo) con add_special_tokens=True (il default)."""
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_id is None:
+        return False
+    ids = tokenizer("x", add_special_tokens=True)["input_ids"]
+    return len(ids) > 0 and ids[0] == bos_id
+
+
 def format_chat_prompt(tokenizer, content):
-    """Prompt con chat template per modelli instruction-tuned (MedGemma,
-    Gemma3, Mistral-Instruct)."""
+    """Prompt con il chat template del modello (tutti i modelli attuali sono
+    instruction-tuned).
+
+    BUG CORRETTO il 29/09 -- doppio BOS. Il chat template di Gemma 3, Mistral e
+    LFM2 comincia con il token BOS ("<bos>", "<s>", "<|startoftext|>"), e
+    WhiteboxModel.tokenize() tokenizza poi il testo con add_special_tokens=True,
+    che aggiunge un secondo BOS in testa. Due BOS di fila sono un input fuori
+    distribuzione (per Gemma la documentazione lo segnala esplicitamente come
+    causa di output degradati). Qui il BOS scritto dal template viene tolto
+    quando il tokenizer lo aggiunge gia' da solo, cosi' che la sequenza
+    tokenizzata ne abbia esattamente uno."""
     messages = [{"role": "user", "content": content}]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    bos = getattr(tokenizer, "bos_token", None)
+    if bos and text.startswith(bos) and tokenizer_adds_bos(tokenizer):
+        text = text[len(bos):]
+    return text
 
 
-# I quattro dataset della replica del paper (Sezione 5.1).
+class MaxOverReferences(GenerationMetric):
+    """Qualita' con piu' risposte di riferimento accettate (TriviaQA): il
+    massimo della metrica base sui riferimenti, come AggregatedMetric di
+    lm-polygraph (usato dal protocollo ufficiale con multiref: true), ma con
+    tutte le coppie (risposta, riferimento) valutate in una sola chiamata
+    invece che una alla volta."""
+
+    def __init__(self, base_metric):
+        super().__init__(base_metric.stats_dependencies, base_metric.level)
+        self.base_metric = base_metric
+
+    def __str__(self):
+        return str(self.base_metric)
+
+    def __call__(self, stats, target_texts):
+        preds = stats["greedy_texts"]
+        inputs = stats.get("input_texts", [""] * len(preds))
+        flat_pred, flat_ref, flat_inp, owner = [], [], [], []
+        for i, (pred, refs) in enumerate(zip(preds, target_texts)):
+            refs = [refs] if isinstance(refs, str) else list(refs)
+            for r in refs:
+                flat_pred.append(pred)
+                flat_ref.append(r)
+                flat_inp.append(inputs[i])
+                owner.append(i)
+        values = np.asarray(self.base_metric({"greedy_texts": flat_pred, "input_texts": flat_inp},
+                                             flat_ref), dtype=float)
+        out = np.full(len(preds), np.nan)
+        for v, i in zip(values, owner):
+            out[i] = v if np.isnan(out[i]) else max(out[i], v)
+        return out
+
+
+# I quattro dataset della replica del paper (Sezione 5.1). max_new_tokens e
+# stringhe di arresto seguono le configurazioni ufficiali
+# (examples/configs/polygraph_eval_*_simple_instruct.yaml), tranne dove
+# indicato. `plain_suffix` e' vuoto perche' il contenuto termina gia' con la
+# riga "Answer:" del template.
 DATASETS = {
     "CoQA": {
         "loader": prepare_coqa,
         "n_test": ALL_AVAILABLE,
-        "max_new_tokens": 30,
-        "plain_suffix": "\nR:",
+        "max_new_tokens": 20,
+        "plain_suffix": "",
         "stop_strings": STOP_FIRST_NEWLINE,
-        "continuation_stop_strings": ["\nD:"],
+        "continuation_stop_strings": ["\nQuestion:"],
         "generation_metric_factory": lambda: AlignScore(),
     },
     "TriviaQA": {
         "loader": prepare_triviaqa,
         "n_test": 1000,
         "max_new_tokens": 20,
-        "plain_suffix": "\nRisposta:",
+        "plain_suffix": "",
         "stop_strings": STOP_FIRST_NEWLINE,
-        "continuation_stop_strings": ["\nDomanda:"],
-        "generation_metric_factory": lambda: AlignScore(),
+        "continuation_stop_strings": ["\nQuestion:"],
+        # Piu' riferimenti accettati (gli alias), massimo su di essi.
+        "generation_metric_factory": lambda: MaxOverReferences(AlignScore()),
     },
     "MMLU": {
         "loader": prepare_mmlu,
         "n_test": 1000,
-        # Era 3, ed era troppo stretto. Con tre token un modello che premette
-        # anche una sola parola ("La", "The", "Risposta:") esaurisce il budget
+        # Il protocollo ufficiale usa 3 token. Con tre token un modello che
+        # premette anche una sola parola ("The", "Answer:") esaurisce il budget
         # prima di arrivare alla lettera, e la risposta risulta non estraibile
         # qualunque sia la robustezza dell'estrattore. Misurato nella run
-        # 15293305: MedGemma 88 risposte non estraibili su 100, Mistral 49,
-        # mentre Gemma3 (2) e LFM2 (0) emettono la lettera subito. Non era
-        # ignoranza dei modelli, era il nostro budget.
+        # 15293305: MedGemma 88 risposte non estraibili su 100, Mistral 49.
         "max_new_tokens": MCQ_MAX_NEW_TOKENS,
-        "plain_suffix": "\n\nRisposta:",
+        "plain_suffix": "",
         "stop_strings": STOP_FIRST_NEWLINE,
-        "continuation_stop_strings": ["\nDomanda:"],
+        "continuation_stop_strings": ["\nQ:"],
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
     },
     "GSM8k": {
         "loader": prepare_gsm8k,
         "n_test": 500,
-        # Target medio 128.6 token (Table 2, tokenizer Mistral 7B v0.2):
-        # margine ampio per lasciare spazio al ragionamento completo prima del
-        # numero finale.
-        "max_new_tokens": 200,
-        "plain_suffix": "\nSoluzione:",
-        "stop_strings": ["\nProblema:"],
-        "continuation_stop_strings": ["\nProblema:"],
+        "max_new_tokens": 256,
+        "plain_suffix": "",
+        # La configurazione ufficiale simple_instruct non ha stringhe di
+        # arresto (il modello chiude il turno). Qui ci si ferma anche se il
+        # modello inizia un nuovo esempio inventato.
+        "stop_strings": ["\nQuestion:"],
+        "continuation_stop_strings": ["\nQuestion:"],
         "generation_metric_factory": lambda: GSM8kAccuracyMetric(),
     },
 }
 
 
 # Griglia 2x2 severita' x formato. I campi `severity` e `answer_format`
-# servono a main.py per disporre i pannelli della figura e per verificare che
-# le celle confrontate direttamente condividano la metrica.
+# servono a make_figures.py per disporre i pannelli della figura e per
+# verificare che le celle confrontate direttamente condividano la metrica.
 SEVERITY_DATASETS = {
     "MedQAbstain-LT": {
         "loader": prepare_medqabstain_lt,
         "n_test": 556,
-        # Stesso motivo di MMLU: con 3 token la lettera non entra nella
-        # generazione dei modelli che premettono testo. Vedi MCQ_MAX_NEW_TOKENS.
         "max_new_tokens": MCQ_MAX_NEW_TOKENS,
-        "plain_suffix": "\n\nRisposta:",
+        "plain_suffix": "",
         "stop_strings": STOP_FIRST_NEWLINE,
-        "continuation_stop_strings": ["\nDomanda:"],
+        "continuation_stop_strings": ["\nQ:"],
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "alta",
         "answer_format": "MCQ",
@@ -763,9 +920,9 @@ SEVERITY_DATASETS = {
         # direttamente per isolare la severita', quindi ogni condizione tranne
         # la severita' va tenuta uguale.
         "max_new_tokens": MCQ_MAX_NEW_TOKENS,
-        "plain_suffix": "\n\nRisposta:",
+        "plain_suffix": "",
         "stop_strings": STOP_FIRST_NEWLINE,
-        "continuation_stop_strings": ["\nDomanda:"],
+        "continuation_stop_strings": ["\nQ:"],
         "generation_metric_factory": lambda: MCQAccuracyMetric(),
         "severity": "bassa",
         "answer_format": "MCQ",
@@ -775,9 +932,9 @@ SEVERITY_DATASETS = {
         "loader": prepare_medicationqa,
         "n_test": ALL_AVAILABLE,
         "max_new_tokens": 100,
-        "plain_suffix": "\nRisposta:",
-        "stop_strings": ["\nDomanda:"],
-        "continuation_stop_strings": ["\nDomanda:"],
+        "plain_suffix": "",
+        "stop_strings": ["\nQuestion:"],
+        "continuation_stop_strings": ["\nQuestion:"],
         "generation_metric_factory": lambda: AlignScore(),
         "severity": "alta",
         "answer_format": "libera",
@@ -787,9 +944,9 @@ SEVERITY_DATASETS = {
         "loader": prepare_medquad,
         "n_test": 1000,
         "max_new_tokens": 100,
-        "plain_suffix": "\nRisposta:",
-        "stop_strings": ["\nDomanda:"],
-        "continuation_stop_strings": ["\nDomanda:"],
+        "plain_suffix": "",
+        "stop_strings": ["\nQuestion:"],
+        "continuation_stop_strings": ["\nQuestion:"],
         "generation_metric_factory": lambda: AlignScore(),
         "severity": "bassa",
         "answer_format": "libera",
