@@ -22,3 +22,7 @@ results/
 results.prev/
 smoke_*/
 *.csv.bak
+# Cartelle di risultati alternative (smoke test, costi, run vecchi) e log di lancio.
+results_*/
+chunks_rimossi/
+*.log
