@@ -1,0 +1,657 @@
+{
+ "source": "IINemo/lm-polygraph@32cdf4a examples/configs (polygraph_eval_*.yaml, instruct/*.yaml)",
+ "whitebox": {
+  "CoQA": {
+   "hf_dataset": "LM-polygraph/coqa",
+   "subset": "continuation",
+   "split": "test",
+   "size": null,
+   "max_new_tokens": 20,
+   "stop_strings": [
+    "\n"
+   ],
+   "multiref": false,
+   "process_output_fn": "normalize_em_coqa",
+   "process_target_fn": "normalize_em_coqa",
+   "target_ignore_regex": null,
+   "output_ignore_regex": null,
+   "normalize": false
+  },
+  "TriviaQA": {
+   "hf_dataset": "LM-Polygraph/triviaqa",
+   "subset": "continuation",
+   "split": "test",
+   "size": 10000,
+   "max_new_tokens": 20,
+   "stop_strings": [
+    "\n"
+   ],
+   "multiref": true,
+   "process_output_fn": "normalize_em_triviaqa",
+   "process_target_fn": "normalize_em_triviaqa",
+   "target_ignore_regex": null,
+   "output_ignore_regex": null,
+   "normalize": false
+  },
+  "MMLU": {
+   "hf_dataset": "LM-Polygraph/mmlu",
+   "subset": "continuation",
+   "split": "test",
+   "size": 10000,
+   "max_new_tokens": 3,
+   "stop_strings": [
+    "\n"
+   ],
+   "multiref": false,
+   "process_output_fn": null,
+   "process_target_fn": null,
+   "target_ignore_regex": null,
+   "output_ignore_regex": null,
+   "normalize": false
+  },
+  "GSM8k": {
+   "hf_dataset": "LM-Polygraph/gsm8k",
+   "subset": "continuation",
+   "split": "test",
+   "size": 10000,
+   "max_new_tokens": 256,
+   "stop_strings": [
+    "\n"
+   ],
+   "multiref": false,
+   "process_output_fn": null,
+   "process_target_fn": null,
+   "target_ignore_regex": "(?s).*#### ",
+   "output_ignore_regex": "(?s).*The answer is ",
+   "normalize": true
+  }
+ },
+ "blackbox": {
+  "empirical_baselines": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "empirical_baselines",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 30,
+    "stop_strings": [
+     "\n"
+    ],
+    "multiref": false,
+    "process_output_fn": "process_output_top1_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": "default_blackbox_estimators"
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "empirical_baselines",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 30,
+    "stop_strings": [
+     "\n"
+    ],
+    "multiref": true,
+    "process_output_fn": "process_output_top1_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": "default_blackbox_estimators"
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "empirical_baselines",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 13,
+    "stop_strings": [
+     "\n"
+    ],
+    "multiref": false,
+    "process_output_fn": "process_output_top1",
+    "process_target_fn": "normalize_text",
+    "estimators": "default_blackbox_estimators"
+   }
+  },
+  "ling_1s": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "ling_1s",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 40,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_top1_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": [
+     {
+      "name": "Linguistic1S",
+      "cfg": {
+       "expressions": {
+        "Almost Certain": 0.95,
+        "Highly Likely": 0.9,
+        "Very Good Chance": 0.8,
+        "We Beleive": 0.75,
+        "Probably": 0.7,
+        "Probable": 0.7,
+        "Likely": 0.7,
+        "Better than Even": 0.6,
+        "About Even": 0.5,
+        "Probably Not": 0.25,
+        "We Doubt": 0.2,
+        "Unlikely": 0.2,
+        "Little Chance": 0.1,
+        "Chances Are Slight": 0.1,
+        "Improbable": 0.1,
+        "Highly Unlikely": 0.05,
+        "Almost No Chance": 0.02
+       }
+      }
+     }
+    ]
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "ling_1s",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 40,
+    "stop_strings": null,
+    "multiref": true,
+    "process_output_fn": "process_output_top1_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": [
+     {
+      "name": "Linguistic1S",
+      "cfg": {
+       "expressions": {
+        "Almost Certain": 0.95,
+        "Highly Likely": 0.9,
+        "Very Good Chance": 0.8,
+        "We Beleive": 0.75,
+        "Probably": 0.7,
+        "Probable": 0.7,
+        "Likely": 0.7,
+        "Better than Even": 0.6,
+        "About Even": 0.5,
+        "Probably Not": 0.25,
+        "We Doubt": 0.2,
+        "Unlikely": 0.2,
+        "Little Chance": 0.1,
+        "Chances Are Slight": 0.1,
+        "Improbable": 0.1,
+        "Highly Unlikely": 0.05,
+        "Almost No Chance": 0.02
+       }
+      }
+     }
+    ]
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "ling_1s",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 23,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_top1",
+    "process_target_fn": "normalize_text",
+    "estimators": [
+     {
+      "name": "Linguistic1S",
+      "cfg": {
+       "expressions": {
+        "Almost Certain": 0.95,
+        "Highly Likely": 0.9,
+        "Very Good Chance": 0.8,
+        "We Beleive": 0.75,
+        "Probably": 0.7,
+        "Probable": 0.7,
+        "Likely": 0.7,
+        "Better than Even": 0.6,
+        "About Even": 0.5,
+        "Probably Not": 0.25,
+        "We Doubt": 0.2,
+        "Unlikely": 0.2,
+        "Little Chance": 0.1,
+        "Chances Are Slight": 0.1,
+        "Improbable": 0.1,
+        "Highly Unlikely": 0.05,
+        "Almost No Chance": 0.02
+       }
+      }
+     }
+    ]
+   }
+  },
+  "verb_1s_top1": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "verb_1s_top1",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 30,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_top1_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": [
+     {
+      "name": "Verbalized1S",
+      "cfg": {
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "name_postfix": "_top1"
+      }
+     }
+    ]
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "verb_1s_top1",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 30,
+    "stop_strings": null,
+    "multiref": true,
+    "process_output_fn": "process_output_top1_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": [
+     {
+      "name": "Verbalized1S",
+      "cfg": {
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "name_postfix": "_top1"
+      }
+     }
+    ]
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "verb_1s_top1",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 23,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_top1",
+    "process_target_fn": "normalize_text",
+    "estimators": [
+     {
+      "name": "Verbalized1S",
+      "cfg": {
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "name_postfix": "_top1"
+      }
+     }
+    ]
+   }
+  },
+  "verb_1s_topk": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "verb_1s_topk",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 150,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_topk_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": [
+     {
+      "name": "Verbalized1S",
+      "cfg": {
+       "confidence_regex": "P1: (\\d+\\.\\d+)",
+       "name_postfix": "_topk"
+      }
+     }
+    ]
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "verb_1s_topk",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 150,
+    "stop_strings": null,
+    "multiref": true,
+    "process_output_fn": "process_output_topk_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": [
+     {
+      "name": "Verbalized1S",
+      "cfg": {
+       "confidence_regex": "P1: (\\d+\\.\\d+)",
+       "name_postfix": "_topk"
+      }
+     }
+    ]
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "verb_1s_topk",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 115,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_topk",
+    "process_target_fn": "normalize_text",
+    "estimators": [
+     {
+      "name": "Verbalized1S",
+      "cfg": {
+       "confidence_regex": "P1: (\\d+\\.\\d+)",
+       "name_postfix": "_topk"
+      }
+     }
+    ]
+   }
+  },
+  "verb_2s_cot": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "verb_2s_cot",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 130,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_cot_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that your guess is correct. Give ONLY the probability, no other words or explanation.\n\nFor example:\n\nProbability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "max_new_tokens": 10,
+       "name_postfix": "_cot"
+      }
+     }
+    ]
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "verb_2s_cot",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 200,
+    "stop_strings": null,
+    "multiref": true,
+    "process_output_fn": "process_output_cot_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that your guess is correct. Give ONLY the probability, no other words or explanation.\n\nFor example:\n\nProbability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "max_new_tokens": 10,
+       "name_postfix": "_cot"
+      }
+     }
+    ]
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "verb_2s_cot",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 200,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_cot",
+    "process_target_fn": "normalize_text",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that your guess is correct. Give ONLY the probability, no other words or explanation.\n\nFor example:\n\nProbability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "max_new_tokens": 10,
+       "name_postfix": "_cot"
+      }
+     }
+    ]
+   }
+  },
+  "verb_2s_top1": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "verb_2s_top1",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 30,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_top1_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that your guess is correct. Give ONLY the probability, no other words or explanation.\n\nFor example:\n\nProbability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "max_new_tokens": 10,
+       "name_postfix": "_top1"
+      }
+     }
+    ]
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "verb_2s_top1",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 30,
+    "stop_strings": null,
+    "multiref": true,
+    "process_output_fn": "process_output_top1_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that your guess is correct. Give ONLY the probability, no other words or explanation.\n\nFor example:\n\nProbability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "max_new_tokens": 10,
+       "name_postfix": "_top1"
+      }
+     }
+    ]
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "verb_2s_top1",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 13,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_top1",
+    "process_target_fn": "normalize_text",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that your guess is correct. Give ONLY the probability, no other words or explanation.\n\nFor example:\n\nProbability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "Probability: (\\d+\\.\\d+)",
+       "max_new_tokens": 10,
+       "name_postfix": "_top1"
+      }
+     }
+    ]
+   }
+  },
+  "verb_2s_topk": {
+   "CoQA": {
+    "hf_dataset": "LM-Polygraph/coqa",
+    "subset": "verb_2s_topk",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 125,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_topk_coqa",
+    "process_target_fn": "normalize_em_coqa",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that each of your guesses is correct. Give ONLY the probabilities, no other words or explanation.\n\nFor example:\n\nP1: <the probability between 0.0 and 1.0 that G1 is correct, without any extra commentary whatsoever; just the probability!>\n...\nP4: <the probability between 0.0 and 1.0 that G4 is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "P1: (\\d+\\.\\d+)",
+       "max_new_tokens": 50,
+       "name_postfix": "_topk"
+      }
+     }
+    ]
+   },
+   "TriviaQA": {
+    "hf_dataset": "LM-Polygraph/triviaqa",
+    "subset": "verb_2s_topk",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 125,
+    "stop_strings": null,
+    "multiref": true,
+    "process_output_fn": "process_output_topk_triviaqa",
+    "process_target_fn": "normalize_em_triviaqa",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that each of your guesses is correct. Give ONLY the probabilities, no other words or explanation.\n\nFor example:\n\nP1: <the probability between 0.0 and 1.0 that G1 is correct, without any extra commentary whatsoever; just the probability!>\n...\nP4: <the probability between 0.0 and 1.0 that G4 is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "P1: (\\d+\\.\\d+)",
+       "max_new_tokens": 50,
+       "name_postfix": "_topk"
+      }
+     }
+    ]
+   },
+   "MMLU": {
+    "hf_dataset": "LM-Polygraph/mmlu",
+    "subset": "verb_2s_topk",
+    "split": "test",
+    "size": null,
+    "max_new_tokens": 65,
+    "stop_strings": null,
+    "multiref": false,
+    "process_output_fn": "process_output_topk",
+    "process_target_fn": "normalize_text",
+    "estimators": [
+     {
+      "name": "Verbalized2S",
+      "cfg": {
+       "confidence_prompt": "Provide the probability that each of your guesses is correct. Give ONLY the probabilities, no other words or explanation.\n\nFor example:\n\nP1: <the probability between 0.0 and 1.0 that G1 is correct, without any extra commentary whatsoever; just the probability!>\n...\nP4: <the probability between 0.0 and 1.0 that G4 is correct, without any extra commentary whatsoever; just the probability!>",
+       "confidence_regex": "P1: (\\d+\\.\\d+)",
+       "max_new_tokens": 50,
+       "name_postfix": "_topk"
+      }
+     }
+    ]
+   }
+  }
+ },
+ "default_blackbox_estimators": [
+  {
+   "name": "LexicalSimilarity",
+   "cfg": {
+    "metric": "rouge1"
+   }
+  },
+  {
+   "name": "LexicalSimilarity",
+   "cfg": {
+    "metric": "rouge2"
+   }
+  },
+  {
+   "name": "LexicalSimilarity",
+   "cfg": {
+    "metric": "rougeL"
+   }
+  },
+  {
+   "name": "LexicalSimilarity",
+   "cfg": {
+    "metric": "BLEU"
+   }
+  },
+  {
+   "name": "NumSemSets"
+  },
+  {
+   "name": "EigValLaplacian",
+   "cfg": {
+    "similarity_score": "NLI_score",
+    "affinity": "entail"
+   }
+  },
+  {
+   "name": "EigValLaplacian",
+   "cfg": {
+    "similarity_score": "NLI_score",
+    "affinity": "contra"
+   }
+  },
+  {
+   "name": "EigValLaplacian",
+   "cfg": {
+    "similarity_score": "Jaccard_score"
+   }
+  },
+  {
+   "name": "DegMat",
+   "cfg": {
+    "similarity_score": "NLI_score",
+    "affinity": "entail"
+   }
+  },
+  {
+   "name": "DegMat",
+   "cfg": {
+    "similarity_score": "NLI_score",
+    "affinity": "contra"
+   }
+  },
+  {
+   "name": "DegMat",
+   "cfg": {
+    "similarity_score": "Jaccard_score"
+   }
+  },
+  {
+   "name": "Eccentricity",
+   "cfg": {
+    "similarity_score": "NLI_score",
+    "affinity": "entail"
+   }
+  },
+  {
+   "name": "Eccentricity",
+   "cfg": {
+    "similarity_score": "NLI_score",
+    "affinity": "contra"
+   }
+  },
+  {
+   "name": "Eccentricity",
+   "cfg": {
+    "similarity_score": "Jaccard_score"
+   }
+  },
+  {
+   "name": "SemanticEntropy",
+   "cfg": {
+    "class_probability_estimation": "frequency"
+   }
+  },
+  {
+   "name": "PTrueEmpirical"
+  },
+  {
+   "name": "LabelProb"
+  }
+ ]
+}

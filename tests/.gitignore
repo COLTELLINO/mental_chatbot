@@ -16,3 +16,7 @@ cfg_cap/
 cfg_nocap/
 tmp*/
 quant_t/
+tiny_chat/
+hfcache_datasets/
+replica_t/
+replica_syn/

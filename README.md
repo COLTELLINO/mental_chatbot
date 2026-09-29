@@ -59,11 +59,14 @@ sono in [`METRICHE.md`](METRICHE.md).
 | `make_figures.py` | Rigenera **tutte le figure e le tabelle-immagine** dai CSV, in pochi secondi e senza GPU. |
 | `paired_comparisons.py` | Test bootstrap appaiati: quali metodi sono statisticamente indistinguibili dal migliore. Senza GPU. |
 | `recompute_stats.py` | Ricalcola le statistiche di una cartella di risultati già esistente con le metriche corrette il 29/09 (PRR normalizzato, nuove colonne, Kendall per dataset). Senza GPU. |
-| `paper_reference_prr.csv` | Valori del paper per l'ancora (Mistral 7B), da riempire con le Tabelle 6-7 di Vashurin et al.: li usa `fig_anchor_replication.png`. |
+| `paper_replica.py` | Replica esatta di Vashurin et al. (Tabelle 7 e 10) con Mistral 7B v0.2 base e Instruct, sui dataset e con i prompt pubblicati da lm-polygraph. Vedi la ricetta "Replica del paper" nella sezione 6. |
+| `paper_replica_configs.json` | Impostazioni ufficiali della replica (dataset e prompt, max_new_tokens, stringhe di arresto, stimatori, post-elaborazione delle risposte), estratte dai file di configurazione di lm-polygraph al commit 32cdf4a. |
+| `paper_replica_processing.py` | Funzioni di post-elaborazione delle risposte del protocollo ufficiale, copiate senza modifiche da lm-polygraph. |
+| `paper_reference_prr.csv` | PRR delle Tabelle 7 (white-box, Mistral 7B v0.2) e 10 (black-box, Mistral 7B v0.2 Instruct) del paper, con deviazione standard: il riferimento della replica. |
 | `drop_models_from_checkpoints.py` | Toglie modelli o dataset dai checkpoint, per rieseguire solo quelli. |
-| `tests/` | Test della pipeline senza GPU né rete, con un modello minuscolo e dataset finti: `bash tests/run_tests.sh`. |
+| `tests/` | Test della pipeline senza GPU, con un modello minuscolo e dataset finti: `bash tests/run_tests.sh`. Solo il test della replica usa la rete (scarica i dataset di lm-polygraph). |
 | `preflight.sh` | Controlli di sola lettura prima di un run lungo (codice, token, immagine Docker, GPU, disco). |
-| `sbatch_script.sh`, `run_docker.sh`, `train.sh` | Catena di lancio su cluster SLURM: `sbatch` → container Docker → `main.py`. |
+| `sbatch_script.sh`, `run_docker.sh`, `train.sh` | Catena di lancio su cluster SLURM: `sbatch` → container Docker → `main.py` (oppure lo script indicato come primo argomento, es. `paper_replica.py`). |
 | `create_docker_image.sh`, `build/` | Costruzione dell'immagine Docker (`Dockerfile` e file dei requirements). |
 | `sync_results.sh` | Allinea la cartella `results/` fra i due nodi del cluster (faretra e moro232). |
 | `results_store.py` | Modulo per checkpoint con semantica di sovrascrittura per riga. **Non è usato** dalla pipeline attuale: è una base per un'eventuale riorganizzazione dei checkpoint. |
@@ -370,6 +373,59 @@ python3.11 make_figures.py results
 
 L'ordine conta: `fig_ties_vs_scale.png` legge i riepiloghi di `paired_comparisons.py`.
 
+**Replica del paper** (Vashurin et al., Tabelle 7 e 10). Serve a verificare che la
+pipeline riproduca i risultati del paper nel suo stesso setting, prima di usarla
+sui modelli piccoli. Gira in una cartella separata (default
+`/workspace/results_paper_replica`) e non tocca i risultati della pipeline principale.
+
+```bash
+SB paper_replica.py --parts whitebox                 # Tabella 7: Mistral 7B v0.2 base, 4 dataset
+SB paper_replica.py --parts blackbox verbalized      # Tabella 10: Mistral 7B v0.2 Instruct, 3 dataset
+SB paper_replica.py --parts whitebox --datasets GSM8k   # un solo dataset
+SB paper_replica.py --parts whitebox --n_test_samples 20 --results_dir /workspace/results_replica_smoke  # prova breve
+```
+
+Cosa replica, e da dove viene ogni scelta:
+
+- **modelli:** `mistral-community/Mistral-7B-v0.2`, l'unica copia su Hugging Face
+  della v0.2 base (mistralai non l'ha pubblicata), per la parte white-box;
+  `mistralai/Mistral-7B-Instruct-v0.2` per la black-box. Nessuno dei due è gated.
+  Precisione bf16 (`--precision 4bit` solo in caso di memoria insufficiente);
+- **domande:** i dataset pubblicati da lm-polygraph (`LM-Polygraph/coqa`,
+  `triviaqa`, `mmlu`, `gsm8k`), con i prompt già costruiti. White-box:
+  sottoinsieme `continuation` (5-shot per TriviaQA/MMLU/GSM8k, conversazione
+  precedente per CoQA). Black-box: `empirical_baselines` per i metodi basati
+  sui campioni, poi un sottoinsieme per ciascuno dei 6 metodi verbalized
+  (`--verbalized_variants` per sceglierne alcuni);
+- **numerosità:** come nel paper, 2.000 domande per dataset tranne MMLU (100 per
+  materia, 5.700) e GSM8k (1.319, tutto il test set). Le 2.000 sono scelte come
+  fa lm-polygraph (`np.random.seed(1)` + `np.random.choice`): il test verifica che
+  siano identiche, una per una, a quelle della libreria;
+- **generazione, stimatori, qualità:** max_new_tokens, stringhe di arresto,
+  stimatori e loro parametri e post-elaborazione delle risposte vengono dai file
+  di configurazione ufficiali (`paper_replica_configs.json`). Qualità: AlignScore
+  per CoQA e TriviaQA (massimo sugli alias), accuracy per MMLU e GSM8k.
+
+Alla fine `paper_replica_comparison.csv` confronta ogni metodo con il paper
+(PRR, intervallo al 95%, valore e deviazione standard del paper, scarto), e
+`paper_replica_summary.csv` riassume per dataset lo scarto medio, la quota di
+metodi il cui valore del paper cade nel nostro intervallo e il tau di Kendall
+fra le due classifiche. Figure: `fig_paper_replica_whitebox.png`,
+`fig_paper_replica_blackbox.png`. Per rifare solo confronto e figure:
+`python3.11 paper_replica.py --only_compare --results_dir <cartella>`.
+
+Differenze note rispetto al paper: precisione bf16 (il paper non la dichiara),
+campionatore in batch (stesse statistiche della libreria, vedi
+`tests/test_batched_sampling.py`), metodi density-based esclusi in tutto il lavoro.
+Il modello Mistral-7B-it della pipeline principale resta il riferimento di scala
+per il Kendall tau dei modelli piccoli (stessi prompt dei modelli piccoli), ma
+non è confrontabile direttamente con le tabelle del paper.
+
+Durata stimata (da misurare con la prova breve): la parte white-box sono circa
+11.000 domande con 10 campioni ciascuna, circa 1-2 giorni su una 3090; la parte
+black-box 7 varianti di prompt su 9.700 domande, di cui 6 solo con generazione
+greedy, circa un giorno. Le parti si possono lanciare su nodi diversi.
+
 ### Tempi indicativi (RTX 3090, 5 modelli)
 
 | Parte | Istanze | Tempo con il codice fino al 29/09 |
@@ -439,7 +495,6 @@ possono cancellare a run concluso: servono solo alla ripresa.
 | `fig_prr_vs_scale_by_family.png` | PRR per famiglia di metodi al variare della scala. |
 | `fig_rank_transfer.png` | Kendall tau della classifica dei metodi contro il modello da 7B, per dataset, con intervalli. |
 | `fig_ties_vs_scale.png` | Quanti metodi sono indistinguibili dal migliore, per scala. Richiede `paired_comparisons.py`. |
-| `fig_anchor_replication.png` | Mistral-7B contro i valori del paper (da `paper_reference_prr.csv`), metodo per metodo. |
 | `fig_severity_grid.png` | Griglia 2×2 severità × formato. |
 | `fig_severity_matched.png` | Gli strati di severità confrontati a parità di difficoltà delle domande. |
 | `fig_phase_timings.png` | Dove va il tempo: fasi del calcolo per modello e dataset. |
@@ -448,6 +503,7 @@ possono cancellare a run concluso: servono solo alla ripresa.
 | `fig_pareto_cost_quality.png` | Frontiera di Pareto costo contro PRR, con intervalli di confidenza. |
 | `fig_verbalized_accuracy_cost.png` | Quanto la richiesta di confidenza peggiora le risposte. |
 | `fig_verbalized_{numeric,linguistic}.png` | PRR dei metodi verbalized per modello, con intervalli di confidenza e parse-failure rate. |
+| `fig_paper_replica_{whitebox,blackbox}.png` | Solo nella cartella della replica: PRR ottenuto contro le Tabelle 7 e 10 del paper, metodo per metodo, con tau di Kendall e scarto medio per dataset. |
 | `fig_tabella_*.png` | Tabelle in forma di immagine: accuracy, PRR affiancato all'accuracy (con l'intervallo del metodo migliore), costi, parse-failure rate, errori fra le risposte più confidenti per strato di severità. |
 
 ---
@@ -611,13 +667,16 @@ verificare che la pipeline riproduca i risultati nel regime di scala originale.
 
 ### Metodi UQ
 
-26 metodi di lm-polygraph, mappati sulle Figure 2 e 3 del paper (`PAPER_METHODS`
+27 metodi di lm-polygraph, mappati sulle Figure 2 e 3 del paper (`PAPER_METHODS`
 in `main.py`): information-based (MSP, Perplexity, Mean Token Entropy, CCP, PMI,
 Conditional PMI, Fisher-Rao, Renyi, TokenSAR), basati sulla diversità dei campioni
 (Semantic Entropy, SAR, SentenceSAR, Monte Carlo Sequence Entropy e versione
 normalizzata, Lexical Similarity, EigValLaplacian, DegMat, Eccentricity, NumSet)
-e riflessivi (P(True), BB P(True), Label Prob.), più due verbalized nella sezione
-dedicata. I metodi density-based (Mahalanobis, RMD, RDE) sono esclusi per scelta:
+e riflessivi (P(True), BB P(True), Label Prob.), più BB Semantic Entropy (la versione
+black-box, che stima la probabilità di ogni significato dalla frequenza dei
+campioni; fino al 29/09 era per errore una copia di Semantic Entropy), più due
+verbalized nella sezione dedicata. Nella replica del paper girano tutti i
+metodi delle Tabelle 7 e 10, compresi i 6 verbalized con i prompt originali. I metodi density-based (Mahalanobis, RMD, RDE) sono esclusi per scelta:
 richiedono le statistiche del training set al momento dell'inferenza, cosa
 incompatibile con l'esecuzione sul dispositivo. HUQ-MD non esiste in lm-polygraph.
 Il dettaglio è in `excluded_methods.md`, generato a ogni run.

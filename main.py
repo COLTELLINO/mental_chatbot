@@ -89,6 +89,15 @@ CHAT_TEMPLATE_MODELS = {"LFM2-350M", "LFM2-1.2B", "MedGemma-4B-it", "Gemma3-4B-i
 # quindi vanno caricati in bf16.
 CANNOT_QUANTIZE_MODELS = {"MedGemma-4B-it", "Gemma3-4B-it"}
 
+# Modelli a cui il chat template lo applica lm-polygraph (WhiteboxModel con
+# instruct=True) invece di format_chat_prompt: e' come lavora il protocollo
+# ufficiale con i modelli instruct, e serve a Verbalized2S, che costruisce il
+# turno di follow-up ("quanto sei sicuro?") passando alla libreria una chat e
+# non un testo gia' formattato. Lo usa solo la replica del paper
+# (paper_replica.py); i modelli della pipeline principale restano su
+# format_chat_prompt (CHAT_TEMPLATE_MODELS).
+LIBRARY_CHAT_TEMPLATE_MODELS = set()
+
 # Precisione dell'ancora Mistral-7B (--anchor_precision, default bf16). Fino al
 # 29/09 era sempre 4-bit, con la motivazione che in bf16 (~15 GB di pesi) la
 # memoria non sarebbe bastata. Ma la memoria non la mangiavano i pesi: la
@@ -299,9 +308,14 @@ PAPER_METHODS = [
     {"paper_label": "NumSet", "figure": "AB", "factory": lambda: NumSemSets()},
 
     # --- solo Figura B (reflexive / black-box) ---
-    {"paper_label": "BB Semantic Entropy", "figure": "B", "factory": "alias:Semantic Entropy",
-     "reason": "Stessa classe SemanticEntropy() del white-box (lm-polygraph non ha una classe black-box "
-               "separata): nessuna istanza in piu', il valore viene solo duplicato in tabella con questa etichetta."},
+    # BUG CORRETTO il 29/09: era un alias di "Semantic Entropy" (stessi
+    # valori duplicati), ma nel paper la versione black-box stima la
+    # probabilita' di ogni classe di significato dalla FREQUENZA dei campioni
+    # (non dalle loro probabilita', che un modello black-box non espone):
+    # SemanticEntropy(class_probability_estimation="frequency"), come in
+    # examples/configs/instruct/default_blackbox_estimators.yaml.
+    {"paper_label": "BB Semantic Entropy", "figure": "B",
+     "factory": lambda: SemanticEntropy(class_probability_estimation="frequency")},
     {"paper_label": "Label Prob.", "figure": "B", "factory": lambda: LabelProb()},
     {"paper_label": "BB P(True)", "figure": "B", "factory": lambda: PTrueEmpirical()},
 
@@ -331,7 +345,7 @@ PAPER_METHODS = [
 
     # --- esclusi: verbalized/linguistic, incompatibili con la pipeline a generazione condivisa ---
     {"paper_label": "Verbalized 1S top-k", "figure": "B", "factory": None,
-     "reason": "Estrae la confidenza dalla STESSA generazione greedy condivisa con gli altri 26 stimatori, "
+     "reason": "Estrae la confidenza dalla STESSA generazione greedy condivisa con gli altri stimatori, "
                "che oggi contiene solo la risposta breve/lettera richiesta dal task (nessun testo di confidenza). "
                "Per renderlo utile dovremmo cambiare prompt/lunghezza di generazione per tutti gli stimatori."},
     {"paper_label": "Verbalized 1S top-1", "figure": "B", "factory": None,
@@ -349,7 +363,8 @@ PAPER_METHODS = [
                "con instruct=True; noi usiamo sempre instruct=False perche' applichiamo gia' il chat "
                "template a mano al prompt principale (vedi format_chat_prompt). Attivare instruct=True "
                "applicherebbe il chat template due volte a tutta la generazione condivisa degli altri "
-               "26 stimatori su MedGemma/Gemma3, corrompendola."},
+               "stimatori su MedGemma/Gemma3, corrompendola. (Nella replica del paper, paper_replica.py, "
+               "Verbalized2S gira invece come nel protocollo ufficiale: vedi LIBRARY_CHAT_TEMPLATE_MODELS.)"},
     {"paper_label": "Linguistic 1S", "figure": "B", "factory": None,
      "reason": "Stesso motivo di Verbalized 1S: legge un'espressione verbale di confidenza dalla "
                "generazione condivisa, che non la contiene."},
@@ -474,7 +489,7 @@ PHASE_OF_CALCULATOR = {
     # campionamento: e' come la libreria lo calcola, anche se un'implementazione
     # minima di TokenSAR potrebbe farne a meno (va detto in tesi).
     "CrossEncoderSimilarityMatrixCalculator": "cross_encoder_campioni",
-    "GreedyCrossEncoderSimilarityMatrixCalculator": "cross_encoder_greedy",  # non usato dai 26 metodi
+    "GreedyCrossEncoderSimilarityMatrixCalculator": "cross_encoder_greedy",  # non usato dai metodi della pipeline
     "GreedyLMProbsCalculator": "forward_senza_contesto",    # PMI, CPMI
     "PromptCalculator": "forward_ptrue",                    # P(True)
     "EntropyCalculator": "aritmetica",
@@ -526,7 +541,7 @@ def default_stat_calculators(cache_dir, deberta_batch_size=None):
         language="en",
         hf_cache=cache_dir,
         output_attentions=False,
-        # Nessuno dei 26 stimatori usa gli hidden state (servirebbero solo ai
+        # Nessuno degli stimatori usa gli hidden state (servirebbero solo ai
         # metodi density-based, esclusi per design): chiederli a generate()
         # conservava gli stati di tutti i layer per ogni token, ed era la voce
         # di memoria che portava i Gemma a ~24 GB di picco su MMLU, al limite
@@ -666,7 +681,8 @@ def attn_implementation_for(model_name, model_id=None, cache_dir=None, hf_token=
 
 
 def load_whitebox_model(model_id, cache_dir, hf_token=None,
-                        attn_implementation=ATTN_IMPLEMENTATION_DEFAULT, use_quantization=True):
+                        attn_implementation=ATTN_IMPLEMENTATION_DEFAULT, use_quantization=True,
+                        instruct=False):
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, cache_dir=cache_dir, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -701,7 +717,9 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None,
     if tokenizer.eos_token_id is not None:
         hf_model.generation_config.pad_token_id = tokenizer.eos_token_id
 
-    model = WhiteboxModel(hf_model, tokenizer, model_path=model_id)
+    # instruct=True: il chat template lo applica la libreria in tokenize()
+    # (vedi LIBRARY_CHAT_TEMPLATE_MODELS).
+    model = WhiteboxModel(hf_model, tokenizer, model_path=model_id, instruct=instruct)
     return model
 
 
@@ -1231,7 +1249,8 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             "weights_model": weights_name,
             "precision": "4-bit nf4" if is_quantized else "bf16",
             "attention": getattr(model.model.config, "_attn_implementation", "?"),
-            "prompt_format": "chat_template" if use_chat_template else "plain",
+            "prompt_format": ("chat_template" if use_chat_template else
+                              "chat_template_libreria" if getattr(model, "instruct", False) else "plain"),
             "bos_in_prompt_stripped": bool(use_chat_template and tokenizer_adds_bos(model.tokenizer)),
             "max_new_tokens": max_new_tokens, "stop_strings": json.dumps(stop_strings),
             "generation_batch": gen_bs, "nli_batch": nli_bs, "sampler": SAMPLER,
@@ -1605,7 +1624,8 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
             model = load_whitebox_model(model_id, args.cache_dir, hf_token=hf_token,
                                         use_quantization=uses_quantization(model_name),
                                         attn_implementation=attn_implementation_for(
-                                            model_name, model_id, args.cache_dir, hf_token))
+                                            model_name, model_id, args.cache_dir, hf_token),
+                                        instruct=(model_name in LIBRARY_CHAT_TEMPLATE_MODELS))
         except Exception:
             print(f"!!! Caricamento di {model_name} fallito, salto i suoi dataset.")
             traceback.print_exc()

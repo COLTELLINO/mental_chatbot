@@ -47,24 +47,6 @@ ANCHOR_MODEL = "Mistral-7B-it"
 # Etichetta dell'asse per il PRR.
 PRR_AXIS = "PRR (0 = casuale, 1 = oracolo; max_rejection=0.5)"
 
-# Valori di riferimento del paper per l'ancora. Fino al 29/09 erano due numeri
-# letti a occhio da una figura (TriviaQA 0.60, MMLU 0.50). Ora si leggono da
-# paper_reference_prr.csv (colonne: dataset, paper_label, prr), da riempire con
-# i valori delle Tabelle 6-7 di Vashurin et al. per Mistral 7B v0.2: il file
-# viene cercato nella cartella dei risultati e poi accanto a questo script.
-PAPER_REFERENCE_FILE = "paper_reference_prr.csv"
-
-
-def load_paper_reference(results_dir):
-    for base in (results_dir, os.path.dirname(os.path.abspath(__file__))):
-        path = os.path.join(base, PAPER_REFERENCE_FILE)
-        if os.path.exists(path):
-            ref = pd.read_csv(path).dropna(subset=["prr"])
-            if not ref.empty:
-                return ref
-    return None
-
-
 def _drop_phase_rows(t):
     """Toglie da estimator_timings.csv le righe con i tempi per fase
     ("__fase__:<nome>"), che non sono metodi."""
@@ -192,53 +174,57 @@ def fig_accuracy_vs_prr(stats, results_dir):
     save(fig, results_dir, "fig_accuracy_vs_prr.png")
 
 
-def fig_anchor_replication(stats, results_dir):
-    """Ancora di replica: i PRR di Mistral-7B contro i valori del paper
-    (paper_reference_prr.csv), metodo per metodo."""
-    anchor = stats[stats["model"] == ANCHOR_MODEL]
-    if anchor.empty:
-        print(f"  {ANCHOR_MODEL} assente dai risultati, salto la figura dell'ancora.")
+def fig_paper_replica(results_dir):
+    """Replica di Vashurin et al. (paper_replica.py): PRR ottenuto con
+    intervallo al 95% contro il valore delle Tabelle 7 (white-box, Mistral 7B
+    v0.2 base) e 10 (black-box, Mistral 7B v0.2 Instruct), metodo per metodo.
+    Legge paper_replica_comparison.csv; se manca (cartella della pipeline
+    principale), non disegna nulla."""
+    path = os.path.join(results_dir, "paper_replica_comparison.csv")
+    if not os.path.exists(path):
+        print("  paper_replica_comparison.csv assente (non e' una cartella della replica), salto.")
         return
-    ref = load_paper_reference(results_dir)
-    datasets = sorted(anchor["dataset"].unique())
-    fig, axes = plt.subplots(1, len(datasets), figsize=(4.2 * len(datasets), 8), sharey=True,
-                             squeeze=False)
-    ordine = (anchor.groupby("paper_label")["prr"].mean().sort_values().index.tolist())
-    y = np.arange(len(ordine))
-    for ax, ds in zip(axes[0], datasets):
-        sub = anchor[anchor["dataset"] == ds].set_index("paper_label").reindex(ordine)
-        err = np.vstack([(sub["prr"] - sub["prr_ci_low"]).clip(lower=0).fillna(0),
-                         (sub["prr_ci_high"] - sub["prr"]).clip(lower=0).fillna(0)])
-        ax.barh(y, sub["prr"], xerr=err, color="tab:blue", alpha=0.8,
-                error_kw={"elinewidth": 0.6, "ecolor": "0.35"}, label="ottenuto (IC 95%)")
-        if ref is not None:
-            r = ref[ref["dataset"] == ds].set_index("paper_label")["prr"].reindex(ordine)
-            ax.scatter(r, y, color="tab:red", marker="D", s=22, zorder=4, label="paper")
-        acc = sub["mean_quality"].dropna()
-        ax.set_title(f"{ds}\n(accuracy {acc.iloc[0]:.2f})" if len(acc) else ds, fontsize=9)
-        ax.axvline(0, color="black", linewidth=0.8)
-        ax.set_xlabel("PRR", fontsize=8)
-    axes[0][0].set_yticks(y)
-    axes[0][0].set_yticklabels(ordine, fontsize=7)
-    axes[0][-1].legend(fontsize=7, loc="lower right")
-    precisione = "?"
-    cond = os.path.join(results_dir, "run_conditions.csv")
-    if os.path.exists(cond):
-        c = pd.read_csv(cond)
-        c = c[c["model"] == ANCHOR_MODEL]
-        if len(c):
-            precisione = ", ".join(sorted(c["precision"].astype(str).unique()))
-    fig.suptitle(f"Ancora di replica: {ANCHOR_MODEL} ({precisione}) contro Vashurin et al.")
-    nota = ("L'ancora serve a distinguere gli effetti di scala dagli artefatti della nostra "
-            "pipeline: ha valore se riproduce i valori del paper nel suo stesso regime.\n")
-    if ref is None:
-        nota += ("Valori del paper NON disponibili: riempire paper_reference_prr.csv (dataset, "
-                 "paper_label, prr) con le Tabelle 6-7 di Vashurin et al. per Mistral 7B v0.2.")
-    else:
-        nota += ("Rombi rossi: valori delle Tabelle 6-7 del paper (paper_reference_prr.csv). "
-                 "Criterio di successo da fissare PRIMA di guardare i risultati.")
-    add_note(fig, nota, left=0.2, top=0.9)
-    save(fig, results_dir, "fig_anchor_replication.png")
+    comp = pd.read_csv(path).dropna(subset=["prr_paper"])
+    summ_path = os.path.join(results_dir, "paper_replica_summary.csv")
+    summ = pd.read_csv(summ_path) if os.path.exists(summ_path) else None
+    titoli = {"whitebox": "Tabella 7, white-box: Mistral 7B v0.2 base, prompt a completamento",
+              "blackbox": "Tabella 10, black-box: Mistral 7B v0.2 Instruct"}
+    for setting, cs in comp.groupby("setting"):
+        datasets = [d for d in ("CoQA", "TriviaQA", "MMLU", "GSM8k") if d in set(cs["dataset"])]
+        ordine = cs.groupby("paper_label")["prr_paper"].mean().sort_values().index.tolist()
+        y = np.arange(len(ordine))
+        fig, axes = plt.subplots(1, len(datasets), figsize=(4.2 * len(datasets), max(6, 0.32 * len(ordine) + 2)),
+                                 sharey=True, squeeze=False)
+        for ax, ds in zip(axes[0], datasets):
+            sub = cs[cs["dataset"] == ds].drop_duplicates("paper_label").set_index("paper_label").reindex(ordine)
+            err = np.vstack([(sub["prr"] - sub["prr_ci_low"]).clip(lower=0).fillna(0),
+                             (sub["prr_ci_high"] - sub["prr"]).clip(lower=0).fillna(0)])
+            ax.barh(y, sub["prr"], xerr=err, color="tab:blue", alpha=0.8,
+                    error_kw={"elinewidth": 0.6, "ecolor": "0.35"}, label="replica (IC 95%)")
+            ax.errorbar(sub["prr_paper"], y, xerr=sub["prr_paper_std"].fillna(0), fmt="D", color="tab:red",
+                        markersize=4, elinewidth=0.8, zorder=4, label="paper (± dev. std.)")
+            titolo = ds
+            if summ is not None:
+                r = summ[(summ["setting"] == setting) & (summ["dataset"] == ds)]
+                if len(r):
+                    r = r.iloc[0]
+                    titolo += (f"\nqualita' {r['mean_quality']:.2f}; tau {r['kendall_tau_vs_paper']:.2f}; "
+                               f"|diff| media {r['mean_abs_diff']:.2f}")
+            ax.set_title(titolo, fontsize=8)
+            ax.axvline(0, color="black", linewidth=0.8)
+            ax.set_xlabel("PRR", fontsize=8)
+        axes[0][0].set_yticks(y)
+        axes[0][0].set_yticklabels(ordine, fontsize=7)
+        axes[0][-1].legend(fontsize=7, loc="lower right")
+        fig.suptitle(f"Replica di Vashurin et al. -- {titoli.get(setting, setting)}", fontsize=10)
+        add_note(fig,
+                 "Barre blu: PRR ottenuto dalla replica, con intervallo bootstrap al 95%. Rombi rossi: valore "
+                 "della tabella del paper, con la sua deviazione standard.\n"
+                 "tau: correlazione di Kendall fra la classifica dei metodi della replica e quella del paper "
+                 "(1 = stessa classifica). |diff| media: scarto medio assoluto dal paper.\n"
+                 "Stessi prompt, stesse domande (selezione con il seed della libreria), stessa metrica di "
+                 "qualita' e stessi parametri di generazione del protocollo ufficiale.", left=0.22, top=0.9)
+        save(fig, results_dir, f"fig_paper_replica_{setting}.png")
 
 
 def fig_ties_vs_scale(results_dir):
@@ -1268,6 +1254,14 @@ def generate_all(results_dir):
     results_dir. E' l'UNICO punto in cui si disegna: main.py la richiama a fine
     run, e la si puo' rilanciare a mano quante volte serve."""
     args = argparse.Namespace(results_dir=results_dir)
+    # Cartella della replica del paper (paper_replica.py): ha solo le sue figure.
+    if os.path.exists(os.path.join(results_dir, "paper_replica_comparison.csv")):
+        try:
+            fig_paper_replica(results_dir)
+            return 0
+        except Exception:
+            traceback.print_exc()
+            return 1
     stats = load_stats(args.results_dir)
     if stats is None:
         print(f"!!! Nessuna statistica per-istanza in {args.results_dir}.")
@@ -1286,7 +1280,6 @@ def generate_all(results_dir):
     figure = [
         ("fig_accuracy", lambda: fig_accuracy(stats, rd)),
         ("fig_accuracy_vs_prr", lambda: fig_accuracy_vs_prr(stats, rd)),
-        ("fig_anchor_replication", lambda: fig_anchor_replication(stats, rd)),
         ("fig_ties_vs_scale", lambda: fig_ties_vs_scale(rd)),
         ("fig_timing_full_cost", lambda: fig_timing_full_cost(rd)),
         ("fig_a_white_box", lambda: fig_paper_figure(

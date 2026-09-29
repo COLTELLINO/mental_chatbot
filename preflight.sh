@@ -9,7 +9,8 @@ IMAGE="mental-chatbot-image"
 BRANCH="filo/benchmark-uq"
 LLM_CACHE="${LLM_CACHE:-/llms}"
 GATED=("google/medgemma-4b-it" "google/gemma-3-4b-it")
-MODELS=("LiquidAI/LFM2-350M" "LiquidAI/LFM2-1.2B" "google/medgemma-4b-it" "google/gemma-3-4b-it" "mistralai/Mistral-7B-Instruct-v0.2")
+MODELS=("LiquidAI/LFM2-350M" "LiquidAI/LFM2-1.2B" "google/medgemma-4b-it" "google/gemma-3-4b-it" "mistralai/Mistral-7B-Instruct-v0.2"
+        "mistral-community/Mistral-7B-v0.2")  # questo solo per paper_replica.py
 
 PROBLEMI=()
 ok()   { echo "  [ok]  $*"; }

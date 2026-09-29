@@ -1,149 +1,167 @@
-dataset,paper_label,prr
-CoQA,CCP,
-CoQA,Maximum Sequence Probability,
-CoQA,SAR,
-CoQA,Perplexity,
-CoQA,TokenSAR,
-CoQA,SentenceSAR,
-CoQA,Semantic Entropy,
-CoQA,Mean Token Entropy,
-CoQA,Monte Carlo Sequence Entropy,
-CoQA,Monte Carlo Normalized Sequence Entropy,
-CoQA,Pointwise Mutual Information,
-CoQA,P(True),
-CoQA,Conditional Pointwise Mutual Information,
-CoQA,Fisher-Rao,
-CoQA,Renyi Divergence,
-CoQA,EigValLaplacian NLI Score Entail.,
-CoQA,EigValLaplacian Jaccard Score,
-CoQA,DegMat NLI Score Entail.,
-CoQA,DegMat Jaccard Score,
-CoQA,Eccentricity NLI Score Entail.,
-CoQA,Eccentricity Jaccard Score,
-CoQA,Lexical Similarity Rouge-L,
-CoQA,Lexical Similarity BLEU,
-CoQA,NumSet,
-CoQA,BB Semantic Entropy,
-CoQA,Label Prob.,
-CoQA,BB P(True),
-CoQA,Mahalanobis Distance - Decoder,
-CoQA,RDE - Decoder,
-CoQA,Relative Mahalanobis Distance - Decoder,
-CoQA,HUQ-MD - Decoder,
-CoQA,Verbalized 1S top-k,
-CoQA,Verbalized 1S top-1,
-CoQA,Verbalized 2S top-k,
-CoQA,Verbalized 2S CoT,
-CoQA,Verbalized 2S top-1,
-CoQA,Linguistic 1S,
-TriviaQA,CCP,
-TriviaQA,Maximum Sequence Probability,
-TriviaQA,SAR,
-TriviaQA,Perplexity,
-TriviaQA,TokenSAR,
-TriviaQA,SentenceSAR,
-TriviaQA,Semantic Entropy,
-TriviaQA,Mean Token Entropy,
-TriviaQA,Monte Carlo Sequence Entropy,
-TriviaQA,Monte Carlo Normalized Sequence Entropy,
-TriviaQA,Pointwise Mutual Information,
-TriviaQA,P(True),
-TriviaQA,Conditional Pointwise Mutual Information,
-TriviaQA,Fisher-Rao,
-TriviaQA,Renyi Divergence,
-TriviaQA,EigValLaplacian NLI Score Entail.,
-TriviaQA,EigValLaplacian Jaccard Score,
-TriviaQA,DegMat NLI Score Entail.,
-TriviaQA,DegMat Jaccard Score,
-TriviaQA,Eccentricity NLI Score Entail.,
-TriviaQA,Eccentricity Jaccard Score,
-TriviaQA,Lexical Similarity Rouge-L,
-TriviaQA,Lexical Similarity BLEU,
-TriviaQA,NumSet,
-TriviaQA,BB Semantic Entropy,
-TriviaQA,Label Prob.,
-TriviaQA,BB P(True),
-TriviaQA,Mahalanobis Distance - Decoder,
-TriviaQA,RDE - Decoder,
-TriviaQA,Relative Mahalanobis Distance - Decoder,
-TriviaQA,HUQ-MD - Decoder,
-TriviaQA,Verbalized 1S top-k,
-TriviaQA,Verbalized 1S top-1,
-TriviaQA,Verbalized 2S top-k,
-TriviaQA,Verbalized 2S CoT,
-TriviaQA,Verbalized 2S top-1,
-TriviaQA,Linguistic 1S,
-MMLU,CCP,
-MMLU,Maximum Sequence Probability,
-MMLU,SAR,
-MMLU,Perplexity,
-MMLU,TokenSAR,
-MMLU,SentenceSAR,
-MMLU,Semantic Entropy,
-MMLU,Mean Token Entropy,
-MMLU,Monte Carlo Sequence Entropy,
-MMLU,Monte Carlo Normalized Sequence Entropy,
-MMLU,Pointwise Mutual Information,
-MMLU,P(True),
-MMLU,Conditional Pointwise Mutual Information,
-MMLU,Fisher-Rao,
-MMLU,Renyi Divergence,
-MMLU,EigValLaplacian NLI Score Entail.,
-MMLU,EigValLaplacian Jaccard Score,
-MMLU,DegMat NLI Score Entail.,
-MMLU,DegMat Jaccard Score,
-MMLU,Eccentricity NLI Score Entail.,
-MMLU,Eccentricity Jaccard Score,
-MMLU,Lexical Similarity Rouge-L,
-MMLU,Lexical Similarity BLEU,
-MMLU,NumSet,
-MMLU,BB Semantic Entropy,
-MMLU,Label Prob.,
-MMLU,BB P(True),
-MMLU,Mahalanobis Distance - Decoder,
-MMLU,RDE - Decoder,
-MMLU,Relative Mahalanobis Distance - Decoder,
-MMLU,HUQ-MD - Decoder,
-MMLU,Verbalized 1S top-k,
-MMLU,Verbalized 1S top-1,
-MMLU,Verbalized 2S top-k,
-MMLU,Verbalized 2S CoT,
-MMLU,Verbalized 2S top-1,
-MMLU,Linguistic 1S,
-GSM8k,CCP,
-GSM8k,Maximum Sequence Probability,
-GSM8k,SAR,
-GSM8k,Perplexity,
-GSM8k,TokenSAR,
-GSM8k,SentenceSAR,
-GSM8k,Semantic Entropy,
-GSM8k,Mean Token Entropy,
-GSM8k,Monte Carlo Sequence Entropy,
-GSM8k,Monte Carlo Normalized Sequence Entropy,
-GSM8k,Pointwise Mutual Information,
-GSM8k,P(True),
-GSM8k,Conditional Pointwise Mutual Information,
-GSM8k,Fisher-Rao,
-GSM8k,Renyi Divergence,
-GSM8k,EigValLaplacian NLI Score Entail.,
-GSM8k,EigValLaplacian Jaccard Score,
-GSM8k,DegMat NLI Score Entail.,
-GSM8k,DegMat Jaccard Score,
-GSM8k,Eccentricity NLI Score Entail.,
-GSM8k,Eccentricity Jaccard Score,
-GSM8k,Lexical Similarity Rouge-L,
-GSM8k,Lexical Similarity BLEU,
-GSM8k,NumSet,
-GSM8k,BB Semantic Entropy,
-GSM8k,Label Prob.,
-GSM8k,BB P(True),
-GSM8k,Mahalanobis Distance - Decoder,
-GSM8k,RDE - Decoder,
-GSM8k,Relative Mahalanobis Distance - Decoder,
-GSM8k,HUQ-MD - Decoder,
-GSM8k,Verbalized 1S top-k,
-GSM8k,Verbalized 1S top-1,
-GSM8k,Verbalized 2S top-k,
-GSM8k,Verbalized 2S CoT,
-GSM8k,Verbalized 2S top-1,
-GSM8k,Linguistic 1S,
+setting,model,table,dataset,paper_label,prr,prr_std
+whitebox,Mistral 7B v0.2,7,CoQA,Maximum Sequence Probability,0.33,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Maximum Sequence Probability,0.63,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Maximum Sequence Probability,0.47,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Maximum Sequence Probability,0.47,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Perplexity,0.29,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Perplexity,0.64,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Perplexity,0.47,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Perplexity,0.31,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Mean Token Entropy,0.26,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Mean Token Entropy,0.64,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Mean Token Entropy,0.45,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Mean Token Entropy,0.36,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Pointwise Mutual Information,-0.08,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Pointwise Mutual Information,0.03,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Pointwise Mutual Information,0.45,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Pointwise Mutual Information,0.14,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Conditional Pointwise Mutual Information,-0.11,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Conditional Pointwise Mutual Information,-0.15,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Conditional Pointwise Mutual Information,0.45,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Conditional Pointwise Mutual Information,-0.08,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Rényi Divergence,-0.04,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Rényi Divergence,-0.26,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Rényi Divergence,0.0,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Rényi Divergence,-0.33,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Fisher-Rao Distance,-0.03,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Fisher-Rao Distance,-0.29,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Fisher-Rao Distance,-0.0,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Fisher-Rao Distance,-0.34,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,TokenSAR,0.29,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,TokenSAR,0.62,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,TokenSAR,0.47,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,TokenSAR,0.31,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,CCP,0.29,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,CCP,0.61,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,CCP,0.48,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,CCP,0.53,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Monte Carlo Sequence Entropy,0.26,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Monte Carlo Sequence Entropy,0.52,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Monte Carlo Sequence Entropy,0.35,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Monte Carlo Sequence Entropy,0.49,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Monte Carlo Normalized Sequence Entropy,0.25,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Monte Carlo Normalized Sequence Entropy,0.57,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Monte Carlo Normalized Sequence Entropy,0.36,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Monte Carlo Normalized Sequence Entropy,0.4,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Semantic Entropy,0.29,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Semantic Entropy,0.58,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Semantic Entropy,0.39,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Semantic Entropy,0.48,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,SentenceSAR,0.35,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,SentenceSAR,0.66,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,SentenceSAR,0.43,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,SentenceSAR,0.26,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,SAR,0.32,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,SAR,0.67,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,SAR,0.41,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,SAR,0.5,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Mahalanobis Distance - Decoder,-0.04,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Mahalanobis Distance - Decoder,-0.14,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Mahalanobis Distance - Decoder,-0.04,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Mahalanobis Distance - Decoder,0.38,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,RDE - Decoder,0.03,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,RDE - Decoder,-0.04,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,RDE - Decoder,0.23,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,RDE - Decoder,0.36,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Relative Mahalanobis Distance - Decoder,-0.05,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Relative Mahalanobis Distance - Decoder,-0.14,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Relative Mahalanobis Distance - Decoder,-0.11,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Relative Mahalanobis Distance - Decoder,0.39,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,HUQ-MD - Decoder,0.28,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,HUQ-MD - Decoder,0.64,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,HUQ-MD - Decoder,0.47,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,HUQ-MD - Decoder,0.48,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,P(True),-0.06,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,P(True),-0.12,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,P(True),0.07,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,P(True),0.0,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,NumSet,0.21,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,NumSet,0.65,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,NumSet,0.36,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,NumSet,0.24,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,EigValLaplacian NLI Score Entail.,0.31,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,EigValLaplacian NLI Score Entail.,0.65,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,EigValLaplacian NLI Score Entail.,0.39,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,EigValLaplacian NLI Score Entail.,0.3,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,EigValLaplacian Jaccard Score,0.25,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,EigValLaplacian Jaccard Score,0.62,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,EigValLaplacian Jaccard Score,0.35,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,EigValLaplacian Jaccard Score,0.39,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,DegMat NLI Score Entail.,0.35,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,DegMat NLI Score Entail.,0.67,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,DegMat NLI Score Entail.,0.41,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,DegMat NLI Score Entail.,0.34,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,DegMat Jaccard Score,0.31,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,DegMat Jaccard Score,0.63,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,DegMat Jaccard Score,0.4,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,DegMat Jaccard Score,0.42,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Eccentricity NLI Score Entail.,0.32,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Eccentricity NLI Score Entail.,0.64,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Eccentricity NLI Score Entail.,0.35,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Eccentricity NLI Score Entail.,0.45,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Eccentricity Jaccard Score,0.3,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Eccentricity Jaccard Score,0.6,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Eccentricity Jaccard Score,0.35,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Eccentricity Jaccard Score,0.28,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Lexical Similarity Rouge-L,0.33,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Lexical Similarity Rouge-L,0.64,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Lexical Similarity Rouge-L,0.4,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Lexical Similarity Rouge-L,0.48,0.01
+whitebox,Mistral 7B v0.2,7,CoQA,Lexical Similarity BLEU,0.31,0.01
+whitebox,Mistral 7B v0.2,7,TriviaQA,Lexical Similarity BLEU,0.61,0.01
+whitebox,Mistral 7B v0.2,7,MMLU,Lexical Similarity BLEU,0.4,0.01
+whitebox,Mistral 7B v0.2,7,GSM8k,Lexical Similarity BLEU,0.46,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,NumSet,0.21,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,NumSet,0.51,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,NumSet,0.2,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,EigValLaplacian NLI Score Entail.,0.26,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,EigValLaplacian NLI Score Entail.,0.54,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,EigValLaplacian NLI Score Entail.,0.27,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,EigValLaplacian Jaccard Score,0.19,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,EigValLaplacian Jaccard Score,0.42,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,EigValLaplacian Jaccard Score,0.21,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,DegMat NLI Score Entail.,0.26,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,DegMat NLI Score Entail.,0.52,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,DegMat NLI Score Entail.,0.25,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,DegMat Jaccard Score,0.23,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,DegMat Jaccard Score,0.46,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,DegMat Jaccard Score,0.22,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Eccentricity NLI Score Entail.,0.28,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Eccentricity NLI Score Entail.,0.48,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Eccentricity NLI Score Entail.,0.23,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Eccentricity Jaccard Score,0.29,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Eccentricity Jaccard Score,0.48,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Eccentricity Jaccard Score,0.25,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Lexical Similarity Rouge-L,0.25,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Lexical Similarity Rouge-L,0.44,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Lexical Similarity Rouge-L,0.23,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Lexical Similarity BLEU,0.26,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Lexical Similarity BLEU,0.44,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Lexical Similarity BLEU,0.23,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,BB Semantic Entropy,0.28,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,BB Semantic Entropy,0.48,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,BB Semantic Entropy,0.22,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Label Prob.,0.26,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Label Prob.,0.45,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Label Prob.,0.22,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,BB P(True),-0.02,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,BB P(True),0.35,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,BB P(True),0.22,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Linguistic 1S,0.13,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Linguistic 1S,0.43,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Linguistic 1S,0.25,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Verbalized 1S top-1,0.1,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Verbalized 1S top-1,0.48,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Verbalized 1S top-1,0.29,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Verbalized 1S top-k,0.1,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Verbalized 1S top-k,0.44,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Verbalized 1S top-k,0.26,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Verbalized 2S CoT,0.21,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Verbalized 2S CoT,0.38,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Verbalized 2S CoT,0.34,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Verbalized 2S top-1,0.08,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Verbalized 2S top-1,0.44,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Verbalized 2S top-1,0.33,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,CoQA,Verbalized 2S top-k,0.12,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,TriviaQA,Verbalized 2S top-k,0.47,0.01
+blackbox,Mistral 7B v0.2 Instruct,10,MMLU,Verbalized 2S top-k,0.25,0.01
