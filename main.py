@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
 import time
@@ -12,9 +13,6 @@ import traceback
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -196,6 +194,8 @@ from dataset_prep import (
 VERBALIZED_DATASETS = {k: v for k, v in DATASETS.items() if k != "GSM8k"}
 
 
+# Corrispondenza fra i modelli delle Figure 2/3 del paper e i nostri: finisce
+# nel report excluded_methods.md (le figure le disegna make_figures.py).
 FIGURE_A_MODELS_NOTE = (
     "Figura A ~ Vashurin et al. Fig. 2 (white-box, full access: StableLM v2 12b / "
     "Mistral v0.2 7b base), Mean PRR aggregato su CoQA/TriviaQA/MMLU/GSM8k -> sostituita da "
@@ -1278,244 +1278,6 @@ def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg
     return prr_df, timing_df, stats_df, per_instance_df
 
 
-def _pivot_with_ci(df, labels, group_order, value_col="value"):
-    """Pivot metodo x modello dei valori PRR, piu' i due pivot paralleli con
-    gli estremi dell'intervallo di confidenza (se presenti nel DataFrame).
-    Ritorna (pivot, err_low, err_high), dove i due err sono gia' espressi
-    come DISTANZA dal valore centrale, che e' il formato richiesto da
-    matplotlib per xerr; se gli intervalli non ci sono, ritorna (pivot, None,
-    None)."""
-    subset = df[df["paper_label"].isin(labels)]
-    if subset.empty:
-        return None, None, None
-    pivot = subset.pivot_table(index="paper_label", columns="model", values=value_col, aggfunc="first")
-    pivot = pivot.reindex(columns=group_order)
-
-    if "prr_ci_low" not in subset.columns or "prr_ci_high" not in subset.columns:
-        return pivot, None, None
-
-    low = subset.pivot_table(index="paper_label", columns="model", values="prr_ci_low", aggfunc="first")
-    high = subset.pivot_table(index="paper_label", columns="model", values="prr_ci_high", aggfunc="first")
-    low = low.reindex(index=pivot.index, columns=group_order)
-    high = high.reindex(index=pivot.index, columns=group_order)
-    # matplotlib vuole le semi-ampiezze, non gli estremi assoluti.
-    err_low = (pivot - low).clip(lower=0)
-    err_high = (high - pivot).clip(lower=0)
-    return pivot, err_low, err_high
-
-
-def _apply_label_margin(fig, index, cap=0.55, floor=0.22, per_char=0.011, **kwargs):
-    """Margine sinistro proporzionale alla label piu' lunga (in caratteri):
-    col figsize fisso il margine di default di matplotlib (~0.125) tronca
-    etichette lunghe tipo "Monte Carlo Normalized Sequence Entropy"."""
-    max_label_len = max(len(str(lbl)) for lbl in index)
-    left_margin = min(cap, max(floor, max_label_len * per_char))
-    fig.subplots_adjust(left=left_margin, **kwargs)
-
-
-def plot_prr_bars(df, labels, group_order, title, note, out_path, xlabel, add_mean=True):
-    """Bar chart orizzontale generico: una barra per elemento di group_order
-    (colonna 'model' del df, che puo' contenere sia nomi di modelli veri sia
-    etichette di varianti come "quantized"/"full precision"), una riga per
-    etichetta 'paper_label' in labels. Se add_mean=True aggiunge anche una
-    barra "Mean".
-
-    Se il DataFrame contiene le colonne prr_ci_low/prr_ci_high (prodotte dal
-    bootstrap), disegna anche le barre d'errore al 95%. La barra "Mean" non ne
-    ha: e' una media di PRR calcolati su dataset diversi, non una statistica
-    ricampionata, quindi un intervallo li' sarebbe fuorviante."""
-    pivot, err_low, err_high = _pivot_with_ci(df, labels, group_order)
-    if pivot is None:
-        print(f"!!! Nessun dato per {out_path}, salto.")
-        return None
-
-    row_mean = pivot.mean(axis=1)
-    order = row_mean.sort_values(ascending=True).index  # barh: ultima disegnata = in cima
-    pivot = pivot.loc[order]
-
-    xerr = None
-    if err_low is not None:
-        err_low, err_high = err_low.loc[order], err_high.loc[order]
-        # Forma richiesta da pandas.plot(kind="barh"): un array
-        # (n_colonne, 2, n_righe) con le semi-ampiezze basso/alto.
-        xerr = np.stack([
-            np.stack([err_low[c].to_numpy(dtype=float), err_high[c].to_numpy(dtype=float)])
-            for c in pivot.columns
-        ])
-        xerr = np.nan_to_num(xerr, nan=0.0)
-
-    if add_mean:
-        pivot = pivot.copy()
-        pivot["Mean"] = row_mean.loc[order]
-        if xerr is not None:
-            zeros = np.zeros((1, 2, len(pivot)))
-            xerr = np.concatenate([xerr, zeros], axis=0)
-
-    fig, ax = plt.subplots(figsize=(10, max(8, len(pivot) * 0.4)))
-    pivot.plot(kind="barh", ax=ax, width=0.8, xerr=xerr,
-               error_kw={"elinewidth": 0.7, "ecolor": "0.3"})
-    ax.set_xlabel(xlabel)
-    ax.set_title(title)
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.legend(loc="lower right", fontsize=8)
-    _apply_label_margin(fig, pivot.index, bottom=0.16)
-    fig.text(0.01, 0.02, "\n".join(textwrap.wrap(note, width=115)), fontsize=7, va="bottom")
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Salvato: {out_path}")
-    return pivot
-
-
-def plot_severity_grid(df, labels, group_order, out_path, accuracy_by_cell=None):
-    """Griglia 2x2 severita' (righe) x formato della risposta (colonne).
-
-    Motivazione: nel confronto precedente MedQA vs MedicationQA la severita' e
-    il formato variavano INSIEME, quindi un calo del PRR poteva dipendere da
-    entrambi. Qui ogni colonna fissa il formato (e quindi la metrica di
-    qualita'), cosi' il confronto verticale dentro una colonna isola la sola
-    severita'.
-
-    L'asse x e' condiviso all'interno di ciascuna colonna -- non tra colonne,
-    perche' AccuracyMetric (binaria) e AlignScore (continua) non sono
-    commensurabili e forzare la stessa scala suggerirebbe un confronto che non
-    e' lecito fare."""
-    cells = {}
-    for ds_name, cfg in SEVERITY_DATASETS.items():
-        ds_subset = df[(df["dataset"] == ds_name) & (df["paper_label"].isin(labels))]
-        if ds_subset.empty:
-            continue
-        pivot = ds_subset.pivot_table(index="paper_label", columns="model", values="value", aggfunc="first")
-        pivot = pivot.reindex(columns=group_order)
-        pivot["Mean"] = pivot.mean(axis=1)
-        cells[ds_name] = pivot
-
-    if not cells:
-        print(f"!!! Nessun dato per {out_path}, salto.")
-        return
-
-    # Ordine comune dei metodi in tutti e quattro i pannelli, cosi' che la
-    # stessa riga corrisponda sempre allo stesso metodo.
-    combined = sum(c["Mean"] for c in cells.values()) / len(cells)
-    common_order = combined.sort_values(ascending=True).index
-
-    severities = ["alta", "bassa"]
-    formats = ["MCQ", "libera"]
-    by_position = {}
-    for ds_name, cfg in SEVERITY_DATASETS.items():
-        by_position[(cfg["severity"], cfg["answer_format"])] = ds_name
-
-    fig, axes = plt.subplots(2, 2, figsize=(17, max(9, len(common_order) * 0.45)), sharey=True)
-    for r, sev in enumerate(severities):
-        # Scala x condivisa per colonna (stesso formato = stessa metrica).
-        for c, fmt in enumerate(formats):
-            ax = axes[r][c]
-            ds_name = by_position.get((sev, fmt))
-            if ds_name is None or ds_name not in cells:
-                ax.set_visible(False)
-                continue
-            pivot = cells[ds_name].reindex(common_order)
-            pivot.plot(kind="barh", ax=ax, width=0.8, legend=False)
-            title = f"{ds_name} -- severita' {sev}, formato {fmt}"
-            if accuracy_by_cell and ds_name in accuracy_by_cell:
-                title += f"\n{accuracy_by_cell[ds_name]}"
-            ax.set_title(title, fontsize=8)
-            ax.axvline(0, color="black", linewidth=0.8)
-            ax.set_xlabel("Mean PRR (raw, max_rejection=0.5)", fontsize=8)
-
-    for c, fmt in enumerate(formats):
-        col_axes = [axes[r][c] for r in range(2)
-                    if by_position.get((severities[r], fmt)) in cells]
-        if len(col_axes) == 2:
-            lo = min(a.get_xlim()[0] for a in col_axes)
-            hi = max(a.get_xlim()[1] for a in col_axes)
-            for a in col_axes:
-                a.set_xlim(lo, hi)
-
-    handles, legend_labels = axes[0][0].get_legend_handles_labels()
-    if handles:
-        axes[0][-1].legend(handles, legend_labels, loc="lower right", fontsize=7)
-    fig.suptitle("PRR per metodo UQ: griglia severita' clinica x formato della risposta")
-    _apply_label_margin(fig, common_order, cap=0.42, floor=0.18, per_char=0.008,
-                        bottom=0.08, top=0.91, wspace=0.05, hspace=0.22)
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Salvato: {out_path}")
-
-
-# Modello scelto per il confronto quantizzato vs non-quantizzato (vedi
-# --run_quant_comparison in main()). MedGemma-4B-it e Gemma3-4B-it sono
-# esclusi a priori: producono logit NaN sotto bitsandbytes 4-bit (vedi
-# NO_QUANT_MODELS) e per questo vengono SEMPRE caricati in bf16, quindi un
-# confronto quantizzato/non-quantizzato su di loro non e' fattibile. Tra i
-# modelli rimasti scegliamo LFM2-1.2B: la quantizzazione comprime
-# maggiormente un modello con piu' parametri, quindi un eventuale effetto
-# sulla qualita' delle stime di incertezza e' piu' probabilmente misurabile
-# rispetto al modello da 350M.
-QUANT_COMPARE_MODEL_DEFAULT = "LFM2-1.2B"
-
-
-def plot_pareto_frontier(df, out_path,
-                         cost_col="sec_full_per_instance", value_col="value",
-                         label_col="paper_label"):
-    """Scatter costo pieno per istanza (x, scala log) vs PRR medio (y), con
-    evidenziata la frontiera di Pareto.
-
-    Una tecnica e' DOMINATA se ne esiste un'altra insieme piu' economica e piu'
-    affidabile: sceglierla non e' mai razionale. Le tecniche non dominate
-    formano la frontiera, cioe' la curva dei migliori compromessi possibili: a
-    ogni budget di calcolo la figura dice qual e' la migliore affidabilita'
-    raggiungibile e con quale metodo. E' la figura che risponde alla domanda
-    del deployment on-device, dove il budget e' fissato dall'hardware."""
-    if df is None or df.empty:
-        print(f"!!! Nessun dato per {out_path}, salto.")
-        return None
-
-    data = df.dropna(subset=[cost_col, value_col]).sort_values(cost_col)
-    if data.empty:
-        print(f"!!! Nessun punto valido per {out_path}, salto.")
-        return None
-
-    # Frontiera: scorrendo per costo crescente, un punto e' sulla frontiera se
-    # supera il PRR massimo visto finora (nessuno piu' economico e' migliore).
-    frontier_idx, best = [], -np.inf
-    for idx, row in data.iterrows():
-        if row[value_col] > best:
-            frontier_idx.append(idx)
-            best = row[value_col]
-    frontier = data.loc[frontier_idx]
-
-    fig, ax = plt.subplots(figsize=(11, 7))
-    ax.scatter(data[cost_col], data[value_col], s=32, color="0.6",
-               label="metodi dominati", zorder=2)
-    ax.scatter(frontier[cost_col], frontier[value_col], s=64, color="tab:red",
-               label="frontiera di Pareto", zorder=3)
-    ax.plot(frontier[cost_col], frontier[value_col], color="tab:red",
-            linewidth=1.0, linestyle="--", zorder=1)
-
-    for _, row in data.iterrows():
-        ax.annotate(str(row[label_col]), (row[cost_col], row[value_col]),
-                    textcoords="offset points", xytext=(5, 3), fontsize=6.5)
-
-    ax.set_xscale("log")
-    ax.set_xlabel("Costo pieno standalone per istanza (secondi, scala log)")
-    ax.set_ylabel("Mean PRR (raw, max_rejection=0.5)")
-    ax.set_title("Frontiera di Pareto: affidabilita' dell'incertezza vs costo di calcolo")
-    ax.legend(loc="lower right", fontsize=8)
-    ax.grid(True, which="both", alpha=0.25)
-    fig.text(0.01, 0.01,
-             "Costo pieno = generazione greedy + K campioni (se la tecnica li richiede) + forward NLI "
-             "(se li richiede) + aritmetica dello stimatore,\nmediato sui modelli e sui dataset. Un "
-             "metodo e' dominato se un altro e' insieme piu' economico e piu' affidabile.",
-             fontsize=7, va="bottom")
-    fig.subplots_adjust(bottom=0.16)
-    plt.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Salvato: {out_path}")
-    print("Metodi sulla frontiera di Pareto:")
-    print(frontier[[label_col, cost_col, value_col]].to_string(index=False))
-    return frontier
-
-
 def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_by_str,
                         results_basename, models=None, estimators_factory=None,
                         content_transform=None, max_new_tokens_override=None,
@@ -1654,43 +1416,6 @@ def run_dataset_section(section_name, datasets_cfg, args, hf_token, paper_label_
     return raw_df, stats_all
 
 
-def aggregate_across_datasets(raw_df):
-    """Media del PRR di ogni metodo sui dataset, con l'intervallo di confidenza
-    propagato da quelli dei singoli dataset.
-
-    Le figure aggregate del paper mediano il PRR su tutti i task; l'intervallo
-    su quella media non puo' essere preso da un singolo dataset. Qui si
-    converte ogni intervallo bootstrap in un errore standard (semi-ampiezza /
-    1.96), si combinano come errori indipendenti -- se(media) = sqrt(somma dei
-    quadrati) / k -- e si torna a un intervallo al 95%.
-
-    L'ipotesi di indipendenza tra dataset e' ragionevole (sono campioni
-    disgiunti da fonti diverse) ma va dichiarata: se i dataset fossero
-    correlati, l'intervallo risultante sarebbe leggermente ottimistico."""
-    if "prr_ci_low" not in raw_df.columns:
-        return raw_df.groupby(["model", "paper_label"], as_index=False)["value"].mean()
-
-    tmp = raw_df.copy()
-    se = (tmp["prr_ci_high"] - tmp["prr_ci_low"]) / (2 * 1.96)
-    tmp["_se2"] = se ** 2
-
-    # Aggregazione tutta dentro .agg() invece che con .apply(): evita la
-    # dipendenza dal parametro include_groups, che esiste solo da pandas 2.2.
-    # "count" ignora i NaN, quindi conta solo i dataset con un intervallo
-    # valido.
-    agg = tmp.groupby(["model", "paper_label"], as_index=False).agg(
-        value=("value", "mean"),
-        n_datasets=("value", "size"),
-        _se2_sum=("_se2", "sum"),
-        _se_count=("_se2", "count"),
-    )
-    denom = agg["_se_count"].replace(0, np.nan)
-    se_comb = np.sqrt(agg["_se2_sum"]) / denom
-    agg["prr_ci_low"] = agg["value"] - 1.96 * se_comb
-    agg["prr_ci_high"] = agg["value"] + 1.96 * se_comb
-    return agg.drop(columns=["_se2_sum", "_se_count"])
-
-
 def build_accuracy_table(stats_df, results_dir, filename="accuracy_table.csv"):
     """Tabella modello x dataset della qualita' media delle generazioni.
 
@@ -1763,32 +1488,6 @@ def compute_rank_transfer(stats_df, results_dir, anchor=REPLICATION_ANCHOR_MODEL
     tau_df.to_csv(path, index=False)
     print(f"Salvato: {path}")
     print(tau_df.round(3).to_string(index=False))
-
-    try:
-        fig, ax = plt.subplots(figsize=(7, 5))
-        ax.plot(tau_df["params_B"], tau_df["kendall_tau_vs_anchor"], "o-", color="tab:blue")
-        for _, r in tau_df.iterrows():
-            ax.annotate(r["model"], (r["params_B"], r["kendall_tau_vs_anchor"]),
-                        textcoords="offset points", xytext=(6, 4), fontsize=8)
-        ax.axhline(0, color="black", linewidth=0.8)
-        ax.axhline(1, color="0.7", linewidth=0.8, linestyle=":")
-        ax.set_xscale("log")
-        ax.set_xlabel("Parametri del modello (miliardi, scala log)")
-        ax.set_ylabel(f"Kendall tau del ranking dei metodi UQ vs {anchor}")
-        ax.set_title("Trasferimento del ranking dei metodi UQ al calare della scala")
-        ax.set_ylim(-1.05, 1.05)
-        fig.text(0.01, 0.01,
-                 f"tau = 1: stesso ordine di preferenza dei metodi del modello a 7B; tau = 0: "
-                 f"ranking scorrelato.\nIl PRR e' mediato su tutti i dataset disponibili per "
-                 f"ciascun modello.", fontsize=7, va="bottom")
-        fig.subplots_adjust(bottom=0.18)
-        chart_path = os.path.join(results_dir, "fig_rank_transfer.png")
-        plt.savefig(chart_path, dpi=150)
-        plt.close(fig)
-        print(f"Salvato: {chart_path}")
-    except Exception:
-        print("!!! figura rank transfer fallita:")
-        traceback.print_exc()
 
     return tau_df
 
@@ -2209,43 +1908,10 @@ def main():
     model_order = [m for m in MODELS.keys() if m in raw_df["model"].unique()]
     dataset_order = [d for d in DATASETS.keys() if d in raw_df["dataset"].unique()]
 
-    # Mean PRR aggregato su tutti i task di selective QA, esattamente come da
-    # didascalia originale delle Figure 2/3 del paper ("aggregated over all
-    # selective QA tasks for each ... LLM separately"), con l'intervallo di
-    # confidenza propagato dai singoli dataset.
-    agg_df = aggregate_across_datasets(raw_df)
-
+    # Le figure (Figure A/B, griglia, costi, Pareto, ...) le disegna
+    # make_figures.py, richiamato alla fine di questo script: qui si producono
+    # solo i dati.
     figure_a_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("A", "AB") and m["factory"] is not None]
-    figure_b_labels = [m["paper_label"] for m in PAPER_METHODS if m["figure"] in ("B", "AB") and m["factory"] is not None]
-
-    def plot_paper_figure(labels, title, note, out_name):
-        plot_prr_bars(
-            agg_df, labels, model_order, title, note,
-            os.path.join(args.results_dir, out_name),
-            "Mean PRR (raw, max_rejection=0.5, aggregato su CoQA/TriviaQA/MMLU/GSM8k)",
-        )
-
-    try:
-        plot_paper_figure(
-            figure_a_labels,
-            "Mean PRR aggregato su selective QA (~ Fig. 2 Vashurin et al., white-box full-access)",
-            FIGURE_A_MODELS_NOTE,
-            "fig_a_white_box.png",
-        )
-    except Exception:
-        print("!!! fig_a_white_box.png fallito:")
-        traceback.print_exc()
-
-    try:
-        plot_paper_figure(
-            figure_b_labels,
-            "Mean PRR aggregato su selective QA (~ Fig. 3 Vashurin et al., reflexive/black-box)",
-            FIGURE_B_MODELS_NOTE,
-            "fig_b_reflexive.png",
-        )
-    except Exception:
-        print("!!! fig_b_reflexive.png fallito:")
-        traceback.print_exc()
 
     # Tabella stile Tabella 6 del paper, UNA per ciascun nostro modello:
     # righe = metodi di Figura A, colonne = i 4 dataset (CoQA/TriviaQA/MMLU/
@@ -2307,42 +1973,6 @@ def main():
             cost_table.to_csv(cost_path, index=False)
             print(f"Salvato: {cost_path}")
 
-            # Scala log sull'asse x: i tempi coprono diversi ordini di
-            # grandezza, in scala lineare tutte le barre tranne una sarebbero
-            # invisibili.
-            plot_pivot = timing_pivot.drop(columns=["Total"]).loc[
-                timing_pivot.sort_values("Total", ascending=True).index
-            ]
-            fig, ax = plt.subplots(figsize=(10, max(8, len(plot_pivot) * 0.4)))
-            plot_pivot.plot(kind="barh", ax=ax, width=0.8, logx=True)
-            ax.set_xlabel("Tempo di sola aritmetica dello stimatore, sommato su batch e dataset "
-                          "(secondi, scala log)")
-            ax.set_title("Costo MARGINALE per metodo UQ e modello")
-            ax.legend(loc="lower right", fontsize=8)
-            fig.text(0.01, 0.01,
-                     "Costo marginale = solo il calcolo dello stimatore su statistiche gia' pronte. "
-                     "NON e' il costo di eseguire la tecnica da sola: per quello vedi la frontiera "
-                     "di Pareto e estimator_cost_table.csv.", fontsize=7, va="bottom")
-            fig.subplots_adjust(bottom=0.14)
-            timing_chart_path = os.path.join(args.results_dir, "estimator_timing_chart.png")
-            plt.savefig(timing_chart_path, dpi=150)
-            plt.close(fig)
-            print(f"Salvato: {timing_chart_path}")
-
-            # Frontiera di Pareto costo/affidabilita'.
-            try:
-                pareto_source = agg_df.groupby("paper_label", as_index=False)["value"].mean()
-                pareto = pareto_source.merge(
-                    cost_table[["paper_label", "sec_full_per_instance"]],
-                    on="paper_label", how="inner",
-                ).dropna(subset=["value", "sec_full_per_instance"])
-                plot_pareto_frontier(
-                    pareto,
-                    os.path.join(args.results_dir, "fig_pareto_cost_quality.png"),
-                )
-            except Exception:
-                print("!!! frontiera di Pareto fallita:")
-                traceback.print_exc()
     except Exception:
         print("!!! tabelle/grafici dei costi falliti:")
         traceback.print_exc()
@@ -2365,29 +1995,9 @@ def main():
                 min_datasets=2,
             )
             if severity_raw is not None:
-                severity_model_order = [m for m in MODELS if m in severity_raw["model"].unique()]
-
-                acc_table = build_accuracy_table(
+                build_accuracy_table(
                     severity_stats, args.results_dir, "accuracy_table_severity_grid.csv"
                 )
-                # Accuracy di ogni cella, mostrata nel titolo del pannello:
-                # senza di essa un PRR basso non e' distinguibile da "modello
-                # che tira a indovinare".
-                accuracy_by_cell = {}
-                if severity_stats is not None:
-                    for ds_name, grp in severity_stats.groupby("dataset"):
-                        per_model = ", ".join(
-                            f"{m}: {v:.2f}" for m, v in
-                            grp.groupby("model")["mean_quality"].first().items()
-                        )
-                        accuracy_by_cell[ds_name] = f"qualita' media -- {per_model}"
-
-                plot_severity_grid(
-                    severity_raw, figure_a_labels, severity_model_order,
-                    os.path.join(args.results_dir, "fig_severity_grid.png"),
-                    accuracy_by_cell=accuracy_by_cell,
-                )
-
                 # Silent failure rate: quanti degli errori finiscono nel decile
                 # piu' confidente. E' il numero che conta davvero in clinica e
                 # che il PRR medio non mostra.
@@ -2465,20 +2075,6 @@ def main():
                     print(f"Parse-failure rate ({style}):")
                     print(pf.round(3).to_string())
 
-                verb_model_order = [m for m in MODELS if m in verb_raw["model"].unique()]
-                verb_labels = sorted(verb_raw["paper_label"].dropna().unique())
-                verb_agg = verb_raw.groupby(["model", "paper_label"], as_index=False)["value"].mean()
-                plot_prr_bars(
-                    verb_agg, verb_labels, verb_model_order,
-                    f"Mean PRR metodi verbalized ({style}), aggregato su CoQA/TriviaQA/MMLU",
-                    "I metodi verbalized girano con un prompt e un max_new_tokens diversi dalla "
-                    "pipeline principale, quindi questi valori NON sono confrontabili con quelli "
-                    "delle Figure A/B. Da leggere sempre insieme al parse-failure rate: le istanze "
-                    "in cui la confidenza non e' estraibile vengono trattate da lm-polygraph come "
-                    "massima confidenza, non come errore.",
-                    os.path.join(args.results_dir, f"fig_verbalized_{style}.png"),
-                    "Mean PRR (raw, max_rejection=0.5)",
-                )
                 print(f"Sezione verbalized ({style}) completata.")
             except Exception:
                 print(f"!!! Sezione verbalized ({style}) fallita:")
@@ -2610,6 +2206,28 @@ def main():
             except Exception:
                 print("!!! Confronto quantizzazione fallito:")
                 traceback.print_exc()
+
+    # Analisi offline e figure, sui CSV appena scritti. Girano come processi
+    # separati (sono script autonomi, rilanciabili a mano con gli stessi
+    # comandi): un loro errore non tocca i risultati gia' salvati.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for script, extra in (("paired_comparisons.py", []),
+                          ("paired_comparisons.py",
+                           ["--per_instance_file", "results_severity_grid_per_instance.csv"]),
+                          ("make_figures.py", [])):
+        if "severity" in " ".join(extra) and not os.path.exists(
+                os.path.join(args.results_dir, "results_severity_grid_per_instance.csv")):
+            continue
+        cmd = [sys.executable, os.path.join(here, script), args.results_dir] + extra
+        print(f"\n--- {' '.join(cmd[1:])} ---")
+        try:
+            esito = subprocess.run(cmd, check=False)
+            if esito.returncode != 0:
+                print(f"!!! {script} terminato con codice {esito.returncode}: i CSV sono salvi, "
+                      f"si puo' rilanciare a mano.")
+        except Exception:
+            print(f"!!! {script} non eseguito:")
+            traceback.print_exc()
 
     print("\nBENCHMARK COMPLETATO.")
 

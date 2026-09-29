@@ -20,6 +20,7 @@ Uso:
 import argparse
 import os
 import sys
+import traceback
 
 import matplotlib
 matplotlib.use("Agg")
@@ -54,6 +55,14 @@ ANCHOR_MODEL = "Mistral-7B-it"
 # Zona in cui il PRR non e' interpretabile: troppo poche risposte corrette o
 # troppo poche sbagliate da ordinare (vedi build_accuracy_table in main.py).
 INTERPRETABLE_ACCURACY = (0.30, 0.85)
+
+
+def _ordina_modelli(nomi):
+    """Modelli nell'ordine di scala di MODEL_PARAMS_B, seguiti da quelli non in
+    elenco (prima venivano scartati, e un modello nuovo spariva dalle figure)."""
+    nomi = list(dict.fromkeys(nomi))
+    noti = [m for m in MODEL_PARAMS_B if m in nomi]
+    return noti + sorted(m for m in nomi if m not in MODEL_PARAMS_B)
 
 
 def load_stats(results_dir):
@@ -248,6 +257,71 @@ def fig_ties_vs_scale(results_dir):
     save(fig, results_dir, "fig_ties_vs_scale.png")
 
 
+def fig_timing_marginal(results_dir):
+    """Costo MARGINALE per metodo e modello (sola aritmetica dello stimatore,
+    sommata su batch e dataset). Era disegnata da main.py a fine run."""
+    path = os.path.join(results_dir, "estimator_timings.csv")
+    if not os.path.exists(path):
+        return
+    t = pd.read_csv(path)
+    if "seconds" not in t.columns:
+        return
+    piv = t.pivot_table(index="paper_label", columns="model", values="seconds", aggfunc="sum")
+    piv = piv.reindex(columns=_ordina_modelli(piv.columns))
+    if piv.empty:
+        return
+    piv = piv.loc[piv.sum(axis=1).sort_values().index]
+    fig, ax = plt.subplots(figsize=(10, max(8, len(piv) * 0.4)))
+    piv.plot(kind="barh", ax=ax, width=0.8, logx=True)
+    ax.set_xlabel("Tempo di sola aritmetica dello stimatore, sommato su batch e dataset "
+                  "(secondi, scala log)")
+    ax.set_ylabel("")
+    ax.set_title("Costo MARGINALE per metodo UQ e modello")
+    ax.legend(loc="lower right", fontsize=8)
+    add_note(fig,
+             "Costo marginale = solo il calcolo dello stimatore su statistiche gia' pronte. NON e' il "
+             "costo di eseguire la tecnica da sola:\nper quello vedi fig_timing_full_cost.png, la "
+             "frontiera di Pareto ed estimator_cost_table.csv.")
+    save(fig, results_dir, "estimator_timing_chart.png")
+
+
+def fig_verbalized_by_style(results_dir):
+    """PRR dei metodi verbalized per modello, uno per stile di confidenza, con
+    intervalli di confidenza e la quota di confidenze non estraibili accanto al
+    nome del modello. Era disegnata da main.py a fine run."""
+    for style in ("numeric", "linguistic"):
+        raw = _read_mapped(results_dir, f"results_verbalized_{style}_mapped.csv")
+        if raw is None or raw.empty:
+            continue
+        agg = aggregate_across_datasets(raw)
+        modelli = _ordina_modelli(agg["model"])
+        if not modelli:
+            continue
+        agg = agg.set_index("model").reindex(modelli).reset_index()
+        pf = (raw.groupby("model")["nan_rate"].mean()
+              if "nan_rate" in raw.columns else pd.Series(dtype=float))
+        etichette = [f"{m}\n(confidenza non estraibile: {pf[m]:.0%})" if m in pf else m
+                     for m in modelli]
+        datasets = ", ".join(sorted(raw["dataset"].unique()))
+        fig, ax = plt.subplots(figsize=(9, 1.2 + 0.7 * len(modelli)))
+        xerr = None
+        if {"prr_ci_low", "prr_ci_high"}.issubset(agg.columns):
+            xerr = np.stack([(agg["value"] - agg["prr_ci_low"]).clip(lower=0).fillna(0),
+                             (agg["prr_ci_high"] - agg["value"]).clip(lower=0).fillna(0)])
+        ax.barh(etichette, agg["value"], xerr=xerr, color="tab:purple", alpha=0.8,
+                error_kw={"elinewidth": 0.6, "ecolor": "0.35"})
+        ax.invert_yaxis()
+        ax.set_xlabel(f"Mean PRR (raw, max_rejection=0.5, aggregato su {datasets})")
+        titolo = "numerica" if style == "numeric" else "verbale"
+        ax.set_title(f"Metodi verbalized: confidenza {titolo} dichiarata dal modello")
+        add_note(fig,
+                 "Prompt e max_new_tokens diversi dalla pipeline principale: valori NON confrontabili "
+                 "con le Figure A/B (vedi fig_verbalized_accuracy_cost.png).\nlm-polygraph tratta una "
+                 "confidenza non estraibile come massima confidenza: con una quota alta fra parentesi, "
+                 "il PRR di quel modello\nnon misura quasi nulla.")
+        save(fig, results_dir, f"fig_verbalized_{style}.png")
+
+
 def fig_verbalized_accuracy_cost(results_dir):
     """Quanto costa, in qualita' delle risposte, chiedere al modello di
     dichiarare la propria confidenza.
@@ -397,7 +471,7 @@ def fig_paper_figure(results_dir, figure_letter, out_name, titolo):
     if verb_agg is not None:
         verb_agg["paper_label"] = verb_agg["paper_label"].replace(VERBALIZED_RENAME)
 
-    modelli = [m for m in MODEL_PARAMS_B if m in set(agg["model"])]
+    modelli = _ordina_modelli(agg["model"])
     if not modelli:
         return
 
@@ -500,7 +574,7 @@ def fig_severity_grid(results_dir):
     posizioni = {("alta", "MCQ"): "MedQAbstain-LT", ("bassa", "MCQ"): "MedQAbstain-Safe",
                  ("alta", "libera"): "MedicationQA", ("bassa", "libera"): "MedQuAD"}
     presenti = set(raw["dataset"])
-    modelli = [m for m in MODEL_PARAMS_B if m in set(raw["model"])]
+    modelli = _ordina_modelli(raw["model"])
 
     ordine = (raw.groupby("paper_label")["value"].mean().sort_values().index.tolist())
     fig, axes = plt.subplots(2, 2, figsize=(17, max(9, len(ordine) * 0.45)), sharey=True)
@@ -672,7 +746,7 @@ def table_accuracy(stats, results_dir):
     cell["testo"] = cell.apply(
         lambda r: f"{r['acc']:.3f}\n({r['metrica']})" if pd.notna(r["acc"]) else "-", axis=1)
     tabella = cell.pivot(index="model", columns="dataset", values="testo").fillna("-")
-    tabella = tabella.reindex([m for m in MODEL_PARAMS_B if m in tabella.index])
+    tabella = tabella.reindex(_ordina_modelli(tabella.index))
     df = tabella.reset_index().rename(columns={"model": "modello"})
 
     fig, ax = plt.subplots(figsize=(2.1 * len(df.columns), 1.4 + 0.75 * len(df)))
@@ -979,7 +1053,7 @@ def table_silent_failure(results_dir):
     abbrev = {"MedQAbstain-LT": "LT", "MedQAbstain-Safe": "Safe",
               "MedicationQA": "MedicationQA", "MedQuAD": "MedQuAD"}
     ordine_ds = [d for d in abbrev if d in set(st["dataset"])]
-    ordine_m = [m for m in MODEL_PARAMS_B if m in set(st["model"])]
+    ordine_m = _ordina_modelli(st["model"])
     colonne = [(d, m) for d in ordine_ds for m in ordine_m
                if ((st["dataset"] == d) & (st["model"] == m)).any()]
     if not colonne:
@@ -1058,54 +1132,79 @@ def _tabella_da_csv(results_dir, filename, titolo, out_name, nota, indice=None):
     save(fig, results_dir, out_name)
 
 
+def generate_all(results_dir):
+    """Disegna tutte le figure e le tabelle-immagine a partire dai CSV di
+    results_dir. E' l'UNICO punto in cui si disegna: main.py la richiama a fine
+    run, e la si puo' rilanciare a mano quante volte serve."""
+    args = argparse.Namespace(results_dir=results_dir)
+    stats = load_stats(args.results_dir)
+    if stats is None:
+        print(f"!!! Nessuna statistica per-istanza in {args.results_dir}.")
+        return 1
+    print(f"Celle modello x dataset disponibili: "
+          f"{stats.groupby(['model', 'dataset']).ngroups}")
+
+    rd = args.results_dir
+    nota_parse_failure = ("Frazione di istanze in cui la confidenza non e' estraibile dal testo generato. Va letta "
+             "ACCANTO al PRR: lm-polygraph\nconverte i punteggi non estraibili in -1e7, cioe' li tratta "
+             "come massima confidenza, quindi un modello che non rispetta il\nformato non viene "
+             "penalizzato dal PRR ma premiato. Un parse-failure rate alto rende il PRR di quel metodo "
+             "non informativo.")
+    # Ogni figura gira isolata: un errore su una (dati parziali, un CSV di
+    # una versione vecchia) non deve impedire di disegnare le altre.
+    figure = [
+        ("fig_accuracy", lambda: fig_accuracy(stats, rd)),
+        ("fig_accuracy_vs_prr", lambda: fig_accuracy_vs_prr(stats, rd)),
+        ("fig_anchor_replication", lambda: fig_anchor_replication(stats, rd)),
+        ("fig_ties_vs_scale", lambda: fig_ties_vs_scale(rd)),
+        ("fig_timing_full_cost", lambda: fig_timing_full_cost(rd)),
+        ("fig_a_white_box", lambda: fig_paper_figure(
+            rd, "A", "fig_a_white_box.png",
+            "Mean PRR aggregato su selective QA (~ Fig. 2 Vashurin et al., white-box full-access)")),
+        ("fig_b_reflexive", lambda: fig_paper_figure(
+            rd, "B", "fig_b_reflexive.png",
+            "Mean PRR aggregato su selective QA (~ Fig. 3 Vashurin et al., reflexive/black-box)")),
+        ("fig_quant_comparison", lambda: fig_quant_comparison(rd)),
+        ("fig_severity_grid", lambda: fig_severity_grid(rd)),
+        ("fig_tabella_accuracy", lambda: table_accuracy(stats, rd)),
+        ("fig_tabella_prr_accuracy", lambda: table_prr_vs_accuracy(stats, rd)),
+        ("fig_verbalized_accuracy_cost", lambda: fig_verbalized_accuracy_cost(rd)),
+        ("fig_verbalized_numeric/linguistic", lambda: fig_verbalized_by_style(rd)),
+        ("estimator_timing_chart", lambda: fig_timing_marginal(rd)),
+        ("fig_prr_vs_scale_by_family", lambda: fig_prr_vs_scale_by_family(rd)),
+        ("fig_rank_transfer", lambda: fig_rank_transfer(stats, rd)),
+        ("fig_pareto_cost_quality", lambda: fig_pareto(rd)),
+        ("fig_tabella_costi", lambda: table_costi(rd)),
+    ]
+    for style in ("numeric", "linguistic"):
+        figure.append((f"fig_tabella_parse_failure_{style}", lambda style=style: _tabella_da_csv(
+            rd, f"parse_failure_rate_{style}.csv", f"Parse-failure rate, confidenza {style}",
+            f"fig_tabella_parse_failure_{style}.png", nota_parse_failure)))
+    figure.append(("fig_tabella_silent_failure", lambda: table_silent_failure(rd)))
+
+    fallite = []
+    for nome, disegna in figure:
+        try:
+            disegna()
+        except Exception:
+            fallite.append(nome)
+            print(f"!!! {nome} fallita:")
+            traceback.print_exc()
+        finally:
+            plt.close("all")
+    if fallite:
+        print(f"\n!!! Figure non prodotte ({len(fallite)}): {', '.join(fallite)}")
+        return 1
+    print(f"\nTutte le {len(figure)} figure prodotte.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("results_dir")
     args = parser.parse_args()
-
-    stats = load_stats(args.results_dir)
-    if stats is None:
-        raise SystemExit(f"!!! Nessuna statistica per-istanza in {args.results_dir}.")
-    print(f"Celle modello x dataset disponibili: "
-          f"{stats.groupby(['model', 'dataset']).ngroups}")
-
-    fig_accuracy(stats, args.results_dir)
-    fig_accuracy_vs_prr(stats, args.results_dir)
-    fig_anchor_replication(stats, args.results_dir)
-    fig_ties_vs_scale(args.results_dir)
-
-    # Le otto figure richieste (vedi figure_richieste.txt).
-    fig_timing_full_cost(args.results_dir)                                    # 1
-    fig_paper_figure(args.results_dir, "A", "fig_a_white_box.png",            # 2
-                     "Mean PRR aggregato su selective QA "
-                     "(~ Fig. 2 Vashurin et al., white-box full-access)")
-    fig_paper_figure(args.results_dir, "B", "fig_b_reflexive.png",            # 3
-                     "Mean PRR aggregato su selective QA "
-                     "(~ Fig. 3 Vashurin et al., reflexive/black-box)")
-    fig_quant_comparison(args.results_dir)                                    # 4
-    fig_severity_grid(args.results_dir)                                       # 5
-    table_accuracy(stats, args.results_dir)                                   # 6
-    table_prr_vs_accuracy(stats, args.results_dir)                            # 7
-    fig_verbalized_accuracy_cost(args.results_dir)                            # 8
-
-    # Artefatti chiesti dal TODO ma non compresi nelle otto.
-    fig_prr_vs_scale_by_family(args.results_dir)                              # TODO 1
-    fig_rank_transfer(stats, args.results_dir)                                # TODO 1
-    fig_pareto(args.results_dir)                                              # TODO 6
-    table_costi(args.results_dir)                                             # TODO 6
-    for style in ("numeric", "linguistic"):                                   # TODO 3
-        _tabella_da_csv(
-            args.results_dir, f"parse_failure_rate_{style}.csv",
-            f"Parse-failure rate, confidenza {style}",
-            f"fig_tabella_parse_failure_{style}.png",
-            "Frazione di istanze in cui la confidenza non e' estraibile dal testo generato. Va letta "
-            "ACCANTO al PRR: lm-polygraph\nconverte i punteggi non estraibili in -1e7, cioe' li tratta "
-            "come massima confidenza, quindi un modello che non rispetta il\nformato non viene "
-            "penalizzato dal PRR ma premiato. Un parse-failure rate alto rende il PRR di quel metodo "
-            "non informativo.")
-    table_silent_failure(args.results_dir)                                    # TODO 4
-    return 0
+    return generate_all(args.results_dir)
 
 
 if __name__ == "__main__":

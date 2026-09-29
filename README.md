@@ -303,13 +303,18 @@ completo, e la pipeline principale viene ripresa interamente dai checkpoint.
 SB --results_dir /workspace/results_costi --datasets CoQA TriviaQA MMLU --n_test_samples 100
 ```
 
-**Rigenerare figure e tabelle** dopo un run (senza GPU, anche su un portatile con
-pandas e matplotlib):
+**Figure e test appaiati** vengono prodotti in automatico alla fine di `main.py`,
+che lancia nell'ordine `paired_comparisons.py` (sulla pipeline principale e, se c'è,
+sulla griglia clinica) e `make_figures.py`. Per rigenerarli a mano, ad esempio dopo
+aver copiato i risultati su un portatile con pandas e matplotlib (senza GPU):
 
 ```bash
-python3.11 make_figures.py results
 python3.11 paired_comparisons.py results
+python3.11 paired_comparisons.py results --per_instance_file results_severity_grid_per_instance.csv
+python3.11 make_figures.py results
 ```
+
+L'ordine conta: `fig_ties_vs_scale.png` legge i riepiloghi di `paired_comparisons.py`.
 
 ### Tempi indicativi (RTX 3090, 5 modelli)
 
@@ -379,7 +384,7 @@ possono cancellare a run concluso: servono solo alla ripresa.
 | `fig_timing_full_cost.png`, `estimator_timing_chart.png` | Costo pieno contro costo marginale; costo marginale per modello. |
 | `fig_pareto_cost_quality.png` | Frontiera di Pareto costo contro PRR, con intervalli di confidenza. |
 | `fig_verbalized_accuracy_cost.png` | Quanto la richiesta di confidenza peggiora le risposte. |
-| `fig_verbalized_{numeric,linguistic}.png` | PRR dei metodi verbalized per modello (prodotte da `main.py`). |
+| `fig_verbalized_{numeric,linguistic}.png` | PRR dei metodi verbalized per modello, con intervalli di confidenza e parse-failure rate. |
 | `fig_tabella_*.png` | Tabelle in forma di immagine: accuracy, PRR affiancato all'accuracy, costi, parse-failure rate, silent failure rate. |
 
 ---
@@ -397,8 +402,12 @@ python3.11 make_figures.py <results_dir>
 ```
 
 Rigenera tutte le figure della sezione 7 dai CSV. Se un CSV manca, la figura
-corrispondente viene saltata con un messaggio. Ogni figura ha in fondo una nota
-su come leggerla e su quando non fidarsi del dato.
+corrispondente viene saltata con un messaggio. Ogni figura è disegnata in modo
+isolato: se una fallisce (ad esempio per un CSV di una versione vecchia), le altre
+vengono prodotte comunque e alla fine lo script elenca quelle mancanti ed esce con
+codice 1. Un modello non presente in `MODEL_PARAMS_B` compare in coda nelle figure
+invece di essere scartato. Ogni figura ha in fondo una nota su come leggerla e su
+quando non fidarsi del dato.
 
 ### `paired_comparisons.py`
 
