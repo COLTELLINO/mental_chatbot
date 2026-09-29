@@ -634,13 +634,27 @@ def fig_timing_full_cost(results_dir):
     save(fig, results_dir, "fig_timing_full_cost.png")
 
 
+def _righe_di_testo(celle):
+    """Numero massimo di righe di testo fra le celle date."""
+    celle = [str(c) for c in celle]
+    return max(c.count("\n") + 1 for c in celle) if celle else 1
+
+
 def _tabella_immagine(fig, ax, df, col_widths=None, fontsize=8):
     ax.axis("off")
     tab = ax.table(cellText=df.values.tolist(), colLabels=df.columns.tolist(),
                    cellLoc="center", loc="center", colWidths=col_widths)
     tab.auto_set_font_size(False)
     tab.set_fontsize(fontsize)
-    tab.scale(1, 1.45)
+    # L'altezza delle righe cresce con il numero di righe di testo per cella:
+    # con un fattore fisso le celle su due righe (valore + metrica) si
+    # sovrapponevano a quelle vicine.
+    righe_corpo = _righe_di_testo(df.values.ravel())
+    righe_intest = _righe_di_testo(df.columns)
+    tab.scale(1, 1.45 * righe_corpo)
+    for (r, c), cell in tab.get_celld().items():
+        if r == 0 and righe_intest != righe_corpo:
+            cell.set_height(cell.get_height() * righe_intest / righe_corpo)
     for (r, c), cell in tab.get_celld().items():
         cell.set_linewidth(0.4)
         if r == 0:
@@ -661,7 +675,7 @@ def table_accuracy(stats, results_dir):
     tabella = tabella.reindex([m for m in MODEL_PARAMS_B if m in tabella.index])
     df = tabella.reset_index().rename(columns={"model": "modello"})
 
-    fig, ax = plt.subplots(figsize=(2.1 * len(df.columns), 0.9 + 0.55 * len(df)))
+    fig, ax = plt.subplots(figsize=(2.1 * len(df.columns), 1.4 + 0.75 * len(df)))
     _tabella_immagine(fig, ax, df)
     ax.set_title("Qualita' di base per modello e dataset, con la metrica usata",
                  fontsize=11, pad=16)
@@ -835,8 +849,21 @@ def fig_pareto(results_dir):
         print("  estimator_timings.csv ha uno schema vecchio, salto la Pareto.")
         return
     costo = t.groupby("paper_label", as_index=False)["seconds_full_per_instance"].mean()
-    qualita = aggregate_across_datasets(raw).groupby("paper_label", as_index=False)["value"].mean()
-    punti = qualita.merge(costo, on="paper_label", how="inner").dropna()
+    agg = aggregate_across_datasets(raw)
+    # Intervallo al 95% della media sui modelli, combinando gli errori standard
+    # dei singoli modelli come indipendenti (stessa regola di
+    # aggregate_across_datasets).
+    if {"prr_ci_low", "prr_ci_high"}.issubset(agg.columns):
+        agg = agg.assign(_se2=((agg["prr_ci_high"] - agg["prr_ci_low"]) / (2 * 1.96)) ** 2)
+        qualita = agg.groupby("paper_label", as_index=False).agg(
+            value=("value", "mean"), _se2=("_se2", "sum"), _k=("value", "size"))
+        qualita["ci"] = 1.96 * np.sqrt(qualita["_se2"]) / qualita["_k"]
+        qualita = qualita.drop(columns=["_se2", "_k"])
+    else:
+        qualita = agg.groupby("paper_label", as_index=False)["value"].mean()
+        qualita["ci"] = np.nan
+    punti = qualita.merge(costo, on="paper_label", how="inner").dropna(
+        subset=["value", "seconds_full_per_instance"])
     if punti.empty:
         return
     punti = punti.sort_values("seconds_full_per_instance")
@@ -849,6 +876,10 @@ def fig_pareto(results_dir):
     frontiera = punti.loc[frontiera_idx]
 
     fig, ax = plt.subplots(figsize=(11, 7))
+    if punti["ci"].notna().any():
+        ax.errorbar(punti["seconds_full_per_instance"], punti["value"], yerr=punti["ci"],
+                    fmt="none", ecolor="0.75", elinewidth=0.8, capsize=2, zorder=1,
+                    label="intervallo di confidenza al 95%")
     ax.scatter(punti["seconds_full_per_instance"], punti["value"], s=34,
                color="0.6", label="metodi dominati", zorder=2)
     ax.scatter(frontiera["seconds_full_per_instance"], frontiera["value"], s=68,
@@ -868,7 +899,13 @@ def fig_pareto(results_dir):
              "Un metodo e' dominato se ne esiste un altro insieme piu' economico e piu' affidabile: "
              "sceglierlo non e' mai razionale.\nLa frontiera dice, per ogni budget di calcolo, la "
              "migliore affidabilita' raggiungibile e con quale metodo -- e' la figura\nche risponde "
-             "alla domanda del deployment on-device.")
+             "alla domanda del deployment on-device. Le barre grigie sono intervalli al 95%: due "
+             "metodi le cui barre si sovrappongono\nlargamente non sono distinguibili, e la "
+             "frontiera fra loro va letta come indicativa, non come una classifica."
+             + ("" if "needs_cross_encoder" in t.columns else
+                "\nATTENZIONE: costi prodotti prima della correzione del calcolo delle dipendenze: "
+                "CCP, TokenSAR, SAR, SentenceSAR,\nLabel Prob., PMI e P(True) risultano piu' "
+                "economici di quanto sono (modelli ausiliari e forward extra non attribuiti)."))
     save(fig, results_dir, "fig_pareto_cost_quality.png")
 
 
@@ -882,35 +919,118 @@ def table_costi(results_dir):
     if not attese.issubset(t.columns):
         print(f"  estimator_timings.csv senza le colonne di costo, salto la tabella costi.")
         return
+    extra = [c for c in ("needs_cross_encoder", "needs_extra_forward") if c in t.columns]
     costo = t.groupby("paper_label", as_index=False).agg(
         marginale=("seconds_marginal_per_instance", "mean"),
         pieno=("seconds_full_per_instance", "mean"),
-        memoria=("peak_memory_gb", "max"),
         campioni=("needs_sampling", "max"),
         nli=("needs_nli", "max"),
+        **{c: (c, "max") for c in extra},
     ).sort_values("pieno", ascending=False)
 
-    df = pd.DataFrame({
+    # La memoria di picco NON compare: e' misurata sull'intera cella modello x
+    # dataset, quindi e' identica per tutti i metodi e non dice nulla sul
+    # singolo metodo (resta in estimator_cost_table.csv come dato per modello).
+    colonne = {
         "metodo": costo["paper_label"],
         "famiglia": costo["paper_label"].map(family_of),
         "s/istanza (marginale)": costo["marginale"].map("{:.4f}".format),
         "s/istanza (pieno)": costo["pieno"].map("{:.3f}".format),
-        "memoria picco (GB)": costo["memoria"].map("{:.1f}".format),
         "K campioni": np.where(costo["campioni"], "si", "-"),
         "NLI": np.where(costo["nli"], "si", "-"),
-    })
+    }
+    larghezze = [0.28, 0.16, 0.13, 0.12, 0.09, 0.07]
+    if "needs_cross_encoder" in costo:
+        colonne["cross-encoder"] = np.where(costo["needs_cross_encoder"], "si", "-")
+        larghezze.append(0.10)
+    if "needs_extra_forward" in costo:
+        colonne["forward extra"] = np.where(costo["needs_extra_forward"], "si", "-")
+        larghezze.append(0.10)
+    df = pd.DataFrame(colonne)
     fig, ax = plt.subplots(figsize=(13, 0.6 + 0.30 * len(df)))
-    _tabella_immagine(fig, ax, df, col_widths=[0.28, 0.16, 0.13, 0.12, 0.13, 0.09, 0.07],
-                      fontsize=7.5)
-    ax.set_title("Costo per metodo UQ: tempo marginale, tempo pieno standalone, memoria di picco",
+    _tabella_immagine(fig, ax, df, col_widths=larghezze, fontsize=7.5)
+    ax.set_title("Costo per metodo UQ: tempo marginale e tempo pieno standalone",
                  fontsize=11, pad=16)
+    nota_extra = ("" if extra else
+                  "\nATTENZIONE: risultati prodotti prima della correzione del calcolo delle "
+                  "dipendenze: il costo pieno di CCP, TokenSAR,\nSAR, SentenceSAR, Label Prob., PMI e "
+                  "P(True) e' sottostimato (modelli ausiliari e forward extra non attribuiti).")
     add_note(fig,
              "Il tempo marginale e' la sola aritmetica su statistiche gia' pronte, utile a chi "
              "calcola molte tecniche insieme. Il tempo pieno\ne' quello che conta per il deployment "
-             "on-device: include generazione greedy, K campioni e forward NLI se il metodo li "
-             "richiede.\nLa memoria di picco e' quella dell'intera combinazione, quindi e' un limite "
-             "superiore per il singolo metodo.")
+             "on-device: somma i tempi misurati di tutti i calcolatori da cui il metodo dipende\n"
+             "(generazione greedy, K campioni, modello NLI, cross-encoder, forward extra del modello)."
+             + nota_extra)
     save(fig, results_dir, "fig_tabella_costi.png")
+
+
+def table_silent_failure(results_dir):
+    """Silent failure rate per metodo, dataset della griglia e modello, letto
+    direttamente dalle statistiche per-istanza (non dal pivot CSV, che ha due
+    righe di intestazione e usciva con colonne "MedQuAD.1" e una riga
+    "paper_label nan")."""
+    path = os.path.join(results_dir, "results_severity_grid_instance_stats.csv")
+    if not os.path.exists(path):
+        print("  results_severity_grid_instance_stats.csv assente, salto il silent failure rate.")
+        return
+    st = pd.read_csv(path)
+    if "silent_failure_rate" not in st.columns or st.empty:
+        return
+    abbrev = {"MedQAbstain-LT": "LT", "MedQAbstain-Safe": "Safe",
+              "MedicationQA": "MedicationQA", "MedQuAD": "MedQuAD"}
+    ordine_ds = [d for d in abbrev if d in set(st["dataset"])]
+    ordine_m = [m for m in MODEL_PARAMS_B if m in set(st["model"])]
+    colonne = [(d, m) for d in ordine_ds for m in ordine_m
+               if ((st["dataset"] == d) & (st["model"] == m)).any()]
+    if not colonne:
+        return
+    piv = st.pivot_table(index="paper_label", columns=["dataset", "model"],
+                         values="silent_failure_rate", aggfunc="first")
+    piv = piv.reindex(columns=pd.MultiIndex.from_tuples(colonne))
+    # Colonne interamente vuote = dati per-istanza assenti per quel modello
+    # (non un metodo costante): non vanno mostrate come una fila di "-".
+    vuote = [c for c in colonne if piv[c].isna().all()]
+    if vuote:
+        print(f"  silent failure rate: nessun dato per {vuote}, colonne omesse.")
+        colonne = [c for c in colonne if c not in vuote]
+        piv = piv.reindex(columns=pd.MultiIndex.from_tuples(colonne))
+    if not colonne:
+        return
+    acc = st.groupby(["dataset", "model"])["mean_quality"].first()
+    fuori = {c: not (INTERPRETABLE_ACCURACY[0] <= acc.get(c, np.nan) <= INTERPRETABLE_ACCURACY[1])
+             for c in colonne}
+    piv = piv.loc[piv.mean(axis=1).sort_values().index]
+
+    intest = [f"{abbrev[d]}\n{m.replace('-it', '')}" for d, m in colonne]
+    testo = piv.apply(lambda col: col.map(lambda v: "-" if pd.isna(v) else f"{v:.3f}"))
+    df = pd.DataFrame(testo.values, columns=intest)
+    df.insert(0, "metodo", piv.index)
+
+    fig, ax = plt.subplots(figsize=(max(12, 1.05 * len(df.columns) + 3), 1.6 + 0.30 * len(df)))
+    larghezze = [0.25] + [0.75 / len(colonne)] * len(colonne)
+    tab = _tabella_immagine(fig, ax, df, col_widths=larghezze, fontsize=6.5)
+    for (r, c), cell in tab.get_celld().items():
+        if r == 0 or c == 0:
+            continue
+        colonna = colonne[c - 1]
+        v = piv.iloc[r - 1, c - 1]
+        if fuori[colonna]:
+            cell.set_facecolor("#eeeeee")
+            cell.get_text().set_color("0.45")
+        elif pd.notna(v) and v <= 0.05:
+            cell.set_facecolor("#dff0d8")
+        elif pd.notna(v) and v >= 0.15:
+            cell.set_facecolor("#f8d7da")
+    ax.set_title("Silent failure rate per strato di severita' (LT = domande letali, Safe = sicure)",
+                 fontsize=11, pad=16)
+    add_note(fig,
+             "Frazione delle risposte SBAGLIATE che finisce nel 10% delle risposte su cui il metodo e' "
+             "piu' sicuro: gli errori che passano inosservati.\nUn metodo che ordina a caso da' circa "
+             "0.10, un metodo perfetto 0. Verde: <= 0.05 (meta' del caso o meno). Rosso: >= 0.15 "
+             "(peggio del caso).\nIn grigio le celle con accuracy fuori dall'intervallo "
+             f"{INTERPRETABLE_ACCURACY[0]:.2f}-{INTERPRETABLE_ACCURACY[1]:.2f}: li' la metrica misura il "
+             "regime, non il metodo. '-' = metodo con punteggio costante (non ordina nulla).")
+    save(fig, results_dir, "fig_tabella_silent_failure.png")
 
 
 def _tabella_da_csv(results_dir, filename, titolo, out_name, nota, indice=None):
@@ -984,14 +1104,7 @@ def main():
             "come massima confidenza, quindi un modello che non rispetta il\nformato non viene "
             "penalizzato dal PRR ma premiato. Un parse-failure rate alto rende il PRR di quel metodo "
             "non informativo.")
-    _tabella_da_csv(                                                          # TODO 4
-        args.results_dir, "silent_failure_rate.csv",
-        "Silent failure rate per strato di severita'",
-        "fig_tabella_silent_failure.png",
-        "Frazione delle risposte SBAGLIATE che finisce nel decile piu' confidente del metodo: gli "
-        "errori che passano\ninosservati, presentati con la massima sicurezza. E' la metrica che "
-        "interessa in ambito clinico, dove non conta\nquanto bene il metodo ordina in media ma quanti "
-        "errori pericolosi lascia passare.")
+    table_silent_failure(args.results_dir)                                    # TODO 4
     return 0
 
 

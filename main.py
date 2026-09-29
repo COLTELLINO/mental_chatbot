@@ -428,6 +428,61 @@ def classify_stat_calculator(name):
     return "altro"
 
 
+# Calcolatori che caricano un modello ausiliario, per la tabella dei costi.
+_NLI_CALCULATORS = {"SemanticMatrixCalculator", "SemanticClassesCalculator",
+                    "GreedyAlternativesNLICalculator"}
+_CROSS_ENCODER_CALCULATORS = {"CrossEncoderSimilarityMatrixCalculator"}
+_EXTRA_FORWARD_CALCULATORS = {"GreedyLMProbsCalculator", "PromptCalculator"}
+
+
+def default_stat_calculators(cache_dir, deberta_batch_size=None):
+    """Descrizioni dei calcolatori di statistiche usate da UEManager (vedi
+    build_manager). Servono anche a ricostruire le dipendenze di ogni metodo."""
+    return register_default_stat_calculators(
+        model_type="Whitebox",
+        language="en",
+        hf_cache=cache_dir,
+        output_attentions=False,
+        # Nessuno dei 26 stimatori usa gli hidden state (servirebbero solo ai
+        # metodi density-based, esclusi per design): chiederli a generate()
+        # conservava gli stati di tutti i layer per ogni token, ed era la voce
+        # di memoria che portava i Gemma a ~24 GB di picco su MMLU, al limite
+        # della RTX 3090. Se uno stimatore ne avesse bisogno, UEManager
+        # fallirebbe subito all'avvio per statistica mancante, non in silenzio.
+        output_hidden_states=False,
+        blackbox_supports_logprobs=False,
+        deberta_batch_size=deberta_batch_size or DEBERTA_BATCH_SIZE_DEFAULT,
+    )
+
+
+def estimator_calculator_closure(estimator, containers):
+    """Tutti i calcolatori di statistiche di cui un metodo ha bisogno, anche
+    INDIRETTAMENTE. Prima si guardavano solo le statistiche dichiarate dal
+    metodo: Label Prob. chiede le classi semantiche, che pero' si calcolano dai
+    K campioni; CCP usa l'NLI sulle alternative dei token; TokenSAR e SAR usano
+    un cross-encoder sui campioni. Quei costi non venivano attribuiti, e CCP e
+    TokenSAR risultavano economici quanto la Perplexity. La mappa statistica ->
+    calcolatore segue la stessa regola di UEManager (vince l'ultimo registrato).
+    La generazione greedy e' sempre inclusa: e' la risposta da valutare."""
+    provider = {}
+    for c in containers:
+        for stat in c.stats:
+            provider[stat] = c
+    closure, todo = {"GreedyProbsCalculator"}, list(getattr(estimator, "stats_dependencies", []))
+    visited = set()
+    while todo:
+        stat = todo.pop()
+        if stat in visited:
+            continue
+        visited.add(stat)
+        c = provider.get(stat)
+        if c is None:
+            continue
+        closure.add(c.name)
+        todo.extend(c.dependencies)
+    return closure
+
+
 def estimator_phase_needs(estimator):
     """Quali fasi costose servono davvero a uno stimatore, dedotte dalle
     statistiche che dichiara di volere. La generazione greedy serve sempre,
@@ -542,21 +597,7 @@ def load_whitebox_model(model_id, cache_dir, hf_token=None,
 def build_manager(model, dataset, estimators, cache_dir, max_rejection, max_new_tokens,
                   generation_metric, stat_timing_dict=None,
                   deberta_batch_size=DEBERTA_BATCH_SIZE_DEFAULT):
-    available_stat_calculators = register_default_stat_calculators(
-        model_type="Whitebox",
-        language="en",
-        hf_cache=cache_dir,
-        output_attentions=False,
-        # Nessuno dei 26 stimatori usa gli hidden state (servirebbero solo ai
-        # metodi density-based, esclusi per design): chiederli a generate()
-        # conservava gli stati di tutti i layer per ogni token, ed era la voce
-        # di memoria che portava i Gemma a ~24 GB di picco su MMLU, al limite
-        # della RTX 3090. Se uno stimatore ne avesse bisogno, UEManager
-        # fallirebbe subito all'avvio per statistica mancante, non in silenzio.
-        output_hidden_states=False,
-        blackbox_supports_logprobs=False,
-        deberta_batch_size=deberta_batch_size,
-    )
+    available_stat_calculators = default_stat_calculators(cache_dir, deberta_batch_size)
     builder_env_stat_calc = BuilderEnvironmentStatCalculator(model=model)
 
     man = TimedUEManager(
@@ -890,7 +931,8 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
             timing_dict = {}
             stat_timing_dict = {}
             estimators = [TimedEstimator(e, timing_dict) for e in base_estimators]
-            phase_needs = {str(e): estimator_phase_needs(e) for e in base_estimators}
+            containers = default_stat_calculators(args.cache_dir, nli_bs)
+            closures = {str(e): estimator_calculator_closure(e, containers) for e in base_estimators}
             man = build_manager(
                 model, model_dataset, estimators, args.cache_dir, args.max_rejection,
                 max_new_tokens, generation_metric,
@@ -974,14 +1016,13 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
 
         timing_rows = []
         for est_str, seconds in timing_dict.items():
-            needs = phase_needs.get(est_str, {"generazione_greedy": True})
+            closure = closures.get(est_str, {"GreedyProbsCalculator"})
             # Costo pieno standalone: se questa fosse l'unica tecnica in
-            # esecuzione, dovrebbe pagarsi da sola la generazione greedy piu'
-            # le fasi che le servono, oltre alla propria aritmetica.
-            full = seconds
-            for phase, needed in needs.items():
-                if needed:
-                    full += phase_seconds.get(phase, 0.0)
+            # esecuzione, dovrebbe pagarsi da sola ogni calcolatore della sua
+            # catena di dipendenze (generazione greedy, campioni, modelli
+            # ausiliari, forward extra), oltre alla propria aritmetica. I
+            # tempi sono quelli misurati calcolatore per calcolatore.
+            full = seconds + sum(stat_timing_dict.get(c, 0.0) for c in closure)
             timing_rows.append({
                 "model": model_name,
                 "dataset": dataset_name,
@@ -994,8 +1035,11 @@ def run_model_on_dataset(model, model_name, dataset_name, examples, cfg, args, p
                 # Costo pieno: quello che conta per la scelta on-device.
                 "seconds_full_standalone": full,
                 "seconds_full_per_instance": full / n_inst,
-                "needs_sampling": needs.get("campionamento_K_generazioni", False),
-                "needs_nli": needs.get("forward_NLI", False),
+                "needs_sampling": "SamplingGenerationCalculator" in closure,
+                "needs_nli": bool(closure & _NLI_CALCULATORS),
+                "needs_cross_encoder": bool(closure & _CROSS_ENCODER_CALCULATORS),
+                "needs_extra_forward": bool(closure & _EXTRA_FORWARD_CALCULATORS),
+                "calculators": ";".join(sorted(closure)),
                 "peak_memory_gb": peak_mem_gb,
                 "n_instances": n_inst,
             })
@@ -1080,6 +1124,8 @@ def _merge_timing(timing_all, model_name, dataset_name):
         needs_nli=("needs_nli", "first"),
         peak_memory_gb=("peak_memory_gb", "max"),
         n_instances=("n_instances", "sum"),
+        **{c: (c, "first") for c in ("needs_cross_encoder", "needs_extra_forward", "calculators")
+           if c in timing_all.columns},
     )
     n = agg["n_instances"].clip(lower=1)
     agg["seconds_marginal_per_instance"] = agg["seconds"] / n
@@ -1089,8 +1135,9 @@ def _merge_timing(timing_all, model_name, dataset_name):
     cols = ["model", "dataset", "estimator", "paper_label", "seconds",
             "seconds_marginal_per_instance", "seconds_full_standalone",
             "seconds_full_per_instance", "needs_sampling", "needs_nli",
+            "needs_cross_encoder", "needs_extra_forward", "calculators",
             "peak_memory_gb", "n_instances"]
-    return agg[cols]
+    return agg[[c for c in cols if c in agg.columns]]
 
 
 def run_cell_chunked(section_tag, model, model_name, dataset_name, examples, cfg, args,
@@ -2249,7 +2296,12 @@ def main():
                 sec_full_per_instance=("seconds_full_per_instance", "mean"),
                 needs_sampling=("needs_sampling", "max"),
                 needs_nli=("needs_nli", "max"),
-                peak_memory_gb=("peak_memory_gb", "max"),
+                **{c: (c, "max") for c in ("needs_cross_encoder", "needs_extra_forward")
+                   if c in timing_all.columns},
+                # Memoria di picco dell'intera cella modello x dataset, NON del
+                # singolo metodo: tutti i metodi della stessa cella hanno lo
+                # stesso valore. Utile solo per confrontare i modelli.
+                peak_memory_gb_cell=("peak_memory_gb", "max"),
             ).sort_values("sec_full_per_instance", ascending=False)
             cost_path = os.path.join(args.results_dir, "estimator_cost_table.csv")
             cost_table.to_csv(cost_path, index=False)
@@ -2548,19 +2600,10 @@ def main():
                                              "accuracy_table_quant_comparison.csv")
                     quant_raw.to_csv(os.path.join(args.results_dir, "results_quant_comparison_mapped.csv"), index=False)
 
-                    quant_agg = quant_raw.groupby(["model", "paper_label"], as_index=False)["value"].mean()
-                    variant_order = [v for v, _ in variants if v in quant_agg["model"].unique()]
-                    plot_prr_bars(
-                        quant_agg, figure_a_labels, variant_order,
-                        f"Mean PRR per metodo UQ -- {quant_model_name}: 4-bit vs bf16 "
-                        "(aggregato su CoQA/TriviaQA/MMLU/GSM8k)",
-                        f"Confronto quantizzazione su {quant_model_name} (vedi commento su "
-                        "QUANT_COMPARE_MODEL_DEFAULT nel codice per la motivazione della scelta: "
-                        "MedGemma-4B-it/Gemma3-4B-it producono NaN sotto 4-bit e sono esclusi a priori).",
-                        os.path.join(args.results_dir, f"fig_quant_comparison_{quant_model_name}.png"),
-                        "Mean PRR (raw, max_rejection=0.5)",
-                        add_mean=False,
-                    )
+                    # La figura del confronto la disegna make_figures.py
+                    # (fig_quant_comparison.png), con gli intervalli di
+                    # confidenza: qui ne veniva prodotta una seconda versione
+                    # senza intervalli, duplicata e fuorviante.
                     print("Confronto quantizzazione completato.")
                 else:
                     print("!!! Nessuna combinazione quant completata con successo.")
