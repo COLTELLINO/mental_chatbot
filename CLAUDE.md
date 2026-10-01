@@ -42,8 +42,9 @@ for Large Language Models with LM-Polygraph", TACL 2025 (arXiv 2406.15627), con
    sui nodi e si carica con `source ~/.uq_env` prima di `sbatch_script.sh`.
 3. **Identità git:** `COLTELLINO <filippo.patrignani2@studio.unibo.it>`. Si
    pusha su `origin` (github.com/COLTELLINO/mental_chatbot), branch
-   `filo/benchmark-uq`. `unibo` è il repo del gruppo: non si pusha lì senza
-   che Filippo lo chieda.
+   `filo/benchmark-uq`, sempre e subito dopo ogni commit (`git push origin
+   filo/benchmark-uq`), senza chiedere conferma. `unibo` è il repo del gruppo:
+   non si pusha lì senza che Filippo lo chieda.
 4. **Commenti e messaggi in italiano.** Lo stile del repo: ogni scelta non ovvia ha
    un commento che spiega il perché; le correzioni sono marcate
    "BUG CORRETTO il <data>" con il sintomo che le ha fatte trovare.
