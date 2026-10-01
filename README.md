@@ -414,6 +414,38 @@ fra le due classifiche. Figure: `fig_paper_replica_whitebox.png`,
 `fig_paper_replica_blackbox.png`. Per rifare solo confronto e figure:
 `python3.11 paper_replica.py --only_compare --results_dir <cartella>`.
 
+**Criterio di successo della replica**, fissato il 1° ottobre 2026 prima di
+lanciarla. Si valuta separatamente su ognuna delle 7 celle (white-box: CoQA,
+TriviaQA, MMLU, GSM8k; black-box: CoQA, TriviaQA, MMLU), usando i metodi presenti
+anche nel paper:
+
+1. **Scarto:** la mediana di |PRR nostro − PRR del paper| sui metodi della cella
+   deve essere ≤ 0.05. Si usa la mediana e non la media perché un solo metodo
+   rotto non deve far fallire tutta la cella: per quei casi c'è la regola 3.
+   0.05 è circa l'ampiezza del nostro intervallo al 95% con 2.000 domande, più
+   un margine per le differenze dichiarate. Resta comunque molto più piccolo
+   della distanza fra le famiglie di metodi (deviazione standard dei PRR del
+   paper fra 0.16 e 0.35 in white-box), quindi uno scarto così non cambia quale
+   famiglia di metodi vince.
+2. **Classifica (solo white-box):** il τ di Kendall fra la nostra classifica e
+   quella del paper deve essere ≥ 0.6, cioè circa l'80% delle coppie di metodi
+   nello stesso ordine. Non si chiede che il metodo migliore coincida: nel paper
+   i primi tre distano fra loro circa 0.01, meno della nostra incertezza. In
+   black-box il τ si riporta ma non decide nulla, perché lì i PRR del paper
+   sono troppo vicini fra loro (deviazione standard fra 0.04 e 0.09): la
+   classifica sarebbe in buona parte rumore.
+3. **Metodi fuori scala:** ogni metodo con |scarto| > 0.15 va elencato e
+   spiegato (con una causa verificata, non ipotizzata). Un solo metodo fuori
+   scala senza spiegazione fa fallire la cella.
+
+Esito: **riuscita** se passano tutte e 7 le celle. **Parziale** se passano
+almeno 3 celle white-box su 4 e 2 black-box su 3, e ogni cella fallita ha una
+causa individuata. Altrimenti **fallita**: nella tesi non si dice che il codice
+riproduce il paper, si riportano gli scarti e si cerca la causa a partire
+dalle parti di codice in comune con la pipeline principale. Le soglie non si
+cambiano dopo aver visto i risultati; se si vuole cambiarle, va scritto il
+motivo e vanno riportati entrambi gli esiti.
+
 Differenze note rispetto al paper: precisione bf16 (il paper non la dichiara),
 campionatore in batch (stesse statistiche della libreria, vedi
 `tests/test_batched_sampling.py`), metodi density-based esclusi in tutto il lavoro.

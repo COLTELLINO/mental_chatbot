@@ -77,6 +77,13 @@ for Large Language Models with LM-Polygraph", TACL 2025 (arXiv 2406.15627), con
   - 2.000 domande scelte come `Dataset.subsample` (seed 1); MMLU 5.700, GSM8k 1.319;
   - le impostazioni stanno in `paper_replica_configs.json`, estratte dalle
     configurazioni ufficiali; i valori del paper in `paper_reference_prr.csv`.
+  - **criterio di successo** (fissato il 1° ottobre 2026, prima del lancio; testo
+    completo e motivazioni in `README.md`, sezione della replica): per ognuna
+    delle 7 celle, mediana di |scarto dal paper| ≤ 0.05, τ di Kendall con la
+    classifica del paper ≥ 0.6 (solo white-box), e ogni metodo con |scarto| > 0.15
+    spiegato. Riuscita con 7 celle su 7; parziale con almeno 3 white-box su 4 e
+    2 black-box su 3, con le celle fallite spiegate. Le soglie non si cambiano
+    dopo aver visto i risultati.
 - **Il Kendall τ dei modelli piccoli** si calcola contro il Mistral Instruct della
   pipeline principale, che usa gli stessi prompt dei modelli piccoli, e per dataset. La
   replica serve solo a validare il codice rispetto al paper.
@@ -163,7 +170,7 @@ Ognuno è coperto da un test (indicato fra parentesi).
 
 ## Stato al 1° ottobre 2026 e prossimi passi
 
-Ultimo commit: `7b304c3` (replica del paper), già su `origin`.
+Tutto il lavoro è su `origin`. La run del 28/09 (job `16145101`, faretra) è ancora in corso con il codice vecchio: vedi il punto 4.
 
 1. **Sui nodi:** `git pull`, ricostruire l'immagine e lanciare i test nel container.
 2. **Prova breve della pipeline:**
@@ -180,7 +187,6 @@ Ultimo commit: `7b304c3` (replica del paper), già su `origin`.
    La run partita il 28/09 su faretra usa il codice vecchio (prompt italiani, bug della "A",
    campionatore della libreria): per la tesi non vale, si può tenere solo come confronto.
 5. **Rimandati a fine esperimenti, su richiesta di Filippo:**
-   - criterio di successo della replica (per esempio uno scarto massimo dal paper e un τ minimo con la sua classifica);
    - limiti da dichiarare nella tesi: regola dei ties, 5 livelli di difficoltà nella severità, "I'd go with A because" non leggibile.
 6. **Scadenza di caricamento della tesi:** 13 novembre 2026.
 
