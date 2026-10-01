@@ -8,6 +8,10 @@ set -e
 cd "$(dirname "$0")"
 export PYTHONPATH="$(cd .. && pwd):$PYTHONPATH"
 export HF_HUB_OFFLINE=1
+# Come in run_docker.sh: con il JIT attivo, l'import di DeBERTa in transformers
+# (torch.jit.script) va in segmentation fault nel container. Senza questa riga i
+# test lanciati con un docker run a mano morivano al primo import.
+export PYTORCH_JIT=0
 PY=${PY:-python3.11}
 mkdir -p hfcache
 [ -d tiny ] || $PY make_tiny.py
