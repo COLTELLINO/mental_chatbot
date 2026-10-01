@@ -168,27 +168,34 @@ Ognuno è coperto da un test (indicato fra parentesi).
 - **Comandi utili:** `squeue -u patrignani`; i log sono `slurm-<jobid>.out` nella cartella del repo.
 - **Su moro232** a volte la GPU è parzialmente occupata da altri: il preflight lo segnala.
 
-## Stato al 1° ottobre 2026 e prossimi passi
+## Stato al 2 ottobre 2026 e prossimi passi
 
-Tutto il lavoro è su `origin`. La run del 28/09 (job `16145101`, faretra) è ancora in corso con il codice vecchio: vedi il punto 4.
-
-1. **Sui nodi:** `git pull`, ricostruire l'immagine e lanciare i test nel container.
-2. **Prova breve della pipeline:**
-   `--results_dir /workspace/results_smoke --n_test_samples 6 --chunk_size 3 --run_severity_grid --run_verbalized --run_quant_comparison`.
-   Controllare memoria (Mistral bf16 a batch 1), tempi per fase (`phase_timings.csv`) e
-   assenza di righe `!!!` nel log.
-3. **Prova breve della replica:**
-   `paper_replica.py --parts whitebox --n_test_samples 20 --results_dir /workspace/results_replica_smoke`,
-   poi la stessa con `--parts blackbox verbalized`.
-4. **Run complete**, su nodi diversi:
-   - pipeline principale con le sezioni extra (GSM8k eventualmente in un run a parte con `--datasets GSM8k`);
-   - replica white-box;
-   - replica black-box.
-   La run partita il 28/09 su faretra usa il codice vecchio (prompt italiani, bug della "A",
-   campionatore della libreria): per la tesi non vale, si può tenere solo come confronto.
-5. **Rimandati a fine esperimenti, su richiesta di Filippo:**
-   - limiti da dichiarare nella tesi: regola dei ties, 5 livelli di difficoltà nella severità, "I'd go with A because" non leggibile.
-6. **Scadenza di caricamento della tesi:** 13 novembre 2026.
+- Il job `16145101` (codice vecchio) è stato cancellato il 1/10. I suoi risultati sono in
+  `results_run_28_09_codice_vecchio/` su faretra, con una copia in `Workspace/BACKUPS_RISULTATI/` sul PC di Filippo.
+- Test nel container e prove brevi (`results_smoke`, `results_replica_smoke_wb/_bb`) passati il 2/10.
+  Picco di memoria: Mistral bf16 su CoQA 22.7 GB su 24, quindi senza margine. Collo di
+  bottiglia: il cross-encoder di SAR (45–70% del tempo), circa 50–65 s per domanda su GSM8k.
+- **Run complete in coda il 2/10, tutte su faretra** (moro232 ha la GPU assegnata ad altri). Gli id
+  sono in `lanci_02_10.txt` sul nodo. Catena in `results/`, ogni job parte solo se il
+  precedente finisce bene (`afterok`):
+  1. `--datasets CoQA TriviaQA MMLU` (stima circa 22 h);
+  2. `--datasets GSM8k` (stima circa 38 h);
+  3. griglia di severità, LFM2-350M, LFM2-1.2B, Mistral;
+  4. griglia di severità, MedGemma e Gemma3;
+  5. `--run_verbalized --run_quant_comparison`.
+  Repliche in parallelo: `results_paper_replica_wb` (white-box) e `results_paper_replica_bb`
+  (black-box e verbalized). A fine run copiare i file di una nelle cartella dell'altra e lanciare
+  `paper_replica.py --only_compare`, poi applicare il criterio di successo.
+- **Non modificare** `main.py`, `dataset_prep.py`, `batched_sampling.py` o `analysis_lib.py` finché la catena
+  non è finita: cambierebbe l'impronta e i job successivi rifiuterebbero la ripresa.
+- `sync_results.sh` usa `srun`: per operazioni brevi l'admin lo consente.
+- **Rimandati a fine esperimenti, su richiesta di Filippo:**
+  - limiti da dichiarare nella tesi: regola dei ties, 5 livelli di difficoltà nella severità,
+    "I'd go with A because" non leggibile;
+  - `<end_of_turn>` resta nei testi di Gemma3, sia greedy sia campioni, perché lm-polygraph decodifica
+    senza togliere i token speciali. La qualità non cambia, ma le similarità lessicali tra i campioni
+    di Gemma3 possono uscire un po' più alte.
+- **Scadenza di caricamento della tesi:** 13 novembre 2026.
 
 ## Come lavorare con Filippo
 
